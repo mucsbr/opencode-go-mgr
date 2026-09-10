@@ -28,11 +28,13 @@ own link before a real signup. Creating a managed draft can also edit and write
 this value back. User-defined panes show configuration, mappings, and
 edit/delete. User-defined Providers are unpriced.
 
-**Aliases** is a separate core page because its read-only table spans every
-Provider contract, user-defined Provider mapping, and Custom account instead of
-the selected Provider. It aggregates existing contracts and account capabilities
-into public names with their routeability and exact upstream identities.
-Custom mappings stay editable only on **Accounts**.
+**Aliases** is a separate core page because it spans every Provider contract,
+user-defined Provider mapping, and Custom account instead of the selected
+Provider. Built-in, dynamic, and Custom rows remain read-only. Administrators
+may additionally configure a public lowercase Alias with one exact catalog ID
+per sealed Provider. Add every Provider mapping for the intended model in one
+save; discovery never guesses equivalence. Custom mappings stay editable only
+on **Accounts**.
 
 **Model catalog** is local. The matrix has one row per current catalog model and
 three columns — Chat Completions, Responses, and Messages. Each cell is a binary
@@ -110,6 +112,16 @@ publishes its suffix-stripped Alias from the official `-free` suffix;
 the original `-free` ID remains an exact raw pin,
 as described under
 [Zen Free models](routing.md#zen-free-models).
+
+Manual Alias bindings extend that baseline without changing code. Each mapping
+must select a model in the Provider's current catalog whose effective protocol
+is enabled. A binding cannot replace an existing mapping for the same Provider;
+when a new Alias is already an exact raw model ID, include that original
+Provider mapping so its route is preserved. For example, one saved Alias may
+map `deepseek-flash` to OpenCode Go `deepseek-flash` and Command Code GOAT
+`deepseek/deepseek-v4.1-flash`. Account selection then rewrites the client model
+to the chosen Provider's exact ID. If a later catalog removes a selected ID,
+the row stays visible but unavailable and is never silently retargeted.
 
 If every model/protocol cell for a Provider is off, that Provider contributes
 no route. Authenticated downstream `GET /v1/models` publishes only routeable

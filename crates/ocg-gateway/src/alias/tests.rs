@@ -20,6 +20,7 @@ fn catalogs<'a>(
         cpa: NO_IDS,
         ollama: NO_IDS,
         ollama_pinned: NO_IDS,
+        user_aliases: &[],
         extra: &[],
     }
 }
@@ -1029,6 +1030,46 @@ fn refreshed_go_catalog_adds_raw_pins_without_expanding_alias_authority() {
     let overlap = resolve_with_all_catalogs("vendor/raw-go", &go, &[], &[], &goat)
         .expect_err("overlapping raw provider IDs must remain ambiguous");
     assert_eq!(overlap.code(), Some(AMBIGUOUS_MODEL_ID));
+}
+
+#[test]
+fn confirmed_user_aliases_publish_and_rewrite_each_provider_upstream_id() {
+    let go = vec!["deepseek-flash".to_string()];
+    let command = vec!["deepseek/deepseek-v4.1-flash".to_string()];
+    let bindings = vec![
+        UserAliasBinding {
+            alias: "deepseek-flash".to_string(),
+            provider_id: OPENCODE_PROVIDER_ID.to_string(),
+            upstream_model: "deepseek-flash".to_string(),
+        },
+        UserAliasBinding {
+            alias: "deepseek-flash".to_string(),
+            provider_id: COMMAND_CODE_PROVIDER_ID.to_string(),
+            upstream_model: "deepseek/deepseek-v4.1-flash".to_string(),
+        },
+    ];
+    let catalogs = RuntimeCatalogs {
+        go: &go,
+        command_code: &command,
+        user_aliases: &bindings,
+        ..RuntimeCatalogs::default()
+    };
+
+    let published = published_routeable_aliases_with_runtime_catalogs(catalogs);
+    assert!(published.iter().any(|row| row.alias == "deepseek-flash"));
+    match resolve_with_runtime_catalogs("deepseek-flash", catalogs).unwrap() {
+        ResolvedModel::Alias { mappings, .. } => {
+            assert!(mappings.iter().any(|mapping| {
+                mapping.provider_id == OPENCODE_PROVIDER_ID
+                    && mapping.upstream_model == "deepseek-flash"
+            }));
+            assert!(mappings.iter().any(|mapping| {
+                mapping.provider_id == COMMAND_CODE_PROVIDER_ID
+                    && mapping.upstream_model == "deepseek/deepseek-v4.1-flash"
+            }));
+        }
+        other => panic!("expected a cross-Provider Alias, got {other:?}"),
+    }
 }
 
 #[test]

@@ -38,6 +38,7 @@ const contracts = {
     revision: 1,
   }],
   custom_endpoints: [],
+  alias_bindings: [],
 } satisfies ProviderContractsResponse;
 
 test("account tests use only routable models from the exact account scope", () => {
@@ -94,7 +95,7 @@ const expectedDynamicModels = [
 ] as const;
 
 test("dynamic catalog aliases fill the test list only when no exact contract scope exists", () => {
-  const emptyContracts = { revision: 1, providers: [], custom_endpoints: [] } satisfies ProviderContractsResponse;
+  const emptyContracts = { revision: 1, providers: [], custom_endpoints: [], alias_bindings: [] } satisfies ProviderContractsResponse;
   const catalog = [dynamicCatalog()];
   assert.deepEqual(accountTestModels(dynamicAccount, emptyContracts, catalog), expectedDynamicModels);
   assert.deepEqual(

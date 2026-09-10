@@ -14,7 +14,7 @@
 
 左侧列出内置合约范围和用户定义供应商。内置主区有两个子页签：**模型目录** 与 **价格**。**OpenCode Go** 在价格后面多一个 **其他** 页签，用来放托管注册用的 **邀请链接**。它是用户自有的 `opencode.ai` / `console.opencode.ai` HTTPS 链接（不是密封源）。新安装可能带有演示默认值；正式注册前请改为你自己的链接。创建托管草稿时也可直接编辑并写回此处。用户定义面板展示配置、映射以及编辑/删除。用户定义供应商未定价。
 
-**别名** 是独立的核心页面，因为它的只读表覆盖全部 Provider 合约、用户定义供应商映射与 Custom 账号，而不是当前选中的供应商。它把现有合约和账号能力汇总成公开名称，并展示可路由性与精确上游身份。Custom 映射只能在**账号**页编辑。
+**别名** 是独立的核心页面，因为它覆盖全部 Provider 合约、用户定义供应商映射与 Custom 账号，而不是当前选中的供应商。内置、用户定义供应商与 Custom 行仍为只读；管理员可以额外配置一个小写公开 Alias，并为每个密封 Provider 人工选择一个精确目录 ID。同一模型的全部 Provider 映射应一次保存，发现流程绝不猜测等价关系。Custom 映射只能在**账号**页编辑。
 
 **模型目录** 是本地的。矩阵只列出当前目录中的模型，并以三个上游协议（Chat Completions、Responses、Messages）为列。每格是 effective 模型/协议状态的二态开关：打开写入 `force_on`，关闭写入 `force_off`；列菜单可以整列打开或关闭。开关会先立即更新显示，再在后台执行带 CAS 保护的保存，只有受影响的格子显示保存进度。
 
@@ -31,6 +31,8 @@ MiniMax 与 Kimi 需要一个符合条件的账号 Key。MiniMax 刷新 `https:/
 Custom API 继续使用账号所有的公开名称 → 上游 ID 映射，发现结果不会静默替换它们。账号表单里的 **获取模型** 只是未保存表单辅助，且只返回上游 ID。选择一个 ID 时，原样导入为“公开名称 = 上游 ID”。Command Code 使用官方公开的 `/models` 目录：GOAT 预设默认开启，后续发现的额外模型默认关闭，只有在矩阵中开启其受支持协议后才会供应。
 
 本地目录会进入解析，请求时不会再访问上游。内置 Alias 权威是静态且由代码持有：最早 OpenCode Go 表提供 Go 名称，密封 MiniMax CN、Kimi CN 与选定 GOAT 长名称映射表提供供应商 Alias，但不会据此新增 Go 路由。Command 会先去掉 Provider 命名空间并复用已有代码持有的 Alias；只有短名已获授权时才去掉已知套餐后缀。例如 `nvidia/nemotron-3-ultra-550b-a55b` 使用 Alias `nemotron-3-ultra`。保存的 CN 行只激活其精确密封映射。无法匹配的 Command/MiniMax/Kimi 模型保留为精确 raw ID，不会作为新 Alias 公布；CN 映射仍保留上游 ID 的准确拼写。Zen Free 按官方 `-free` 后缀公布去掉后缀后的 Alias，原始 `-free` ID 始终可作为精确 raw pin 使用，见 [Zen Free 模型](routing.zh-CN.md#zen-free-模型)。
+
+人工 Alias 绑定无需改代码即可扩展该基线。每条映射必须选择当前 Provider 目录中 effective 协议已启用的模型；不能替换同一 Provider 的既有 mapping。若新 Alias 本身已是某个精确 raw 模型 ID，保存时必须包含该原 Provider 映射，以保留原路由。例如可把公开 `deepseek-flash` 同时映射到 OpenCode Go 的 `deepseek-flash` 与 Command Code GOAT 的 `deepseek/deepseek-v4.1-flash`。账号选择完成后，Gateway 会把客户端模型改写成所选 Provider 的精确 ID。后续目录若移除某个 ID，该行会继续显示但不可用，绝不会静默改指向别的模型。
 
 当某个供应商的模型/协议单元格全部关闭时，该供应商不再产生路由。带鉴权的下游 `GET /v1/models` 只公布可路由的公开名称；raw-only 身份和 raw 名称冲突都会排除。歧义 raw 身份以 `ambiguous_model_id` 失败，绝不请求上游。
 

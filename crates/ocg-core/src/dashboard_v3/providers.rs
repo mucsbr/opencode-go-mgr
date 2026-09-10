@@ -51,7 +51,7 @@ use super::types::{
     AccountAuthScheme, AccountQuotaScope, AccountUpstreamProtocol, AccountVerificationStatus,
     CapabilitySummary, CardCapabilitySummary, ContractEvidenceSource, ContractScopeKind,
     ControlRevision, CustomEndpointContract, EffectiveCatalog, EffectiveModelContract,
-    EffectiveModelProtocols, EffectiveProtocolEvidence, ModelProtocolOverride,
+    EffectiveModelProtocols, EffectiveProtocolEvidence, ModelAliasBinding, ModelProtocolOverride,
     ModelProtocolOverridesUpdate, MutationExpectation, ProbeResultKind, ProtocolOverrideState,
     ProtocolProbeRequest, ProtocolProbeResponse, ProtocolProbeResult, ProviderAccountChoice,
     ProviderCatalog, ProviderCatalogEntry, ProviderCatalogFormField, ProviderContractGroup,
@@ -669,7 +669,9 @@ pub(super) async fn get_provider_contracts(
     )))
 }
 
-fn provider_contracts_response(state: &CoreState) -> Result<Json<ProviderContracts>, V3ApiError> {
+pub(super) fn provider_contracts_response(
+    state: &CoreState,
+) -> Result<Json<ProviderContracts>, V3ApiError> {
     let contracts = state.provider_contracts();
     let (accounts, statuses) = load_accounts_with_verification(state)?;
     Ok(Json(provider_contracts_from_state(
@@ -1289,6 +1291,7 @@ fn provider_catalog_from_state(state: &CoreState) -> ProviderCatalog {
         .map(|scope| scope.catalog.models.as_slice())
         .unwrap_or_default();
     let ollama_pinned_models = provider_contracts::ollama_cloud_pinned_model_ids(&contracts);
+    let user_aliases = contracts.routeable_user_alias_bindings();
     let mut entries: Vec<ProviderCatalogEntry> = BUILTIN_PROVIDERS
         .iter()
         .filter(|plan| !plan.product_surface.is_external_integration())
@@ -1301,6 +1304,7 @@ fn provider_catalog_from_state(state: &CoreState) -> ProviderCatalog {
                 kimi_models,
                 ollama_models,
                 &ollama_pinned_models,
+                &user_aliases,
             )
         })
         .collect();
@@ -1387,6 +1391,7 @@ fn catalog_entry(
     kimi_models: &[String],
     ollama_models: &[String],
     ollama_pinned_models: &[String],
+    user_aliases: &[alias::UserAliasBinding],
 ) -> ProviderCatalogEntry {
     ProviderCatalogEntry {
         provider_id: plan.provider_id.to_string(),
@@ -1439,6 +1444,7 @@ fn catalog_entry(
                 kimi: kimi_models,
                 ollama: ollama_models,
                 ollama_pinned: ollama_pinned_models,
+                user_aliases,
                 ..alias::RuntimeCatalogs::default()
             },
         ),
@@ -1699,6 +1705,15 @@ fn provider_contracts_from_state(
     ProviderContracts {
         providers,
         custom_endpoints,
+        alias_bindings: contracts
+            .user_alias_bindings
+            .iter()
+            .map(|binding| ModelAliasBinding {
+                alias: binding.alias.clone(),
+                provider_id: binding.provider_id.clone(),
+                upstream_model: binding.upstream_model.clone(),
+            })
+            .collect(),
         revision: revision.revision,
         process_generation: revision.process_generation,
         pricing_revision: revision.pricing_revision,

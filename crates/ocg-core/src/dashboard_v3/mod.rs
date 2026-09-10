@@ -34,6 +34,7 @@ mod custom_discovery;
 mod dynamic_providers;
 mod keys;
 mod managed_key_verify;
+mod model_aliases;
 mod observability;
 mod pricing;
 mod providers;
@@ -100,20 +101,21 @@ pub use types::{
     EffectiveCatalog, EffectiveModelContract, EffectiveModelProtocols, EffectiveProtocolEvidence,
     ForwardLog, ForwardLogClientKey, ForwardLogKeys, ForwardLogModels, ForwardLogQuery,
     ForwardLogSummary, ForwardLogs, GatewayLog, GatewayLogQuery, GatewayLogs, GatewayStatus,
-    InstallUpdate, KeyCreate, KeyUpdate, ModelProtocolOverride, ModelProtocolOverridesUpdate,
-    MutationAck, MutationExpectation, OllamaBillingTier, PricingAdjustment, PricingAvailability,
-    PricingLimits, PricingModel, PricingMultiplierChange, PricingMultiplierWrite,
-    PricingMultipliersUpdate, PricingRefresh, PricingRefreshPolicy, PricingRefreshStatus,
-    PricingRefreshUpdate, PricingRevision, PricingSnapshot, PricingTimeWindow,
-    ProtocolOverrideState, ProtocolProbeRequest, ProtocolProbeResponse, ProtocolProbeResult,
-    ProviderAccountChoice, ProviderCatalog, ProviderCatalogEntry, ProviderCatalogFormField,
-    ProviderCatalogRiskNotice, ProviderContractGroup, ProviderContracts, ProviderModelCapability,
-    ProviderPricing, ProviderPricingRefresh, ProviderPricingRefreshUpdate, ProviderUsage,
-    ProxyListDirection, ProxyMode, ProxySupportedModel, ProxyTestRequest, ProxyTestResponse,
-    QuotaWindow, RoutingMode, Settings, SettingsUpdate, UpdateCheck, UsageAvailability,
-    UsageMutation, UsageRefresh, UsageRefreshThrottleError, UsageRefreshUpdate, UsageSyncState,
-    UsageWindow, V3Error, ZenFreeModel, ZenFreeModels, ZenFreeSettings, ZenFreeSettingsUpdate,
-    contract_schema, contract_schema_pretty,
+    InstallUpdate, KeyCreate, KeyUpdate, ModelAliasBinding, ModelAliasBindingsUpdate,
+    ModelProtocolOverride, ModelProtocolOverridesUpdate, MutationAck, MutationExpectation,
+    OllamaBillingTier, PricingAdjustment, PricingAvailability, PricingLimits, PricingModel,
+    PricingMultiplierChange, PricingMultiplierWrite, PricingMultipliersUpdate, PricingRefresh,
+    PricingRefreshPolicy, PricingRefreshStatus, PricingRefreshUpdate, PricingRevision,
+    PricingSnapshot, PricingTimeWindow, ProtocolOverrideState, ProtocolProbeRequest,
+    ProtocolProbeResponse, ProtocolProbeResult, ProviderAccountChoice, ProviderCatalog,
+    ProviderCatalogEntry, ProviderCatalogFormField, ProviderCatalogRiskNotice,
+    ProviderContractGroup, ProviderContracts, ProviderModelCapability, ProviderPricing,
+    ProviderPricingRefresh, ProviderPricingRefreshUpdate, ProviderUsage, ProxyListDirection,
+    ProxyMode, ProxySupportedModel, ProxyTestRequest, ProxyTestResponse, QuotaWindow, RoutingMode,
+    Settings, SettingsUpdate, UpdateCheck, UsageAvailability, UsageMutation, UsageRefresh,
+    UsageRefreshThrottleError, UsageRefreshUpdate, UsageSyncState, UsageWindow, V3Error,
+    ZenFreeModel, ZenFreeModels, ZenFreeSettings, ZenFreeSettingsUpdate, contract_schema,
+    contract_schema_pretty,
 };
 pub use updater::{GITHUB_LATEST_RELEASE_API, GITHUB_LATEST_RELEASE_URL};
 
@@ -389,6 +391,10 @@ pub fn api_router(state: CoreState) -> Router<CoreState> {
         .route(
             "/provider-contracts",
             get(providers::get_provider_contracts),
+        )
+        .route(
+            "/model-alias-bindings",
+            put(model_aliases::put_model_alias_bindings),
         )
         .route(
             "/provider-contracts/{scope_kind}/{scope_id}/catalog/refresh",

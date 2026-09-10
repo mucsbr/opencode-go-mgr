@@ -934,6 +934,7 @@ fn sample_contracts() -> ProviderContracts {
     };
     ProviderContracts {
         providers: vec![goat],
+        alias_bindings: Vec::new(),
         custom_endpoints: vec![CustomEndpointContract {
             scope_kind: ContractScopeKind::CustomEndpoint,
             scope_id: "custom-1".into(),
@@ -1781,6 +1782,7 @@ const DYNAMIC_PROVIDER_CATALOG_TYPES: &[&str] = &[
     "DynamicProviderTestResponse",
 ];
 const OLLAMA_USAGE_CATALOG_TYPES: &[&str] = &["OllamaBillingTier"];
+const MODEL_ALIAS_CATALOG_TYPES: &[&str] = &["ModelAliasBinding", "ModelAliasBindingsUpdate"];
 
 #[test]
 fn catalog_type_names_append_pricing_dtos_after_the_provider_prefix() {
@@ -1881,7 +1883,12 @@ fn catalog_type_names_append_pricing_dtos_after_the_provider_prefix() {
         &CATALOG_TYPE_NAMES[dynamic_end..ollama_end],
         OLLAMA_USAGE_CATALOG_TYPES
     );
-    assert_eq!(CATALOG_TYPE_NAMES.len(), ollama_end);
+    let model_alias_end = ollama_end + MODEL_ALIAS_CATALOG_TYPES.len();
+    assert_eq!(
+        &CATALOG_TYPE_NAMES[ollama_end..model_alias_end],
+        MODEL_ALIAS_CATALOG_TYPES
+    );
+    assert_eq!(CATALOG_TYPE_NAMES.len(), model_alias_end);
 }
 
 #[test]

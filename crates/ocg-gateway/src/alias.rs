@@ -85,6 +85,15 @@ pub struct ExtraProviderCatalog {
     pub mappings: Vec<(String, String)>,
 }
 
+/// Administrator-confirmed public Alias binding for one sealed Provider.
+/// Discovery never creates these rows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserAliasBinding {
+    pub alias: String,
+    pub provider_id: String,
+    pub upstream_model: String,
+}
+
 /// Borrowed runtime catalog inputs used to overlay the sealed Alias registry.
 ///
 /// Callers pass one value instead of extending resolver signatures whenever a
@@ -101,6 +110,7 @@ pub struct RuntimeCatalogs<'a> {
     pub cpa: &'a [String],
     pub ollama: &'a [String],
     pub ollama_pinned: &'a [String],
+    pub user_aliases: &'a [UserAliasBinding],
     pub extra: &'a [ExtraProviderCatalog],
 }
 
@@ -285,7 +295,53 @@ fn build_runtime_registry(catalogs: RuntimeCatalogs<'_>) -> Registry {
     insert_cpa_catalog(&mut registry, catalogs.cpa);
     insert_ollama_catalog(&mut registry, catalogs.ollama, catalogs.ollama_pinned);
     insert_extra_catalogs(&mut registry, catalogs.extra);
+    insert_user_alias_bindings(&mut registry, catalogs.user_aliases);
     registry
+}
+
+fn insert_user_alias_bindings(registry: &mut Registry, bindings: &[UserAliasBinding]) {
+    for binding in bindings {
+        let alias = binding.alias.trim();
+        let provider_id = binding.provider_id.trim();
+        let upstream_model = binding.upstream_model.trim();
+        if !valid_user_alias(alias) || provider_id.is_empty() || upstream_model.is_empty() {
+            continue;
+        }
+        let replacement = mapping(provider_id, upstream_model, true);
+        let key = alias.to_ascii_lowercase();
+        if let Some(entry) = registry.aliases.get_mut(&key) {
+            if let Some(existing) = entry
+                .mappings
+                .iter()
+                .find(|mapping| mapping.provider_id == provider_id)
+            {
+                if existing.upstream_model != upstream_model {
+                    continue;
+                }
+                continue;
+            }
+            entry.mappings.push(replacement);
+        } else {
+            insert_mapping(registry, alias, replacement);
+        }
+    }
+}
+
+fn valid_user_alias(alias: &str) -> bool {
+    !alias.is_empty()
+        && alias.len() <= 128
+        && alias == alias.to_ascii_lowercase()
+        && alias
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '.'))
+        && alias
+            .chars()
+            .next()
+            .is_some_and(|character| character.is_ascii_alphanumeric())
+        && alias
+            .chars()
+            .last()
+            .is_some_and(|character| character.is_ascii_alphanumeric())
 }
 
 fn insert_extra_catalogs(registry: &mut Registry, extras: &[ExtraProviderCatalog]) {

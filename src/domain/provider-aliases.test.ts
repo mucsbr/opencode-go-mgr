@@ -6,6 +6,7 @@ import {
   dynamicProviderAliasRows,
   mergeProviderAliasRows,
   providerAliasRows,
+  userProviderAliasRows,
 } from "./provider-aliases.ts";
 
 const protocol = {
@@ -25,6 +26,7 @@ const builtinScope = {
   key: "provider:go",
   scope_kind: "provider",
   scope_id: "go",
+  provider_id: "go",
   label: "OpenCode Go",
   models: [{
     alias: "gpt-5.6",
@@ -84,6 +86,7 @@ test("Alias rows combine provider contracts with Custom public-to-upstream mappi
       upstream_model: "gpt-5.6-upstream",
       routable: true,
       custom_account_id: null,
+      user_defined: false,
     },
     {
       key: "custom:custom-1:public-model:vendor/model:free",
@@ -93,6 +96,7 @@ test("Alias rows combine provider contracts with Custom public-to-upstream mappi
       upstream_model: "vendor/model:free",
       routable: false,
       custom_account_id: "custom-1",
+      user_defined: false,
     },
   ]);
 });
@@ -142,6 +146,24 @@ test("user-defined Provider mappings appear as Alias rows labelled by Provider n
     upstream_model: "vendor/opus",
     routable: true,
     custom_account_id: null,
+    user_defined: false,
+  }]);
+});
+
+test("administrator Alias bindings keep exact Provider upstream identities", () => {
+  assert.deepEqual(userProviderAliasRows([builtinScope], [{
+    alias: "shared-flash",
+    provider_id: "go",
+    upstream_model: "gpt-5.6-upstream",
+  }]), [{
+    key: "user:shared-flash:go:gpt-5.6-upstream",
+    public_model: "shared-flash",
+    provider_plan: "OpenCode Go",
+    custom_account: null,
+    upstream_model: "gpt-5.6-upstream",
+    routable: true,
+    custom_account_id: null,
+    user_defined: true,
   }]);
 });
 

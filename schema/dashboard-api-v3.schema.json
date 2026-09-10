@@ -4631,6 +4631,55 @@
       ],
       "type": "object"
     },
+    "ModelAliasBinding": {
+      "additionalProperties": false,
+      "description": "One administrator-confirmed public Alias mapping for a sealed Provider.",
+      "properties": {
+        "alias": {
+          "type": "string"
+        },
+        "providerId": {
+          "type": "string"
+        },
+        "upstreamModel": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "alias",
+        "providerId",
+        "upstreamModel"
+      ],
+      "type": "object"
+    },
+    "ModelAliasBindingsUpdate": {
+      "additionalProperties": false,
+      "description": "Atomic replacement of every user-defined model Alias binding.",
+      "properties": {
+        "bindings": {
+          "items": {
+            "$ref": "#/$defs/ModelAliasBinding"
+          },
+          "type": "array"
+        },
+        "expectedRevision": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "processGeneration": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "expectedRevision",
+        "processGeneration",
+        "bindings"
+      ],
+      "type": "object"
+    },
     "ModelProtocolOverride": {
       "additionalProperties": false,
       "description": "One per-cell override entry in a batch update.",
@@ -5536,6 +5585,12 @@
       "additionalProperties": false,
       "description": "Effective provider-scope and custom-endpoint contracts.\n\nTop-level `revision` is the settings CAS token. Nested `revision` values\nare display-only and must not be sent as `expectedRevision`.",
       "properties": {
+        "aliasBindings": {
+          "items": {
+            "$ref": "#/$defs/ModelAliasBinding"
+          },
+          "type": "array"
+        },
         "customEndpoints": {
           "items": {
             "$ref": "#/$defs/CustomEndpointContract"
@@ -5565,6 +5620,7 @@
       "required": [
         "providers",
         "customEndpoints",
+        "aliasBindings",
         "revision",
         "processGeneration",
         "pricingRevision"
@@ -7469,6 +7525,12 @@
     },
     {
       "$ref": "#/$defs/OllamaBillingTier"
+    },
+    {
+      "$ref": "#/$defs/ModelAliasBinding"
+    },
+    {
+      "$ref": "#/$defs/ModelAliasBindingsUpdate"
     }
   ],
   "title": "DashboardApiV3"

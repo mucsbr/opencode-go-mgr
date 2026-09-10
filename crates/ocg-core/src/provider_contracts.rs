@@ -4,7 +4,7 @@
 //! seam: dashboard, materialize, and `/v1/models` read an immutable snapshot
 //! captured at request entry. Request paths never discover or probe.
 
-use crate::alias::ProviderMapping;
+use crate::alias::{ProviderMapping, UserAliasBinding};
 use crate::custom::CustomAccountRuntime;
 use crate::kernel::ids::{
     COMMAND_CODE_PROVIDER_ID, CUSTOM_PROVIDER_ID, KIMI_PROVIDER_ID, MINIMAX_PROVIDER_ID,
@@ -353,6 +353,7 @@ pub struct PersistedContracts {
     pub scopes: HashMap<ContractScope, PersistedScopeRow>,
     pub evidence: HashMap<ContractScope, Vec<PersistedModelProtocol>>,
     pub overrides: HashMap<ContractScope, Vec<PersistedModelProtocolOverride>>,
+    pub user_alias_bindings: Vec<UserAliasBinding>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -440,6 +441,7 @@ impl EffectiveScopeContract {
 pub struct EffectiveContractSet {
     pub providers: BTreeMap<String, EffectiveScopeContract>,
     pub custom_endpoints: BTreeMap<String, EffectiveScopeContract>,
+    pub user_alias_bindings: Vec<UserAliasBinding>,
 }
 
 impl EffectiveContractSet {
@@ -461,6 +463,27 @@ impl EffectiveContractSet {
         };
         self.scope(&scope)
             .is_some_and(|contract| contract.model_has_enabled_protocol(&mapping.upstream_model))
+    }
+
+    /// Persisted bindings survive catalog rotation, but only bindings whose
+    /// exact upstream ID remains in the current Provider catalog with an
+    /// enabled protocol may enter runtime Alias resolution.
+    pub fn routeable_user_alias_bindings(&self) -> Vec<UserAliasBinding> {
+        self.user_alias_bindings
+            .iter()
+            .filter(|binding| {
+                self.provider_offering(&binding.provider_id)
+                    .is_some_and(|contract| {
+                        contract
+                            .catalog
+                            .models
+                            .iter()
+                            .any(|model| model == &binding.upstream_model)
+                            && contract.model_has_enabled_protocol(&binding.upstream_model)
+                    })
+            })
+            .cloned()
+            .collect()
     }
 
     pub fn production_protocol_allowed(
@@ -807,6 +830,7 @@ pub fn build_effective_contracts(
         set.custom_endpoints
             .insert(runtime.account_id.clone(), contract);
     }
+    set.user_alias_bindings = persisted.user_alias_bindings;
     set
 }
 

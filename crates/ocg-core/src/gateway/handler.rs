@@ -259,6 +259,7 @@ fn published_alias_models_response(state: &CoreState) -> axum::response::Respons
     let cpa_ids = active_cpa_model_ids(state);
     let ollama_ids = provider_catalog_model_ids(&contracts, crate::provider::OLLAMA_PROVIDER_ID);
     let ollama_pinned_ids = crate::provider_contracts::ollama_cloud_pinned_model_ids(&contracts);
+    let user_aliases = contracts.routeable_user_alias_bindings();
     let custom_ids = match eligible_custom_public_models(state, &contracts) {
         Ok(ids) => ids,
         Err(error) => {
@@ -285,6 +286,7 @@ fn published_alias_models_response(state: &CoreState) -> axum::response::Respons
         cpa: &cpa_ids,
         ollama: &ollama_ids,
         ollama_pinned: &ollama_pinned_ids,
+        user_aliases: &user_aliases,
         extra: &extra,
     };
     let published = crate::alias::published_routeable_aliases_with_runtime_catalogs(catalogs);
@@ -564,6 +566,7 @@ async fn proxy_handler_inner(
     let ollama_model_ids =
         provider_catalog_model_ids(&contracts, crate::provider::OLLAMA_PROVIDER_ID);
     let ollama_pinned_ids = crate::provider_contracts::ollama_cloud_pinned_model_ids(&contracts);
+    let user_aliases = contracts.routeable_user_alias_bindings();
     let zen_catalog = state.zen_free_model_catalog();
     let dynamics = state.dynamic_providers();
     let extra: Vec<_> = dynamics
@@ -580,6 +583,7 @@ async fn proxy_handler_inner(
         cpa: &cpa_model_ids,
         ollama: &ollama_model_ids,
         ollama_pinned: &ollama_pinned_ids,
+        user_aliases: &user_aliases,
         extra: &extra,
     };
     let resolved = match crate::alias::resolve_with_runtime_catalogs(&routing_model, catalogs) {
@@ -697,6 +701,7 @@ async fn gemini_proxy_handler(
     let ollama_model_ids =
         provider_catalog_model_ids(&contracts, crate::provider::OLLAMA_PROVIDER_ID);
     let ollama_pinned_ids = crate::provider_contracts::ollama_cloud_pinned_model_ids(&contracts);
+    let user_aliases = contracts.routeable_user_alias_bindings();
     let zen_catalog = state.zen_free_model_catalog();
     let dynamics = state.dynamic_providers();
     let extra: Vec<_> = dynamics
@@ -713,6 +718,7 @@ async fn gemini_proxy_handler(
         cpa: &cpa_model_ids,
         ollama: &ollama_model_ids,
         ollama_pinned: &ollama_pinned_ids,
+        user_aliases: &user_aliases,
         extra: &extra,
     };
     let resolved = match crate::alias::resolve_with_runtime_catalogs(&routing_model, catalogs) {

@@ -33,7 +33,7 @@ GUI 或 CLI 启动时会原地执行 SQLite 迁移。打开新版二进制前：
 
 ## Schema v27 与 pre-v3 快照
 
-`CURRENT_SCHEMA_VERSION = 37`（`crates/ocg-core/src/db.rs`）。打开历史库会先规范迁移到 v26，再由 v27 重写把主 Key 与全部 `sub_gateway_keys` 行复制进一张 `access_keys` 表（主 Key 固定 id `00000000-0000-0000-0000-000000000001`），删除 `sub_gateway_keys`，并删除 `accounts` 上遗留的五列 `usage_sync_*`（用量同步元数据在 `provider_usage_sync_state`）。v33 新增 Custom 精确上游模型身份；v34 新增 CPA 单例配置表，但不会导入或导出 CPA 状态。v35 把 Provider/Plan 身份收成只有 `provider_id`：先预检每一个已知的 v34 provider/offering 对，未知对与会丢数据的复合键冲突在写入前失败，再重建受影响的表，使 offering 列不存在。v36 增量创建过 `ollama_cloud_usage_state`（未发布的 Cookie 用量抓取）。v37 删除该表且不动账号 Key 与日志，并创建 `ollama_cloud_billing`。账号 `key_cipher` / `password_cipher` 用 Host cipher 就地校验，**不会重新加密**。
+`CURRENT_SCHEMA_VERSION = 38`（`crates/ocg-core/src/db.rs`）。打开历史库会先规范迁移到 v26，再由 v27 重写把主 Key 与全部 `sub_gateway_keys` 行复制进一张 `access_keys` 表（主 Key 固定 id `00000000-0000-0000-0000-000000000001`），删除 `sub_gateway_keys`，并删除 `accounts` 上遗留的五列 `usage_sync_*`（用量同步元数据在 `provider_usage_sync_state`）。v33 新增 Custom 精确上游模型身份；v34 新增 CPA 单例配置表，但不会导入或导出 CPA 状态。v35 把 Provider/Plan 身份收成只有 `provider_id`：先预检每一个已知的 v34 provider/offering 对，未知对与会丢数据的复合键冲突在写入前失败，再重建受影响的表，使 offering 列不存在。v36 增量创建过 `ollama_cloud_usage_state`（未发布的 Cookie 用量抓取）。v37 删除该表且不动账号 Key 与日志，并创建 `ollama_cloud_billing`。v38 新增管理员确认的跨 Provider Alias 绑定，不会自动创建任何映射。账号 `key_cipher` / `password_cipher` 用 Host cipher 就地校验，**不会重新加密**。
 
 ## Schema v31 — 按模型/按协议覆盖
 
@@ -80,6 +80,10 @@ v37 删除 `ollama_cloud_usage_state`（未发布的 Cookie 抓取，包括混�
 - `billing_tier` — `pro` / `max` / `team`
 
 没有行即未配置（账号字段为 `null`）。既有 Ollama 账号迁移后没有行，仍可路由，Key 与日志保持不变。新建必须选择付费档并填写 `accounts.purchase_date`。节点导出/导入携带计费档位。该迁移不新增备份族。回滚仍是既有的整目录恢复。
+
+## Schema v38 — 用户模型 Alias 绑定
+
+v38 创建 `user_model_alias_bindings`，复合主键为 `(alias, provider_id)`。每行保存一个小写公开 Alias，以及从该密封 Provider 当前目录中人工选择的精确上游模型 ID。迁移不会创建任何行：目录或价格刷新绝不猜测模型等价关系。Dashboard V3 在 CAS 下原子替换完整绑定集，并校验目录成员、启用协议、重复 Provider，以及与既有 raw/内置路由的冲突。后续目录删除模型时，保存的映射会变成不可路由，而不会自动改指向其他模型。既有账号、Key、日志、静态 Alias 与 Provider 合约均保持不变。节点导出/导入携带完整绑定集；回滚仍使用既有整目录恢复。
 
 ## Schema v33 — Custom 上游模型身份
 

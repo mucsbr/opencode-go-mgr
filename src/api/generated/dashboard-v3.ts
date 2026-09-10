@@ -179,7 +179,9 @@ export type DashboardApiV3 =
   | DynamicProviderDiscoverResponse
   | DynamicProviderTestRequest
   | DynamicProviderTestResponse
-  | OllamaBillingTier;
+  | OllamaBillingTier
+  | ModelAliasBinding
+  | ModelAliasBindingsUpdate;
 /**
  * Which listed models take the list-mode exception leg.
  */
@@ -739,11 +741,20 @@ export interface ZenFreeModel {
  * are display-only and must not be sent as `expectedRevision`.
  */
 export interface ProviderContracts {
+  aliasBindings: ModelAliasBinding[];
   customEndpoints: CustomEndpointContract[];
   pricingRevision: string;
   processGeneration: number;
   providers: ProviderContractGroup[];
   revision: number;
+}
+/**
+ * One administrator-confirmed public Alias mapping for a sealed Provider.
+ */
+export interface ModelAliasBinding {
+  alias: string;
+  providerId: string;
+  upstreamModel: string;
 }
 /**
  * One Custom API account scope. Distinct from built-in provider groups.
@@ -2166,4 +2177,12 @@ export interface DynamicProviderTestResponse {
   ok: boolean;
   processGeneration: number;
   revision: number;
+}
+/**
+ * Atomic replacement of every user-defined model Alias binding.
+ */
+export interface ModelAliasBindingsUpdate {
+  bindings: ModelAliasBinding[];
+  expectedRevision: number;
+  processGeneration: number;
 }

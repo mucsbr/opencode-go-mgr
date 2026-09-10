@@ -987,6 +987,17 @@ export const enUSMessages = {
   "鉴权方式": "Auth kind",
   "测试模型": "Test model",
   "只读汇总当前供应商合同与 Custom 账号映射。": "Read-only summary of current provider contracts and Custom account mappings.",
+  "汇总当前供应商合同、Custom 账号映射与人工确认的跨供应商绑定。": "Summary of current Provider contracts, Custom account mappings, and administrator-confirmed cross-Provider bindings.",
+  "配置 Alias": "Configure Alias",
+  "编辑": "Edit",
+  "编辑 Alias": "Edit Alias",
+  "例如：deepseek-flash": "For example: deepseek-flash",
+  "供应商映射": "Provider mappings",
+  "选择供应商": "Select Provider",
+  "选择上游模型": "Select upstream model",
+  "添加供应商映射": "Add Provider mapping",
+  "删除 Alias": "Delete Alias",
+  "确定删除这个人工 Alias 绑定吗？内置 Alias 不受影响。": "Delete this administrator-defined Alias binding? Built-in Aliases are not affected.",
 } as const;
 
 export type MessageKey = keyof typeof enUSMessages;

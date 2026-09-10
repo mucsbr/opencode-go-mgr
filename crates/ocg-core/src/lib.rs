@@ -28,6 +28,7 @@ pub(crate) mod host_gateway;
 pub mod host_router;
 pub(crate) mod http_client;
 pub mod kernel;
+pub(crate) mod model_aliases;
 pub mod models;
 pub(crate) mod plan_usage;
 pub mod pricing;

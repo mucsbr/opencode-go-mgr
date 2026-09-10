@@ -16,9 +16,9 @@ keeps the data directory and auto-start setting, migrates existing desktop and
 Start-menu shortcuts, and replaces the old installed-app registration with the
 new product name.
 
-## Database Migration And Access Keys (Schema v37)
+## Database Migration And Access Keys (Schema v38)
 
-The database schema is **v37**; historical databases migrate in place on
+The database schema is **v38**; historical databases migrate in place on
 startup. Upgrading from a single-key version keeps your existing credential
 as the **primary key** (fixed id
 `00000000-0000-0000-0000-000000000001`), so clients keep authenticating
@@ -31,13 +31,17 @@ rewrite copies the primary Key and every `sub_gateway_keys` row into
 `access_keys`, drops `sub_gateway_keys`, and drops the legacy
 `accounts.usage_sync_*` columns. Before any v27 write the database receives a
 sibling snapshot `data.sqlite.pre-v3.<timestamp>.bak` plus a SHA-256 sidecar.
-A fresh empty data directory creates schema v37 directly and skips the
+A fresh empty data directory creates schema v38 directly and skips the
 snapshot. That snapshot is a v26 rollback point, not a substitute for a
 complete backup; verify the sidecar before restoring it, and restore it only
 onto a v26-capable binary or to retry a v27 open that never committed. Never
 open a migrated database with an older build — extra Keys do not authenticate
 on a single-key-era build, and a revoked value cannot come back to life by
 downgrading.
+
+Schema v38 also stores administrator-confirmed cross-Provider model Alias
+bindings. Node export/import carries the complete binding set; catalog refresh
+never creates or retargets these mappings automatically.
 
 v29 removes SCNet Token Plans from the catalog and deletes any existing
 SCNet account rows during migration. Every startup normalizes historical

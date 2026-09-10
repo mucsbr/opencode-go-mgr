@@ -1539,6 +1539,150 @@ async fn dashboard_v3_custom_endpoint_model_protocol_overrides_enforce_cas_and_p
 }
 
 #[tokio::test]
+async fn dashboard_v3_user_alias_bindings_are_cas_persisted_and_provider_scoped() {
+    let harness = start_loopback("provider-user-alias-bindings").await;
+    let now = chrono::Utc::now();
+    {
+        let db = harness.state.db.lock();
+        db.set_contract_catalog(
+            &ContractScope::provider(OPENCODE_PROVIDER_ID),
+            &["deepseek-flash".to_string()],
+            Some(now),
+            CATALOG_SOURCE_OPENCODE_MODELS,
+            "https://opencode.ai/zen/go/v1/models",
+            now,
+        )
+        .unwrap();
+        db.set_model_protocol_overrides(
+            &ContractScope::provider(OPENCODE_PROVIDER_ID),
+            &[(
+                "deepseek-flash".to_string(),
+                ocg_core::provider::UpstreamProtocolKind::ChatCompletions,
+                ocg_core::provider_contracts::ProtocolOverrideState::ForceOn,
+            )],
+            now,
+        )
+        .unwrap();
+        db.set_contract_catalog(
+            &ContractScope::provider(COMMAND_CODE_PROVIDER_ID),
+            &["deepseek/deepseek-v4.1-flash".to_string()],
+            Some(now),
+            CATALOG_SOURCE_COMMAND_CODE_MODELS,
+            "https://api.commandcode.ai/provider/v1/models",
+            now,
+        )
+        .unwrap();
+        db.set_model_protocol_overrides(
+            &ContractScope::provider(COMMAND_CODE_PROVIDER_ID),
+            &[(
+                "deepseek/deepseek-v4.1-flash".to_string(),
+                ocg_core::provider::UpstreamProtocolKind::ChatCompletions,
+                ocg_core::provider_contracts::ProtocolOverrideState::ForceOn,
+            )],
+            now,
+        )
+        .unwrap();
+        harness.state.reload_provider_contracts_locked(&db).unwrap();
+    }
+
+    let before = harness.state.settings_revision();
+    let (status, body) = send_json(
+        &harness,
+        Method::PUT,
+        "/model-alias-bindings",
+        &cas(
+            &harness,
+            json!({
+                "bindings": [
+                    {
+                        "alias": "deepseek-flash",
+                        "providerId": OPENCODE_PROVIDER_ID,
+                        "upstreamModel": "deepseek-flash"
+                    },
+                    {
+                        "alias": "deepseek-flash",
+                        "providerId": COMMAND_CODE_PROVIDER_ID,
+                        "upstreamModel": "deepseek/deepseek-v4.1-flash"
+                    }
+                ]
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(harness.state.settings_revision(), before + 1);
+    assert_eq!(body["aliasBindings"].as_array().unwrap().len(), 2);
+
+    let persisted = harness.state.db.lock().load_persisted_contracts().unwrap();
+    assert_eq!(persisted.user_alias_bindings.len(), 2);
+
+    let unchanged_revision = harness.state.settings_revision();
+    let (noop_status, noop_body) = send_json(
+        &harness,
+        Method::PUT,
+        "/model-alias-bindings",
+        &cas(
+            &harness,
+            json!({
+                "bindings": [
+                    {
+                        "alias": "deepseek-flash",
+                        "providerId": OPENCODE_PROVIDER_ID,
+                        "upstreamModel": "deepseek-flash"
+                    },
+                    {
+                        "alias": "deepseek-flash",
+                        "providerId": COMMAND_CODE_PROVIDER_ID,
+                        "upstreamModel": "deepseek/deepseek-v4.1-flash"
+                    }
+                ]
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(noop_status, StatusCode::OK, "{noop_body}");
+    assert_eq!(harness.state.settings_revision(), unchanged_revision);
+
+    let contracts = harness.state.provider_contracts();
+    let aliases = ocg_core::alias::RuntimeCatalogs {
+        go: &contracts.providers[OPENCODE_PROVIDER_ID].catalog.models,
+        command_code: &contracts.providers[COMMAND_CODE_PROVIDER_ID].catalog.models,
+        user_aliases: &contracts.user_alias_bindings,
+        ..ocg_core::alias::RuntimeCatalogs::default()
+    };
+    match ocg_core::alias::resolve_with_runtime_catalogs("deepseek-flash", aliases).unwrap() {
+        ocg_core::alias::ResolvedModel::Alias { mappings, .. } => {
+            assert_eq!(mappings.len(), 2);
+            assert!(mappings.iter().any(|mapping| {
+                mapping.provider_id == OPENCODE_PROVIDER_ID
+                    && mapping.upstream_model == "deepseek-flash"
+            }));
+            assert!(mappings.iter().any(|mapping| {
+                mapping.provider_id == COMMAND_CODE_PROVIDER_ID
+                    && mapping.upstream_model == "deepseek/deepseek-v4.1-flash"
+            }));
+        }
+        other => panic!("expected confirmed Alias mapping, got {other:?}"),
+    }
+
+    let (stale_status, stale) = send_json(
+        &harness,
+        Method::PUT,
+        "/model-alias-bindings",
+        &json!({
+            "expectedRevision": before,
+            "processGeneration": harness.state.process_generation(),
+            "bindings": []
+        }),
+    )
+    .await;
+    assert_eq!(stale_status, StatusCode::CONFLICT, "{stale}");
+    assert_eq!(stale["code"], ERROR_REVISION_CONFLICT);
+
+    harness.stop();
+}
+
+#[tokio::test]
 async fn dashboard_v3_provider_routes_coexist_with_v2_and_omit_v2_aliases() {
     let harness = start_loopback("providers-coexist").await;
 

@@ -218,6 +218,8 @@ pub const CATALOG_TYPE_NAMES: &[&str] = &[
     "DynamicProviderTestRequest",
     "DynamicProviderTestResponse",
     "OllamaBillingTier",
+    "ModelAliasBinding",
+    "ModelAliasBindingsUpdate",
 ];
 
 pub const ERROR_UNAUTHORIZED: &str = "unauthorized";
@@ -1437,9 +1439,30 @@ pub struct ZenFreeModel {
 pub struct ProviderContracts {
     pub providers: Vec<ProviderContractGroup>,
     pub custom_endpoints: Vec<CustomEndpointContract>,
+    pub alias_bindings: Vec<ModelAliasBinding>,
     pub revision: u64,
     pub process_generation: u64,
     pub pricing_revision: String,
+}
+
+/// One administrator-confirmed public Alias mapping for a sealed Provider.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+#[schemars(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ModelAliasBinding {
+    pub alias: String,
+    pub provider_id: String,
+    pub upstream_model: String,
+}
+
+/// Atomic replacement of every user-defined model Alias binding.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[schemars(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ModelAliasBindingsUpdate {
+    #[serde(flatten)]
+    pub expectation: MutationExpectation,
+    pub bindings: Vec<ModelAliasBinding>,
 }
 
 /// One built-in Provider contract scope.
@@ -3360,6 +3383,7 @@ pub fn contract_schema() -> Value {
     include_type::<AccountVerify>(&mut deserialize);
     include_type::<ZenFreeSettingsUpdate>(&mut deserialize);
     include_type::<ModelProtocolOverridesUpdate>(&mut deserialize);
+    include_type::<ModelAliasBindingsUpdate>(&mut deserialize);
     include_type::<ProtocolProbeRequest>(&mut deserialize);
     include_type::<PricingRefreshUpdate>(&mut deserialize);
     include_type::<PricingRefreshPolicy>(&mut deserialize);

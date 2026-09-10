@@ -1,3 +1,4 @@
+use crate::alias::UserAliasBinding;
 use crate::crypto::KeyCipher;
 use crate::custom::validate_custom_endpoint_url;
 use crate::dynamic::DynamicProviderRuntime;
@@ -194,7 +195,7 @@ pub const PRE_V3_BACKUP_FILE_PREFIX: &str = "data.sqlite.pre-v3.";
 /// database is rewritten to provider-only identity in v35.
 pub const PRE_V35_BACKUP_FILE_PREFIX: &str = "data.sqlite.pre-v35.";
 /// Highest schema this binary can open or migrate. Newer databases fail closed.
-pub const CURRENT_SCHEMA_VERSION: i32 = 37;
+pub const CURRENT_SCHEMA_VERSION: i32 = 38;
 /// Canonical source schema for the v35 provider-identity rewrite.
 pub const V34_SCHEMA_VERSION: i32 = 34;
 /// Historical v34 offering IDs. Used only by v1–v34 SQL and the v35 preflight
@@ -2433,6 +2434,38 @@ fn migrate_to_v37(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// v38: administrator-confirmed public Alias bindings for sealed Providers.
+/// Discovery and pricing refresh never populate this table automatically.
+fn migrate_to_v38(conn: &Connection) -> Result<()> {
+    let version = schema_version_on(conn)?;
+    if version >= 38 {
+        return Ok(());
+    }
+    anyhow::ensure!(
+        version == 37,
+        "v38 requires a canonical schema v37 source, found {version}"
+    );
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch(
+        "CREATE TABLE IF NOT EXISTS user_model_alias_bindings (
+            alias TEXT NOT NULL CHECK (
+                length(alias) BETWEEN 1 AND 128
+                AND alias = lower(alias)
+                AND alias NOT GLOB '*[^a-z0-9.-]*'
+                AND substr(alias, 1, 1) GLOB '[a-z0-9]'
+                AND substr(alias, -1, 1) GLOB '[a-z0-9]'
+            ),
+            provider_id TEXT NOT NULL CHECK (length(provider_id) BETWEEN 1 AND 128),
+            upstream_model TEXT NOT NULL CHECK (length(upstream_model) BETWEEN 1 AND 512),
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (alias, provider_id)
+        );
+        INSERT OR REPLACE INTO schema_version (version) VALUES (38);",
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
 #[cfg(test)]
 pub(crate) mod dynamic_provider_fault {
     use std::cell::Cell;
@@ -3228,6 +3261,7 @@ impl Database {
         migrate_to_v35(&db.conn, &db_path, is_fresh)?;
         migrate_to_v36(&db.conn)?;
         migrate_to_v37(&db.conn)?;
+        migrate_to_v38(&db.conn)?;
         ensure_dynamic_provider_tables(&db.conn)?;
         Ok(db)
     }
@@ -4676,7 +4710,46 @@ impl Database {
                     .push(row);
             }
         }
+        {
+            let mut stmt = self.conn.prepare(
+                "SELECT alias, provider_id, upstream_model
+                 FROM user_model_alias_bindings
+                 ORDER BY alias, provider_id",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok(UserAliasBinding {
+                    alias: row.get(0)?,
+                    provider_id: row.get(1)?,
+                    upstream_model: row.get(2)?,
+                })
+            })?;
+            persisted.user_alias_bindings = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        }
         Ok(persisted)
+    }
+
+    pub fn replace_user_model_alias_bindings(
+        &self,
+        bindings: &[UserAliasBinding],
+        now: DateTime<Utc>,
+    ) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM user_model_alias_bindings", [])?;
+        for binding in bindings {
+            tx.execute(
+                "INSERT INTO user_model_alias_bindings
+                 (alias, provider_id, upstream_model, updated_at)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    binding.alias,
+                    binding.provider_id,
+                    binding.upstream_model,
+                    now.to_rfc3339(),
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     pub fn load_persisted_scope(&self, scope: &ContractScope) -> Result<Option<PersistedScopeRow>> {
@@ -5431,6 +5504,21 @@ impl Database {
                     override_row.updated_at,
                 )?;
             }
+        }
+
+        tx.execute("DELETE FROM user_model_alias_bindings", [])?;
+        for binding in &record.provider_contracts.user_alias_bindings {
+            tx.execute(
+                "INSERT INTO user_model_alias_bindings
+                 (alias, provider_id, upstream_model, updated_at)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    binding.alias,
+                    binding.provider_id,
+                    binding.upstream_model,
+                    Utc::now().to_rfc3339(),
+                ],
+            )?;
         }
 
         ensure_dynamic_singleton_accounts_on(&tx)?;

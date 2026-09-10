@@ -168,6 +168,7 @@ function contracts(overrides: Partial<ProviderContractsResponse> = {}): Provider
     providers: [providerGroup()],
     custom_endpoints: [customEndpoint()],
     ...overrides,
+    alias_bindings: overrides.alias_bindings ?? [],
   };
 }
 

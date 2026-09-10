@@ -2309,6 +2309,94 @@ async fn goat_preset_alias_routes_before_go_when_account_order_prefers_goat() {
 }
 
 #[tokio::test]
+async fn confirmed_alias_rewrites_the_model_for_each_selected_provider() {
+    let p = PreparedFallback::go(
+        &[("goat-key", &[ok()]), ("open-key", &[ok()])],
+        &["open-key"],
+    )
+    .await;
+    let origin = p.base_url.clone();
+    let goat_id = prepare_goat(
+        &p.state,
+        "goat-key",
+        &["deepseek/deepseek-v4.1-flash"],
+        true,
+    );
+    let now = Utc::now();
+    {
+        let db = p.state.db.lock();
+        db.set_contract_catalog(
+            &ocg_core::provider_contracts::ContractScope::provider(OPENCODE_PROVIDER_ID),
+            &["deepseek-flash".to_string()],
+            Some(now),
+            ocg_core::provider_contracts::CATALOG_SOURCE_OPENCODE_MODELS,
+            "http://127.0.0.1/models",
+            now,
+        )
+        .unwrap();
+        db.set_model_protocol_overrides(
+            &ocg_core::provider_contracts::ContractScope::provider(OPENCODE_PROVIDER_ID),
+            &[(
+                "deepseek-flash".to_string(),
+                ocg_core::provider::UpstreamProtocolKind::ChatCompletions,
+                ocg_core::provider_contracts::ProtocolOverrideState::ForceOn,
+            )],
+            now,
+        )
+        .unwrap();
+        db.replace_user_model_alias_bindings(
+            &[
+                ocg_core::alias::UserAliasBinding {
+                    alias: "deepseek-flash".to_string(),
+                    provider_id: OPENCODE_PROVIDER_ID.to_string(),
+                    upstream_model: "deepseek-flash".to_string(),
+                },
+                ocg_core::alias::UserAliasBinding {
+                    alias: "deepseek-flash".to_string(),
+                    provider_id: COMMAND_CODE_PROVIDER_ID.to_string(),
+                    upstream_model: "deepseek/deepseek-v4.1-flash".to_string(),
+                },
+            ],
+            now,
+        )
+        .unwrap();
+        p.state.reload_provider_contracts_locked(&db).unwrap();
+    }
+    let mut h = p.bind().await;
+    h.attach_goat_route(goat_id.clone(), origin);
+
+    let (status, body) = h.protocol("/v1/chat/completions", "deepseek-flash").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    {
+        let calls = h.calls.lock().unwrap();
+        assert_eq!(calls[0].key, "goat-key");
+        assert_eq!(calls[0].path, "/provider/v1/chat/completions");
+        assert!(
+            calls[0]
+                .body
+                .contains(r#""model":"deepseek/deepseek-v4.1-flash""#)
+        );
+    }
+
+    h.state
+        .db
+        .lock()
+        .reorder_accounts(&[
+            "acct-1".to_string(),
+            goat_id,
+            ZEN_FREE_ACCOUNT_ID.to_string(),
+        ])
+        .unwrap();
+    h.state.routing.reset();
+    let (status, body) = h.protocol("/v1/chat/completions", "deepseek-flash").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let calls = h.calls.lock().unwrap();
+    assert_eq!(calls[1].key, "open-key");
+    assert_eq!(calls[1].path, "/v1/chat/completions");
+    assert!(calls[1].body.contains(r#""model":"deepseek-flash""#));
+}
+
+#[tokio::test]
 async fn mixed_goat_cooldown_and_sticky_state_are_independent() {
     let p = PreparedFallback::start(
         script(&[("goat-key", &[limited()]), ("open-key", &[ok()])]),

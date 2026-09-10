@@ -8063,6 +8063,39 @@ fn v36_to_v37_discards_cookie_usage_state_and_keeps_account_keys() {
 }
 
 #[test]
+fn v37_to_v38_adds_user_model_alias_bindings_and_round_trips_rows() {
+    let dir = temp_data_dir("v37-v38-user-model-aliases");
+    {
+        let db = Database::open(dir.clone()).unwrap();
+        db.conn
+            .execute_batch(
+                "DROP TABLE user_model_alias_bindings;
+                 DELETE FROM schema_version;
+                 INSERT INTO schema_version (version) VALUES (37);",
+            )
+            .unwrap();
+    }
+
+    let db = Database::open(dir.clone()).unwrap();
+    assert_eq!(db.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
+    assert!(table_exists(&db.conn, "user_model_alias_bindings").unwrap());
+    let rows = vec![crate::alias::UserAliasBinding {
+        alias: "deepseek-flash".to_string(),
+        provider_id: COMMAND_CODE_PROVIDER_ID.to_string(),
+        upstream_model: "deepseek/deepseek-v4.1-flash".to_string(),
+    }];
+    db.replace_user_model_alias_bindings(&rows, Utc::now())
+        .unwrap();
+    assert_eq!(
+        db.load_persisted_contracts().unwrap().user_alias_bindings,
+        rows
+    );
+
+    drop(db);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn ollama_billing_tier_round_trip_and_cascade() {
     let dir = temp_data_dir("ollama-billing-roundtrip");
     let mut db = Database::open(dir.clone()).unwrap();

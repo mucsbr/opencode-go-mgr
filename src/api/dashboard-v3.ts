@@ -82,6 +82,7 @@ import type {
   KeyCreate,
   KeyUpdate,
   ModelProtocolOverridesUpdate,
+  ModelAliasBindingsUpdate,
   MutationAck,
   MutationExpectation,
   PricingMultipliersUpdate,
@@ -787,6 +788,13 @@ export const dashboardV3 = {
       body: mutation(expectation),
     }),
   getProviderContracts: () => requestV3<ProviderContracts>("/provider-contracts"),
+  putModelAliasBindings: (
+    update: WithoutExpectation<ModelAliasBindingsUpdate>,
+    expectation: MutationExpectation,
+  ) => requestV3<ProviderContracts>("/model-alias-bindings", {
+    method: "PUT",
+    body: withExpectation(update, expectation),
+  }),
   refreshContractCatalog: (
     scopeKind: ContractScopeKind,
     scopeId: string,

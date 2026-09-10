@@ -1,5 +1,5 @@
 import type { Account } from "../api/dashboard.ts";
-import type { DynamicProviderView } from "../api/providers.ts";
+import type { DynamicProviderView, ModelAliasBindingView } from "../api/providers.ts";
 import type { ProviderScopeView } from "./provider-contracts.ts";
 
 export interface ProviderAliasRow {
@@ -10,17 +10,14 @@ export interface ProviderAliasRow {
   upstream_model: string;
   routable: boolean;
   custom_account_id: string | null;
+  user_defined: boolean;
 }
 
 function providerPlanLabel(scope: ProviderScopeView): string {
   return scope.label;
 }
 
-/**
- * This is a read-only cross-reference. Provider contracts describe built-in
- * Alias resolution; account capabilities describe Custom mappings. No new
- * catalog or state is introduced for the table.
- */
+/** Built-in and Custom rows remain read-only cross-references. */
 export function providerAliasRows(
   scopes: readonly ProviderScopeView[],
   accounts: readonly Account[],
@@ -43,6 +40,7 @@ export function providerAliasRows(
         upstream_model: model.model_id,
         routable: model.routable,
         custom_account_id: null,
+        user_defined: false,
       });
     }
   }
@@ -70,6 +68,7 @@ export function providerAliasRows(
           && account.plan_routable
           && Boolean(contract?.routable),
         custom_account_id: account.id,
+        user_defined: false,
       });
     }
   }
@@ -87,14 +86,42 @@ export function dynamicProviderAliasRows(
     upstream_model: model.upstream_model,
     routable: true,
     custom_account_id: null,
+    user_defined: false,
   })));
 }
 
-/** Production Alias table: built-in/Custom rows, then definition-level dynamic rows. */
+export function userProviderAliasRows(
+  scopes: readonly ProviderScopeView[],
+  bindings: readonly ModelAliasBindingView[],
+): ProviderAliasRow[] {
+  return bindings.map((binding) => {
+    const scope = scopes.find((candidate) => (
+      candidate.scope_kind === "provider" && candidate.provider_id === binding.provider_id
+    ));
+    const model = scope?.models.find((candidate) => candidate.model_id === binding.upstream_model);
+    return {
+      key: `user:${binding.alias}:${binding.provider_id}:${binding.upstream_model}`,
+      public_model: binding.alias,
+      provider_plan: scope?.label || binding.provider_id,
+      custom_account: null,
+      upstream_model: binding.upstream_model,
+      routable: Boolean(model?.routable),
+      custom_account_id: null,
+      user_defined: true,
+    };
+  });
+}
+
+/** Production Alias table plus administrator-confirmed sealed-Provider bindings. */
 export function mergeProviderAliasRows(
   scopes: readonly ProviderScopeView[],
   accounts: readonly Account[],
   providers: readonly DynamicProviderView[],
+  userBindings: readonly ModelAliasBindingView[] = [],
 ): ProviderAliasRow[] {
-  return [...providerAliasRows(scopes, accounts), ...dynamicProviderAliasRows(providers)];
+  return [
+    ...providerAliasRows(scopes, accounts),
+    ...dynamicProviderAliasRows(providers),
+    ...userProviderAliasRows(scopes, userBindings),
+  ];
 }

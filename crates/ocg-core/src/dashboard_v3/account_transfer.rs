@@ -138,6 +138,16 @@ struct PortableNodeState {
     zen_free: PortableZenFree,
     account_order: Vec<String>,
     provider_contracts: Vec<PortableProviderContract>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    model_alias_bindings: Vec<PortableModelAliasBinding>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PortableModelAliasBinding {
+    alias: String,
+    provider_id: String,
+    upstream_model: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -276,6 +286,7 @@ impl Zeroize for PortableNodeState {
         self.zen_free.zeroize();
         self.account_order.zeroize();
         self.provider_contracts.zeroize();
+        self.model_alias_bindings.zeroize();
     }
 }
 
@@ -307,6 +318,14 @@ impl Zeroize for PortableProviderContract {
         self.catalog_source_url.zeroize();
         self.evidence.zeroize();
         self.overrides.zeroize();
+    }
+}
+
+impl Zeroize for PortableModelAliasBinding {
+    fn zeroize(&mut self) {
+        self.alias.zeroize();
+        self.provider_id.zeroize();
+        self.upstream_model.zeroize();
     }
 }
 
@@ -674,8 +693,12 @@ async fn import_accounts_inner(
                     .map(|value| value.with_timezone(&Utc)),
                 source_url: node.zen_free.source_url.clone(),
             },
-            provider_contracts: persisted_contracts_from_portable(&node.provider_contracts, now)
-                .map_err(|error| V3ApiError::invalid_request_at(&state, error))?,
+            provider_contracts: persisted_contracts_from_portable(
+                &node.provider_contracts,
+                &node.model_alias_bindings,
+                now,
+            )
+            .map_err(|error| V3ApiError::invalid_request_at(&state, error))?,
             dynamic_providers: validated.dynamic_providers,
         };
         let runtime = state
@@ -928,6 +951,15 @@ fn export_payload(state: &CoreState) -> Result<(PortablePayload, u64, u64), Tran
                 },
                 account_order,
                 provider_contracts,
+                model_alias_bindings: persisted_contracts
+                    .user_alias_bindings
+                    .iter()
+                    .map(|binding| PortableModelAliasBinding {
+                        alias: binding.alias.clone(),
+                        provider_id: binding.provider_id.clone(),
+                        upstream_model: binding.upstream_model.clone(),
+                    })
+                    .collect(),
             }),
         },
         skipped,
@@ -1579,13 +1611,34 @@ fn validate_node_state(
             ));
         }
     }
-    persisted_contracts_from_portable(&node.provider_contracts, Utc::now())
+    let persisted = persisted_contracts_from_portable(
+        &node.provider_contracts,
+        &node.model_alias_bindings,
+        Utc::now(),
+    )
+    .map_err(TransferError::Invalid)?;
+    let zen = crate::kernel::zen::ZenFreeModelCatalog {
+        models: node.zen_free.models.clone(),
+        refreshed_at: node
+            .zen_free
+            .refreshed_at
+            .as_deref()
+            .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+            .map(|value| value.with_timezone(&Utc)),
+        source_url: node.zen_free.source_url.clone(),
+    };
+    let requested_aliases = persisted.user_alias_bindings.clone();
+    let mut base_contracts = persisted;
+    base_contracts.user_alias_bindings.clear();
+    let effective = crate::provider_contracts::build_effective_contracts(&zen, &[], base_contracts);
+    crate::model_aliases::validate_user_alias_bindings(&requested_aliases, &effective)
         .map_err(TransferError::Invalid)?;
     Ok(node)
 }
 
 fn persisted_contracts_from_portable(
     portable: &[PortableProviderContract],
+    aliases: &[PortableModelAliasBinding],
     default_time: DateTime<Utc>,
 ) -> Result<PersistedContracts, String> {
     let mut persisted = PersistedContracts::default();
@@ -1692,6 +1745,29 @@ fn persisted_contracts_from_portable(
             });
         }
         persisted.overrides.insert(scope, override_rows);
+    }
+    if aliases.len() > crate::model_aliases::MAX_USER_ALIAS_BINDINGS {
+        return Err("node migration contains too many model Alias bindings".to_string());
+    }
+    let mut alias_keys = HashSet::new();
+    for binding in aliases {
+        let alias = binding.alias.trim();
+        let provider_id = binding.provider_id.trim();
+        let upstream_model = binding.upstream_model.trim();
+        if alias.is_empty()
+            || provider_id.is_empty()
+            || upstream_model.is_empty()
+            || !alias_keys.insert((alias.to_string(), provider_id.to_string()))
+        {
+            return Err("node migration contains an invalid model Alias binding".to_string());
+        }
+        persisted
+            .user_alias_bindings
+            .push(crate::alias::UserAliasBinding {
+                alias: alias.to_string(),
+                provider_id: provider_id.to_string(),
+                upstream_model: upstream_model.to_string(),
+            });
     }
     Ok(persisted)
 }
@@ -1993,6 +2069,7 @@ mod tests {
                 account_id.to_string(),
             ],
             provider_contracts: Vec::new(),
+            model_alias_bindings: Vec::new(),
         }
     }
 
@@ -2009,6 +2086,35 @@ mod tests {
         let migration = decrypt_and_validate(&bundle, "correct horse battery").unwrap();
         assert_eq!(migration.accounts.len(), 1);
         assert_eq!(migration.accounts[0].key.as_str(), "sk-ocg-test-secret");
+    }
+
+    #[test]
+    fn node_payload_carries_validated_model_alias_bindings() {
+        let mut payload = sample_payload();
+        let node = payload.node.as_mut().unwrap();
+        node.provider_contracts.push(PortableProviderContract {
+            provider_id: crate::provider::OPENCODE_PROVIDER_ID.to_string(),
+            catalog_models: vec!["deepseek-flash".to_string()],
+            catalog_refreshed_at: Some("2026-09-10T00:00:00Z".to_string()),
+            catalog_source: crate::provider_contracts::CATALOG_SOURCE_OPENCODE_MODELS.to_string(),
+            catalog_source_url: "https://opencode.ai/zen/go/v1/models".to_string(),
+            evidence: Vec::new(),
+            overrides: vec![PortableProtocolOverride {
+                model_id: "deepseek-flash".to_string(),
+                protocol: "chat_completions".to_string(),
+                state: "force_on".to_string(),
+            }],
+        });
+        node.model_alias_bindings.push(PortableModelAliasBinding {
+            alias: "deepseek-flash".to_string(),
+            provider_id: crate::provider::OPENCODE_PROVIDER_ID.to_string(),
+            upstream_model: "deepseek-flash".to_string(),
+        });
+
+        let migration = validate_payload(payload).unwrap();
+        let imported = migration.node.as_deref().unwrap();
+        assert_eq!(imported.model_alias_bindings.len(), 1);
+        assert_eq!(imported.model_alias_bindings[0].alias, "deepseek-flash");
     }
 
     #[test]

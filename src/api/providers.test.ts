@@ -189,6 +189,58 @@ test("unified catalog refresh sends only the selected contract scope and CAS tok
   }]);
 });
 
+test("administrator Alias bindings replace the complete set under CAS", async () => {
+  setupControlPlane(12, 42, "p1");
+  const requests = installFetchMock(({ url, method, body }) => {
+    if (url.endsWith("/model-alias-bindings") && method === "PUT") {
+      return {
+        revision: 13,
+        processGeneration: 42,
+        pricingRevision: "p1",
+        providers: [],
+        customEndpoints: [],
+        aliasBindings: body?.bindings ?? [],
+      };
+    }
+    throw new Error(`unexpected request ${url}`);
+  });
+
+  const result = await providerApi.updateModelAliasBindings([
+    {
+      alias: "deepseek-flash",
+      provider_id: "opencode",
+      upstream_model: "deepseek-flash",
+    },
+    {
+      alias: "deepseek-flash",
+      provider_id: "command-code",
+      upstream_model: "deepseek/deepseek-v4.1-flash",
+    },
+  ]);
+
+  assert.equal(result.alias_bindings.length, 2);
+  assert.deepEqual(requests[0], {
+    url: "/dashboard/api/v3/model-alias-bindings",
+    method: "PUT",
+    body: {
+      bindings: [
+        {
+          alias: "deepseek-flash",
+          providerId: "opencode",
+          upstreamModel: "deepseek-flash",
+        },
+        {
+          alias: "deepseek-flash",
+          providerId: "command-code",
+          upstreamModel: "deepseek/deepseek-v4.1-flash",
+        },
+      ],
+      expectedRevision: 12,
+      processGeneration: 42,
+    },
+  });
+});
+
 test("Custom endpoint protocol probe stays blocked while overrides use the model-protocol-overrides route", async () => {
   setupControlPlane(8, 42, "p1");
   const requests = installFetchMock(({ url, method }) => {

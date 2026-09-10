@@ -36,6 +36,7 @@ fn catalogs<'a>(
         cpa: NO_IDS,
         ollama: NO_IDS,
         ollama_pinned: NO_IDS,
+        user_aliases: &[],
         extra: &[],
     }
 }

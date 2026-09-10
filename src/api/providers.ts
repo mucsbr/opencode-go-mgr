@@ -8,6 +8,7 @@ import type {
   DynamicProviderMutation as V3DynamicProviderMutation,
   DynamicProviderTestResponse as V3DynamicProviderTestResponse,
   ModelProtocolOverridesUpdate,
+  ModelAliasBindingsUpdate,
   ProviderCatalogEntry as V3ProviderCatalogEntry,
   ProviderContracts as V3ProviderContracts,
   ProviderPricing as V3ProviderPricing,
@@ -289,6 +290,13 @@ export interface ProviderContractsResponse {
   revision: number;
   providers: ProviderContractGroup[];
   custom_endpoints: CustomEndpointContract[];
+  alias_bindings: ModelAliasBindingView[];
+}
+
+export interface ModelAliasBindingView {
+  alias: string;
+  provider_id: string;
+  upstream_model: string;
 }
 
 export interface ProtocolProbeRequest {
@@ -467,6 +475,11 @@ function presentAccountChoice(value: V3ProviderContracts["providers"][number]["a
 export function presentContracts(value: V3ProviderContracts): ProviderContractsResponse {
   return {
     revision: value.revision,
+    alias_bindings: (value.aliasBindings ?? []).map((binding) => ({
+      alias: binding.alias,
+      provider_id: binding.providerId,
+      upstream_model: binding.upstreamModel,
+    })),
     providers: value.providers.map((scope) => ({
       scope_kind: scope.scopeKind,
       scope_id: scope.scopeId,
@@ -681,6 +694,26 @@ export const providerApi = {
     ));
   },
   getProviderContracts: async () => presentContracts(await dashboardV3.getProviderContracts()),
+  updateModelAliasBindings: async (
+    bindings: ModelAliasBindingView[],
+  ): Promise<ProviderContractsResponse> => {
+    const control = useControlPlaneStore();
+    if (!control.hasTokens()) await control.refresh();
+    try {
+      return presentContracts(await control.runMutation((expectation) =>
+        dashboardV3.putModelAliasBindings({
+          bindings: bindings.map((binding) => ({
+            alias: binding.alias,
+            providerId: binding.provider_id,
+            upstreamModel: binding.upstream_model,
+          })),
+        } satisfies WithoutExpectation<ModelAliasBindingsUpdate>, expectation)
+      ));
+    } catch (cause) {
+      if (isRevisionConflict(cause)) await dashboardV3.getProviderContracts();
+      throw cause;
+    }
+  },
   updateModelProtocolOverrides: async (
     scopeKind: ContractScopeKind,
     scopeId: string,
