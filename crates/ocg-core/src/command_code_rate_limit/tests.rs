@@ -51,3 +51,36 @@ fn rejects_transient_malformed_expired_and_unbounded_rate_limits() {
     let beyond_week = r#"{"error":{"code":"RATE_LIMITED","message":"You've reached your weekly usage limit for your plan. Your limit resets at 2026-09-10T00:00:00Z.","type":"rate_limit_error"}}"#;
     assert!(parse_command_code_rate_limit(beyond_week, at("2026-09-02T00:00:00Z")).is_none());
 }
+
+#[test]
+fn recognizes_only_the_observed_insufficient_credits_envelope() {
+    let observed = r#"{"error":{"code":"BAD_REQUEST","message":"You have insufficient credits to make this request. Please purchase more credits to continue using the service.","type":"invalid_request_error"}}"#;
+    assert!(is_command_code_insufficient_credits(observed));
+
+    for rejected in [
+        r#"{"error":{"code":"BAD_REQUEST","message":"Invalid base64 data","type":"invalid_request_error"}}"#,
+        r#"{"error":{"code":"OTHER","message":"You have insufficient credits to make this request. Please purchase more credits.","type":"invalid_request_error"}}"#,
+        r#"{"error":{"code":"BAD_REQUEST","message":"You have insufficient credits to make this request. Please purchase more credits.","type":"rate_limit_error"}}"#,
+        r#"{"error":{"code":"BAD_REQUEST","message":"You have insufficient credits to make this request.","type":"invalid_request_error"}}"#,
+        "not json",
+    ] {
+        assert!(
+            !is_command_code_insufficient_credits(rejected),
+            "{rejected}"
+        );
+    }
+}
+
+#[test]
+fn derives_a_bounded_monthly_reset_from_the_saved_purchase_date() {
+    let observed_at = at("2026-09-11T02:51:52Z");
+    let resets_at = command_code_monthly_reset("2026-09-01", observed_at)
+        .expect("the current billing month should have a future renewal");
+    let local_reset = resets_at.with_timezone(&Local);
+    assert_eq!(local_reset.date_naive().to_string(), "2026-10-01");
+    assert_eq!(local_reset.time().to_string(), "00:00:00");
+
+    assert!(command_code_monthly_reset("", observed_at).is_none());
+    assert!(command_code_monthly_reset("2026-08-01", observed_at).is_none());
+    assert!(command_code_monthly_reset("2026-10-01", observed_at).is_none());
+}

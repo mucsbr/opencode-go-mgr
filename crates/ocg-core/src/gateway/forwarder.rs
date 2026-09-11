@@ -1045,6 +1045,7 @@ async fn forward_request_impl(
                 let observed_at = Utc::now();
                 let (window, until) = rate_limit_window_and_deadline(
                     &account.provider_id,
+                    Some(&account.purchase_date),
                     policy,
                     &text,
                     observed_at,
@@ -1074,7 +1075,7 @@ async fn forward_request_impl(
                         account,
                         &model,
                         "client_error",
-                        Some(429),
+                        Some(status.as_u16() as i32),
                         metadata_metrics(
                             &pricing_snapshot,
                             plan.service_tier.as_deref(),

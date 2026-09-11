@@ -262,7 +262,11 @@ than a key quota.
 - **GOAT inference cooldown.** A real Command Code `429` that identifies the
   5-hour or weekly plan window uses the response's exact `Your limit resets at`
   timestamp for the matching account cooldown. Ordinary transient or malformed
-  rate limits keep the generic five-minute fallback.
+  rate limits keep the generic five-minute fallback. Command Code may instead
+  return a structured `400` when monthly credits cannot fund another request;
+  that exact insufficient-credits response rotates the account and cools its
+  month window until the saved purchase-date renewal. Unrelated `400` responses
+  remain ordinary request errors.
 - **Identity and credentials.** The name is the account's required primary
   display label. The login account field is optional; on Key-account creation,
   entering it first copies it into the name until you edit the name yourself.

@@ -7746,7 +7746,7 @@ impl Database {
         Ok(updated > 0)
     }
 
-    /// Record a real upstream 429 and reset only the identified manual usage window.
+    /// Record real upstream quota exhaustion and reset only the identified usage window.
     pub fn set_account_rate_limit(
         &self,
         id: &str,
@@ -7758,7 +7758,7 @@ impl Database {
         Ok(())
     }
 
-    /// Record a 429 only when the credential that produced it is still current.
+    /// Record quota exhaustion only when the credential that produced it is still current.
     /// This prevents a delayed response from an old key from cooling down a
     /// replacement credential.
     pub fn set_account_rate_limit_if_key_matches(

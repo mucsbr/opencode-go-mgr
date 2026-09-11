@@ -5,8 +5,8 @@
 //! widened. Do not glob-reexport or reexport the module itself.
 //!
 //! Pure classification policy lives in `ocg-gateway`. This module keeps the
-//! host `classify_http` signature, 429 window/cooldown parsing, and fallback
-//! derived from [`UsageWindowKind`].
+//! host `classify_http` signature, GOAT credit-exhaustion refinement,
+//! window/cooldown parsing, and fallback derived from [`UsageWindowKind`].
 
 use crate::gateway::limit::{parse_free_reset_or_default, parse_reset, parse_usage_limit_window};
 use crate::models::{UpstreamChannel, UsageWindowKind};
@@ -43,13 +43,23 @@ pub(crate) fn classify_http_response(
     anonymous: bool,
     response_body: &str,
 ) -> ProviderErrorClass {
-    ocg_gateway::classify::classify_http_response(
+    let base = ocg_gateway::classify::classify_http_response(
         status,
         provider_id,
         channel == UpstreamChannel::Free,
         anonymous,
         response_body,
-    )
+    );
+    if status == 400
+        && provider_id == COMMAND_CODE_PROVIDER_ID
+        && crate::command_code_rate_limit::is_command_code_insufficient_credits(response_body)
+    {
+        ProviderErrorClass::RateLimited {
+            policy: RateLimitPolicy::GenericFiveMinute,
+        }
+    } else {
+        base
+    }
 }
 
 pub(crate) fn rate_limit_window_and_cooldown(
@@ -76,6 +86,7 @@ pub(crate) fn rate_limit_window_and_cooldown(
 
 pub(crate) fn rate_limit_window_and_deadline(
     provider_id: &str,
+    purchase_date: Option<&str>,
     policy: RateLimitPolicy,
     text: &str,
     observed_at: DateTime<Utc>,
@@ -86,6 +97,15 @@ pub(crate) fn rate_limit_window_and_deadline(
             crate::command_code_rate_limit::parse_command_code_rate_limit(text, observed_at)
     {
         return (Some(limit.window), limit.resets_at);
+    }
+    if provider_id == COMMAND_CODE_PROVIDER_ID
+        && matches!(policy, RateLimitPolicy::GenericFiveMinute)
+        && crate::command_code_rate_limit::is_command_code_insufficient_credits(text)
+        && let Some(resets_at) = purchase_date.and_then(|value| {
+            crate::command_code_rate_limit::command_code_monthly_reset(value, observed_at)
+        })
+    {
+        return (Some(UsageWindowKind::Month), resets_at);
     }
 
     let (window, cooldown) = rate_limit_window_and_cooldown(policy, text);
@@ -155,6 +175,7 @@ mod tests {
         let body = r#"{"error":{"code":"RATE_LIMITED","message":"You've reached your weekly usage limit for your plan. Your limit resets at 2026-09-08T09:56:18.379Z. Please wait for the window to reset or upgrade your plan to continue.","type":"rate_limit_error"}}"#;
         let (window, deadline) = rate_limit_window_and_deadline(
             COMMAND_CODE_PROVIDER_ID,
+            None,
             RateLimitPolicy::GenericFiveMinute,
             body,
             observed_at,
@@ -169,11 +190,72 @@ mod tests {
 
         let (_, other_deadline) = rate_limit_window_and_deadline(
             "another-provider",
+            None,
             RateLimitPolicy::GenericFiveMinute,
             body,
             observed_at,
         );
         assert_eq!(other_deadline, observed_at + Duration::minutes(5));
+    }
+
+    #[test]
+    fn command_code_insufficient_credits_rotates_with_monthly_cooldown() {
+        let observed_at = DateTime::parse_from_rfc3339("2026-09-11T02:51:52Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let body = r#"{"error":{"code":"BAD_REQUEST","message":"You have insufficient credits to make this request. Please purchase more credits to continue using the service.","type":"invalid_request_error"}}"#;
+        let class = classify_http_response(
+            400,
+            COMMAND_CODE_PROVIDER_ID,
+            UpstreamChannel::Go,
+            false,
+            body,
+        );
+        assert_eq!(
+            class,
+            ProviderErrorClass::RateLimited {
+                policy: RateLimitPolicy::GenericFiveMinute
+            }
+        );
+        let (window, deadline) = rate_limit_window_and_deadline(
+            COMMAND_CODE_PROVIDER_ID,
+            Some("2026-09-01"),
+            RateLimitPolicy::GenericFiveMinute,
+            body,
+            observed_at,
+        );
+        assert_eq!(window, Some(UsageWindowKind::Month));
+        assert_eq!(
+            deadline
+                .with_timezone(&chrono::Local)
+                .date_naive()
+                .to_string(),
+            "2026-10-01"
+        );
+        assert_eq!(
+            rate_limit_fallback(window),
+            RateLimitFallback::TryNextAccount
+        );
+    }
+
+    #[test]
+    fn command_code_credit_lookalikes_remain_ordinary_client_errors() {
+        let body = r#"{"error":{"code":"BAD_REQUEST","message":"Invalid base64 data","type":"invalid_request_error"}}"#;
+        assert_eq!(
+            classify_http_response(
+                400,
+                COMMAND_CODE_PROVIDER_ID,
+                UpstreamChannel::Go,
+                false,
+                body,
+            ),
+            ProviderErrorClass::ClientError
+        );
+        let credits = r#"{"error":{"code":"BAD_REQUEST","message":"You have insufficient credits to make this request. Please purchase more credits to continue using the service.","type":"invalid_request_error"}}"#;
+        assert_eq!(
+            classify_http_response(400, "another-provider", UpstreamChannel::Go, false, credits),
+            ProviderErrorClass::ClientError
+        );
     }
 
     #[test]
