@@ -22,7 +22,7 @@
 
 内置 **OpenCode Go**、**Zen Free**、**Command Code GOAT**、**MiniMax CN** 与 **Kimi Code CN** 的目录头部都提供 **恢复官方协议基线**。它不会请求上游，保留当前模型目录，清除手动开关和探测证据，并恢复 **2026-09-06** 审阅的开发时官方基线。OpenCode Go 与已知 Zen 行默认使用各自文档中的单一上游端点。GOAT 对 Anthropic 模型 ID 使用 Messages，对其余 Provider 家族使用 Chat Completions，新发现的非预设模型默认关闭。MiniMax CN 与 Kimi Code CN 默认同时支持 Chat Completions 与 Messages，不宣称 Responses。官方基线中没有的协议保持关闭，直到管理员显式打开可构造路径或成功探测写入证据。
 
-轻量来源信息、刷新动作与矩阵共用同一块内容区域。所有可刷新的范围使用同一个动作：OpenCode Go 由后端选择符合条件的 Go 账号访问官方鉴权目录；Zen Free 访问固定的官方无鉴权目录 `https://opencode.ai/zen/v1/models`；Command Code 直接访问固定的公开官方 `/models` 目录，不选择账号。刷新始终由用户显式触发。
+轻量来源信息、刷新动作与矩阵共用同一块内容区域。所有可刷新的范围使用同一个动作：OpenCode Go 由后端选择已启用、ready、持有 Key 且没有鉴权错误的 Go 账号访问官方鉴权目录；推理冷却和剩余额度不限制目录刷新。Zen Free 访问固定的官方无鉴权目录 `https://opencode.ai/zen/v1/models`；Command Code 直接访问固定的公开官方 `/models` 目录，不选择账号。刷新始终由用户显式触发。
 
 MiniMax 与 Kimi 需要一个符合条件的账号 Key。MiniMax 刷新 `https://api.minimaxi.com/v1/models`；Kimi 刷新 `https://api.kimi.com/coding/v1/models`。保存的模型只激活代码内的密封映射；无法匹配的模型保留为精确 raw ID。MiniMax 把 M3、M2.7/M2.5/M2.1 的标准与 highspeed 变体，以及 M2 映射到对应的小写 kebab Alias。Kimi 映射为 `kimi-for-coding` → `kimi-k2.7-code`、`kimi-for-coding-highspeed` → `kimi-k2.7-code-highspeed`、`k3` → `kimi-k3`、`k3-256k` → `kimi-k3-256k`。转发始终保留每个准确的上游 ID。
 

@@ -17,7 +17,7 @@ use ocg_core::dashboard_v3::{
     ERROR_MISSING_EXPECTED_REVISION, ERROR_NOT_FOUND, ERROR_REVISION_CONFLICT, ERROR_UNAUTHORIZED,
 };
 use ocg_core::gateway::provider_adapter::install_goat_catalog_origin_for_test;
-use ocg_core::models::ProxyMode;
+use ocg_core::models::{ProxyMode, UpstreamChannel, UsageWindowKind};
 use ocg_core::provider::{
     COMMAND_CODE_PROVIDER_ID, CUSTOM_PROVIDER_ID, OPENCODE_PROVIDER_ID, ZEN_FREE_ACCOUNT_ID,
 };
@@ -859,7 +859,7 @@ async fn provider_model_refresh_uses_go_account_and_public_command_catalog() {
 }
 
 #[tokio::test]
-async fn unified_catalog_refresh_selects_an_eligible_account_and_defaults_new_models_off() {
+async fn unified_catalog_refresh_accepts_a_cooled_go_key_and_defaults_new_models_off() {
     let harness = start_loopback("unified-provider-catalog-refresh").await;
     force_direct_proxy(&harness);
     let go_origin = start_origin(
@@ -871,7 +871,20 @@ async fn unified_catalog_refresh_selects_an_eligible_account_and_defaults_new_mo
     let mut config = harness.state.config();
     config.upstream_base_url = format!("{}/provider/v1", go_origin.url);
     harness.state.set_config(config).unwrap();
-    let _account_id = create_go_account(&harness).await;
+    let account_id = create_go_account(&harness).await;
+    let reset_at = chrono::Utc::now() + chrono::Duration::days(7);
+    {
+        let db = harness.state.db.lock();
+        db.set_account_rate_limit(
+            &account_id,
+            reset_at,
+            "monthly usage limit reached",
+            Some(UsageWindowKind::Month),
+        )
+        .unwrap();
+        let account = db.get_account(&account_id).unwrap().unwrap();
+        assert!(account.is_cooling_for(UpstreamChannel::Go, chrono::Utc::now()));
+    }
 
     let before = harness.state.settings_revision();
     let (status, contracts) = send_json(
@@ -884,6 +897,18 @@ async fn unified_catalog_refresh_selects_an_eligible_account_and_defaults_new_mo
     assert_eq!(status, StatusCode::OK, "{contracts}");
     assert_eq!(harness.state.settings_revision(), before + 1);
     assert_eq!(go_origin.call_count(), 1);
+    assert_eq!(
+        harness
+            .state
+            .db
+            .lock()
+            .get_account(&account_id)
+            .unwrap()
+            .unwrap()
+            .cooldown_month_until,
+        Some(reset_at),
+        "catalog refresh must not change inference cooldown",
+    );
     assert_eq!(
         go_origin.calls.lock().unwrap()[0].authorization.as_deref(),
         Some("Bearer sk-go-verify")

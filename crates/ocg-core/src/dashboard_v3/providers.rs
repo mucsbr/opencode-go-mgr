@@ -43,7 +43,9 @@ use crate::provider_contracts::{
     EffectiveProtocolEvidence as DomainProtocolEvidence, PersistedModelProtocol,
     ProtocolOverrideState as DomainProtocolOverrideState,
 };
-use crate::routing_runtime::{account_is_available_for_at, free_channel_is_exhausted_at};
+use crate::routing_runtime::{
+    account_channel, account_is_available_for_at, free_channel_is_exhausted_at,
+};
 use crate::state::CoreState;
 
 use super::accounts::load_model_account;
@@ -227,6 +229,17 @@ enum GoCommandCatalogAccount<'a> {
     None,
 }
 
+/// Model discovery uses the Key but does not consume an inference quota window.
+/// A cooled account may still fetch the official catalog.
+fn go_catalog_account_has_key(account: &ModelAccount) -> bool {
+    account.provider_id == OPENCODE_PROVIDER_ID
+        && account.enabled
+        && account.setup_step.is_ready()
+        && account_channel(account) == Some(UpstreamChannel::Go)
+        && !account.key_cipher.trim().is_empty()
+        && account.auth_error.is_none()
+}
+
 struct GoCommandCatalogRefresh {
     provider_id: String,
     account_id: Option<String>,
@@ -278,7 +291,6 @@ async fn refresh_go_or_command_catalog(
                 Some(account)
             }
             (id, GoCommandCatalogAccount::Eligible) if id == OPENCODE_PROVIDER_ID => {
-                let now = Utc::now();
                 Some(
                     state
                         .db
@@ -286,19 +298,11 @@ async fn refresh_go_or_command_catalog(
                         .list_accounts()
                         .map_err(V3ApiError::internal)?
                         .into_iter()
-                        .find(|account| {
-                            account.provider_id == OPENCODE_PROVIDER_ID
-                                && account_is_available_for_at(
-                                    account,
-                                    UpstreamChannel::Go,
-                                    &[],
-                                    now,
-                                )
-                        })
+                        .find(go_catalog_account_has_key)
                         .ok_or_else(|| {
                             V3ApiError::invalid_request_at(
                                 state,
-                                "no eligible OpenCode Go account is available for catalog refresh",
+                                "no enabled, ready OpenCode Go account with a stored Key and no authentication error is available for catalog refresh",
                             )
                         })?,
                 )

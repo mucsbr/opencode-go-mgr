@@ -65,8 +65,9 @@ path or a successful explicit probe records positive evidence.
 
 The compact source line, refresh action, and matrix share one content panel.
 Every refreshable scope uses the same action. OpenCode Go refreshes from the
-official authenticated model endpoint with a backend-selected eligible Go
-account, Zen Free uses the fixed keyless directory
+official authenticated model endpoint with a backend-selected enabled, ready Go
+account holding a Key without an authentication error; inference cooldown and
+remaining quota do not gate catalog refresh. Zen Free uses the fixed keyless directory
 `https://opencode.ai/zen/v1/models`, and Command Code uses its fixed public
 official `/models` directory without selecting an account. Refresh is always
 explicit.
