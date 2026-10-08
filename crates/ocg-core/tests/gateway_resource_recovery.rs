@@ -22,6 +22,31 @@ use fixture::*;
 const CREDITS: &str = r#"{"error":{"code":"BAD_REQUEST","message":"You have insufficient credits to make this request. Please purchase more credits to continue using the service.","type":"invalid_request_error"}}"#;
 const TRANSIENT: &str = r#"{"error":{"message":"Upstream model provider is temporarily unavailable. Please try again in a moment.","type":"rate_limit_error"}}"#;
 
+fn create_temporary_wait_account(p: &PreparedFallback, id: &str, key: &str) {
+    create_goat_account(&p.state, "acct-1", id, key);
+    // This suite exercises temporary resource waits. Dedicated GOAT credit
+    // tests cover the fork's purchase-date monthly cooldown.
+    p.state
+        .db
+        .lock()
+        .update_account(
+            id,
+            &ocg_core::models::AccountUpdate {
+                name: None,
+                username: None,
+                password: None,
+                key: None,
+                enabled: None,
+                referral_code: None,
+                purchase_date: Some("2000-01-01".into()),
+                notes: None,
+            },
+            None,
+            None,
+        )
+        .unwrap();
+}
+
 fn goats(p: &PreparedFallback, keys: &[&str]) -> (Vec<String>, Vec<GoatLoopbackRouteGuard>) {
     let ids: Vec<_> = keys
         .iter()
@@ -31,7 +56,7 @@ fn goats(p: &PreparedFallback, keys: &[&str]) -> (Vec<String>, Vec<GoatLoopbackR
         .iter()
         .zip(keys)
         .map(|(id, key)| {
-            create_goat_account(&p.state, "acct-1", id, key);
+            create_temporary_wait_account(p, id, key);
             install_goat_loopback_route_for_test(id.clone(), p.base_url.clone()).unwrap()
         })
         .collect();
@@ -304,7 +329,7 @@ async fn more_than_thirty_two_local_policy_waits_still_reach_a_healthy_candidate
         .chain(std::iter::once(&"healthy".to_string()))
     {
         let id = format!("recovery-{}", uuid::Uuid::new_v4());
-        create_goat_account(&p.state, "acct-1", &id, key);
+        create_temporary_wait_account(&p, &id, key);
         guards.push(install_goat_loopback_route_for_test(id.clone(), p.base_url.clone()).unwrap());
         account_ids.push(id);
     }
