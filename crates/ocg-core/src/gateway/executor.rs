@@ -1,75 +1,134 @@
-//! Outer Gateway request orchestration.
-//!
-//! [`GatewayExecutor`] owns the request-entry snapshot, candidate selection,
-//! same-account retry, and account fallback loop. The handler retains
-//! trace/auth, client parse/format validation, Claude Desktop rewrite, and
-//! Alias resolution. Single-attempt forwarding stays in [`super::forwarder`].
-//! This slice does not consolidate decision policy.
+//! Captures a logical request's identities, catalog, transport and prices,
+//! then executes bounded selection, retry and fallback. The handler owns
+//! client authentication and parsing; single-attempt I/O lives in forwarder.
 
 use crate::alias;
+use crate::gateway::classify::{ProviderErrorClass, classify_http};
 use crate::gateway::diagnostics::{
     ErrorDiagnostic, RequestTrace, emit_failure, log_request_failure, serialize_diagnostic,
 };
-use crate::gateway::forwarder::{ForwardAction, forward_request, rate_limited_response};
-use crate::gateway::materialize::{
-    diagnostic_forced_upstream, materialize_account_routes, resolved_alias_from_model,
+use crate::gateway::forwarder::{
+    ForwardAction, LiveSendSelection, forward_request_with_deadline, log_unsent_admission_skip,
+    rate_limited_response,
 };
-use crate::gateway::protocol::{MaterializeSpec, RequestPlan, materialize_parsed_request};
+use crate::gateway::materialize::materialize_execution_routes;
+use crate::gateway::protocol::{
+    ProtocolError, RequestFacts, RequestPlan, validate_client_request_features,
+};
 use crate::gateway::response::{local_protocol_failure, protocol_error_response};
 use crate::gateway::routing::resolve_conversation_key;
 
+use crate::gateway::attempt::UpstreamAuth;
+use crate::gateway::recovery::{ResourceSet, restriction_endpoint_identity};
 use crate::http_client::{ForwardRouteSet, RouteLabel};
-use crate::kernel::pricing::PricingSnapshot;
 use crate::kernel::protocol::ApiFormat;
-use crate::models::{AppConfig, UpstreamChannel};
-use crate::provider_contracts::EffectiveContractSet;
+use crate::models::AppConfig;
 use crate::state::CoreState;
 use axum::body::Bytes;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
 use ocg_gateway::selector::SelectionError;
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
+const MAX_REQUEST_ATTEMPTS: u32 = 32;
 
-/// Process-state values frozen at request entry. Each fallback iteration still
-/// re-reads accounts, eligible Custom runtimes, and Zen Free cooldown.
+fn request_budget_duration(config: &AppConfig, stream: bool) -> Duration {
+    Duration::from_secs(
+        if stream {
+            config.stream_idle_timeout_secs
+        } else {
+            config.non_stream_timeout_secs
+        }
+        .max(1),
+    )
+}
+
+/// Permute materialized routes into the live credential order.
+///
+/// Request entry freezes route identity from the published preparation.
+/// `reorder_accounts` updates `routing_rank` without bumping that generation,
+/// so selection has to walk the order stored now. Routes that share an account
+/// keep their original relative order. A route whose account is absent from
+/// the live snapshot sorts after every live credential.
+fn live_route_order(
+    routes: &[crate::gateway::materialize::ExecutionRoute],
+    credentials: &[crate::routing_snapshot::ExecutionCredential],
+) -> Vec<usize> {
+    order_indexes_by_ids(
+        routes.iter().map(|route| route.routing.account.id.as_str()),
+        credentials.iter().map(|credential| credential.id.as_str()),
+    )
+}
+
+fn order_indexes_by_ids<'a>(
+    route_ids: impl Iterator<Item = &'a str>,
+    credential_ids: impl Iterator<Item = &'a str>,
+) -> Vec<usize> {
+    let route_ids = route_ids.collect::<Vec<_>>();
+    let mut position = HashMap::<&str, usize>::with_capacity(route_ids.len());
+    for (index, id) in credential_ids.enumerate() {
+        position.entry(id).or_insert(index);
+    }
+    let mut order = (0..route_ids.len()).collect::<Vec<_>>();
+    order.sort_by_key(|&route_index| {
+        (
+            position
+                .get(route_ids[route_index])
+                .copied()
+                .unwrap_or(usize::MAX),
+            route_index,
+        )
+    });
+    order
+}
+
+/// Authorization and decrypt both compare the selection with the live row.
+/// Copy the identity fields that can change without a preparation republish.
+fn align_selection_with_account(
+    selection: &mut LiveSendSelection,
+    account: &crate::routing_snapshot::ExecutionCredential,
+) {
+    selection.credential_id = Some(account.credential_id.clone());
+    selection.binding_id = account.binding_id.clone();
+    selection.credential_version = account.credential_version;
+    selection.key_cipher = account.key_cipher.clone();
+}
+
+/// Process-state values frozen at request entry. Live credential availability
+/// and authorization are reread before every dispatch.
 pub(crate) struct RequestSnapshots {
     config: AppConfig,
-    pricing: Arc<PricingSnapshot>,
     routes: Arc<ForwardRouteSet>,
-    contracts: Arc<EffectiveContractSet>,
     resolved: alias::ResolvedModel,
     cpa_base_url: Option<String>,
-    dynamics: Arc<Vec<crate::dynamic::DynamicProviderRuntime>>,
+    routing: crate::routing_snapshot::RoutingSnapshot,
 }
 
 impl RequestSnapshots {
+    /// Freezes the rest of the preparation view from the published aggregate.
+    /// Every field comes from one `Arc`, so routing, config, and routes are
+    /// the same generation.
     fn capture(
-        state: &CoreState,
-        config: AppConfig,
-        contracts: Arc<EffectiveContractSet>,
+        preparation: &crate::state::GatewayPreparationSnapshot,
         resolved: alias::ResolvedModel,
-        dynamics: Arc<Vec<crate::dynamic::DynamicProviderRuntime>>,
-    ) -> Self {
-        let cpa_base_url = match crate::cpa::env_base_url() {
-            Ok(Some(base_url)) => Some(base_url),
-            Ok(None) => state
-                .db
-                .lock()
-                .cpa_integration()
-                .ok()
-                .flatten()
-                .map(|record| record.base_url),
-            Err(_) => None,
-        };
-        Self {
-            config,
-            pricing: state.pricing_snapshot(),
-            routes: state.forward_route_set(),
-            contracts,
+        routing: crate::routing_snapshot::RoutingSnapshot,
+    ) -> anyhow::Result<Self> {
+        let cpa_base_url = crate::cpa::env_base_url()?.or_else(|| {
+            routing
+                .projection
+                .destinations
+                .iter()
+                .find(|d| d.adapter == ocg_domain::destination::AdapterKind::Cpa)
+                .and_then(|d| d.base_url.clone())
+        });
+        Ok(Self {
+            config: preparation.config().clone(),
+            routes: preparation.routes(),
             resolved,
             cpa_base_url,
-            dynamics,
-        }
+            routing,
+        })
     }
 }
 
@@ -78,6 +137,7 @@ struct LoopState {
     last_error: Option<String>,
     failed_ids: Vec<String>,
     attempt: u32,
+    send_attempts: u32,
 }
 
 impl LoopState {
@@ -86,12 +146,12 @@ impl LoopState {
             last_error: None,
             failed_ids: Vec::new(),
             attempt: 0,
+            send_attempts: 0,
         }
     }
 }
 
-/// Concrete orchestration facade for one already-parsed, already-resolved
-/// Gateway request.
+/// Orchestrates one parsed client request.
 pub(crate) struct GatewayExecutor;
 
 impl GatewayExecutor {
@@ -103,74 +163,63 @@ impl GatewayExecutor {
         headers: HeaderMap,
         client_format: ApiFormat,
         parsed: crate::gateway::protocol::ParsedClientRequest,
-        resolved: alias::ResolvedModel,
         client_model: String,
         routing_model: String,
-        config: AppConfig,
         client_key_id: Option<String>,
-        contracts: Arc<EffectiveContractSet>,
-        dynamics: Arc<Vec<crate::dynamic::DynamicProviderRuntime>>,
     ) -> Response {
-        // One logical client request, including safe retries and account fallback,
-        // must use one immutable pricing revision from start to finish.
-        // Routing snapshot captured once at entry: every attempt (including after
-        // free fallback rewrites the model) resolves its leg from this snapshot,
-        // and a concurrent settings switch only affects requests starting later.
-        let snapshots = RequestSnapshots::capture(&state, config, contracts, resolved, dynamics);
-        let mut loop_state = LoopState::new();
-        let conversation_key = if snapshots.config.conversation_sticky {
-            resolve_conversation_key(client_format, &routing_model, &headers, &client_body)
-        } else {
-            None
-        };
-        let (diagnostic_model, diagnostic_channel) = match &snapshots.resolved {
-            alias::ResolvedModel::Alias {
-                alias, mappings, ..
-            } => {
-                let zen_only = mappings
-                    .iter()
-                    .filter(|mapping| mapping.routeable)
-                    .all(|mapping| mapping.is_zen_free());
-                (
-                    (*alias).to_string(),
-                    if zen_only {
-                        UpstreamChannel::Free
-                    } else {
-                        UpstreamChannel::Go
-                    },
-                )
-            }
-            alias::ResolvedModel::PinnedRaw { mapping, .. } => (
-                if mapping.upstream_model.is_empty() {
-                    routing_model.clone()
-                } else {
-                    mapping.upstream_model.to_string()
-                },
-                if mapping.is_zen_free() {
-                    UpstreamChannel::Free
-                } else {
-                    UpstreamChannel::Go
-                },
-            ),
-        };
-        let diagnostic_forced_upstream =
-            diagnostic_forced_upstream(&snapshots.resolved, parsed.client);
-        let requested_plan = match materialize_parsed_request(
-            &parsed,
-            &MaterializeSpec {
-                client_model: client_model.clone(),
-                upstream_model: diagnostic_model,
-                resolved_alias: resolved_alias_from_model(&snapshots.resolved),
-                channel: diagnostic_channel,
-                upstream_base_override: None,
-                original_model: None,
-                allow_go_fallback: false,
-                forced_upstream: diagnostic_forced_upstream,
-                custom_route: None,
-            },
-        ) {
-            Ok(plan) => plan,
-            Err(error) => {
+        let (snapshots, facts, route_set) = {
+            // Alias resolution and proxy transport stay on one published
+            // generation. Each attempt keeps that generation's destinations
+            // and rebuilds account routes from the live credential list, so
+            // rank, Key, and accounts created after the last republish are
+            // visible without letting a mid-request catalog publish drop the
+            // alias this request already resolved. Ordinary preparation takes
+            // no `settings_update`: a writer republishes the whole view with
+            // one Arc swap, so the read lock below is held for an Arc clone
+            // and nothing else. No guard crosses upstream I/O.
+            let preparation = match state.gateway_preparation() {
+                Ok(preparation) => preparation,
+                Err(error) => {
+                    return protocol_error_response(
+                        client_format,
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        &format!("failed to capture routing state: {error}"),
+                        None,
+                    );
+                }
+            };
+            let routing = preparation.routing().clone();
+            let catalog = crate::gateway::handler::RuntimeCatalogSnapshot::from_routing(
+                routing,
+                state.sample_gateway_clock().0,
+            );
+            let resolved = match catalog.resolve(&routing_model) {
+                Ok(resolved) => resolved,
+                Err(error) => {
+                    return local_protocol_failure(
+                        &state,
+                        &trace,
+                        client_format,
+                        crate::gateway::materialize::protocol_error_from_resolve(error),
+                        Some(client_body.len()),
+                        Some(&client_body),
+                    );
+                }
+            };
+            let snapshots = match RequestSnapshots::capture(&preparation, resolved, catalog.routing)
+            {
+                Ok(snapshots) => snapshots,
+                Err(error) => {
+                    return protocol_error_response(
+                        client_format,
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        &format!("failed to capture route configuration: {error}"),
+                        None,
+                    );
+                }
+            };
+            let facts = RequestFacts::from_parsed(&parsed);
+            if let Err(error) = validate_client_request_features(&parsed) {
                 return local_protocol_failure(
                     &state,
                     &trace,
@@ -180,92 +229,17 @@ impl GatewayExecutor {
                     Some(&client_body),
                 );
             }
-        };
 
-        loop {
-            let (decision_wall, decision_mono) = state.sample_gateway_clock();
-            let (accounts, free_cooldown) = {
-                let db = state.db.lock();
-                let accounts = match db.list_accounts() {
-                    Ok(accounts) => accounts,
-                    Err(error) => {
-                        let message = format!("failed to select account: {error}");
-                        record_plan_failure(
-                            &state,
-                            &trace,
-                            &client_body,
-                            loop_state.attempt.max(1),
-                            client_format,
-                            &requested_plan,
-                            "gateway",
-                            "account_selection",
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            &message,
-                        );
-                        return protocol_error_response(
-                            client_format,
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            &message,
-                            None,
-                        );
-                    }
-                };
-                let free_cooldown = match db.free_channel_cooldown_until_at(decision_wall) {
-                    Ok(cooldown) => cooldown,
-                    Err(error) => {
-                        let message = format!("failed to read free-channel cooldown: {error}");
-                        return protocol_error_response(
-                            client_format,
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            &message,
-                            None,
-                        );
-                    }
-                };
-                (accounts, free_cooldown)
-            };
-            let free_available = free_cooldown.is_none()
-                && !crate::routing_runtime::free_channel_is_exhausted_at(&accounts, decision_wall);
-            let custom_runtimes = match state.db.lock().list_custom_account_runtimes() {
-                Ok(runtimes) => crate::custom::custom_runtimes_by_account(&runtimes),
-                Err(error) => {
-                    let message = format!("failed to load Custom accounts: {error}");
-                    return protocol_error_response(
-                        client_format,
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        &message,
-                        None,
-                    );
-                }
-            };
-            let goat_runtimes = match state.db.lock().list_goat_account_runtimes() {
-                Ok(runtimes) => crate::goat::goat_runtimes_by_account(&runtimes),
-                Err(error) => {
-                    let message = format!("failed to load Command Code GOAT accounts: {error}");
-                    return protocol_error_response(
-                        client_format,
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        &message,
-                        None,
-                    );
-                }
-            };
-            let route_set = match materialize_account_routes(
-                &accounts,
+            let route_set = match materialize_execution_routes(
+                &snapshots.routing,
                 &snapshots.config,
                 &parsed,
                 &snapshots.resolved,
                 &client_model,
                 &routing_model,
-                &client_body,
-                free_available,
-                &custom_runtimes,
-                &goat_runtimes,
                 snapshots.cpa_base_url.as_deref(),
-                &snapshots.contracts,
-                &snapshots.dynamics,
             ) {
-                Ok(route_set) => route_set,
+                Ok(routes) => routes,
                 Err(error) => {
                     return local_protocol_failure(
                         &state,
@@ -277,15 +251,186 @@ impl GatewayExecutor {
                     );
                 }
             };
+            if route_set.routes.is_empty()
+                && !route_set.rejections.is_empty()
+                && route_set.rejections.iter().all(|rejection| {
+                    rejection.code
+                        == crate::gateway::materialize::RouteRejectionCode::MappingProtocolIncompatible
+                })
+            {
+                return local_protocol_failure(
+                    &state,
+                    &trace,
+                    client_format,
+                    ProtocolError::new(crate::provider_contracts::NO_ENABLED_UPSTREAM_PROTOCOL),
+                    Some(client_body.len()),
+                    Some(&client_body),
+                );
+            }
+            (snapshots, facts, route_set)
+        };
+        let mut loop_state = LoopState::new();
+        let conversation_key = if snapshots.config.conversation_sticky {
+            resolve_conversation_key(client_format, &routing_model, &headers, &client_body)
+        } else {
+            None
+        };
+        let request_deadline =
+            tokio::time::Instant::now() + request_budget_duration(&snapshots.config, facts.stream);
+        loop {
+            if tokio::time::Instant::now() >= request_deadline {
+                let message =
+                    "Gateway request retry budget exhausted; no further upstream attempt sent";
+                record_request_failure(
+                    &state,
+                    &trace,
+                    &client_body,
+                    loop_state.attempt.max(1),
+                    &facts,
+                    "gateway",
+                    "request_budget",
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    message,
+                );
+                return protocol_error_response(
+                    client_format,
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    message,
+                    None,
+                );
+            }
+            let max_scans = (route_set.routes.len() as u32)
+                .saturating_add(MAX_REQUEST_ATTEMPTS)
+                .max(1);
+            if loop_state.attempt >= max_scans {
+                let message =
+                    "Gateway request candidate scan exhausted; no further upstream attempt sent";
+                record_request_failure(
+                    &state,
+                    &trace,
+                    &client_body,
+                    loop_state.attempt.max(1),
+                    &facts,
+                    "gateway",
+                    "request_budget",
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    message,
+                );
+                return protocol_error_response(
+                    client_format,
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    message,
+                    None,
+                );
+            }
+            let (decision_wall, decision_mono) = state.sample_gateway_clock();
+            let live = {
+                let db = state.db.lock();
+                crate::routing_snapshot::RoutingSnapshot::load(&db).and_then(|routing| {
+                    db.free_channel_cooldown_until_at(decision_wall)
+                        .map(|cooldown| (routing, cooldown))
+                })
+            };
+            let (mut live, free_cooldown) = match live {
+                Ok(live) => live,
+                Err(error) => {
+                    return protocol_error_response(
+                        client_format,
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        &format!("failed to load routing state: {error}"),
+                        None,
+                    );
+                }
+            };
+            let free_egress_wait = state
+                .recovery
+                .free_egress_retry_until(decision_wall, decision_mono);
+            let free_available = free_cooldown.is_none()
+                && free_egress_wait.is_none()
+                && !crate::destination_projection::free_channel_exhausted(
+                    &live.projection,
+                    decision_wall,
+                );
             let excluded = loop_state
                 .failed_ids
                 .iter()
                 .map(String::as_str)
                 .collect::<Vec<_>>();
-            let routing_candidates = route_set
+            {
+                let probes = state.quota_probes.lock();
+                live.apply_quota_probes(&probes);
+            }
+            // Catalog, protocols, and destination identity stay on the entry
+            // snapshot. Credential membership, order, and Key come from `live`.
+            let mut routing = snapshots.routing.clone();
+            routing.credentials = live.credentials.clone();
+            routing.ollama_pinned = live.ollama_pinned.clone();
+            let route_set = match materialize_execution_routes(
+                &routing,
+                &snapshots.config,
+                &parsed,
+                &snapshots.resolved,
+                &client_model,
+                &routing_model,
+                snapshots.cpa_base_url.as_deref(),
+            ) {
+                Ok(routes) => routes,
+                Err(error) => {
+                    return local_protocol_failure(
+                        &state,
+                        &trace,
+                        client_format,
+                        error,
+                        Some(client_body.len()),
+                        Some(&client_body),
+                    );
+                }
+            };
+            let prices = route_set
                 .routes
                 .iter()
-                .map(|route| route.routing.clone())
+                .map(|route| {
+                    crate::gateway::attempt_pricing::capture_execution_pricing(
+                        &state,
+                        &route.routing.account,
+                        route.routing.adapter,
+                        &route.plan,
+                    )
+                })
+                .collect::<Vec<_>>();
+            let mut live_authorization_error = None;
+            let route_order = live_route_order(&route_set.routes, &live.credentials);
+            let routing_candidates = route_order
+                .iter()
+                .map(|&route_index| {
+                    let route = &route_set.routes[route_index];
+                    let mut candidate = route.routing.clone();
+                    let mut selection =
+                        LiveSendSelection::from_execution(route, &client_model, &routing_model);
+                    if let Some(current) = live
+                        .credentials
+                        .iter()
+                        .find(|credential| credential.id == candidate.account.id)
+                    {
+                        candidate.account = current.clone();
+                        align_selection_with_account(&mut selection, &candidate.account);
+                    } else {
+                        candidate.account.enabled = false;
+                    }
+                    if let Err(error) = crate::gateway::forwarder::verify_execution_authorization(
+                        &live,
+                        &selection,
+                        &route.spec,
+                        decision_wall,
+                        free_available,
+                    ) {
+                        candidate.account.enabled = false;
+                        if !excluded.contains(&candidate.account.id.as_str()) {
+                            live_authorization_error.get_or_insert_with(|| error.to_string());
+                        }
+                    }
+                    candidate
+                })
                 .collect::<Vec<_>>();
             let selected_index = match state.routing.try_select_candidate_index_at(
                 &routing_candidates,
@@ -299,16 +444,16 @@ impl GatewayExecutor {
             ) {
                 Ok(Some(index)) => index,
                 Ok(None) => {
+                    let free_wait = free_cooldown.or(free_egress_wait);
                     if route_set.free_only
-                        && let Some(until) = free_cooldown
+                        && let Some(until) = free_wait
                     {
-                        record_plan_failure(
+                        record_request_failure(
                             &state,
                             &trace,
                             &client_body,
                             loop_state.attempt.max(1),
-                            client_format,
-                            &requested_plan,
+                            &facts,
                             "gateway",
                             "account_selection",
                             StatusCode::TOO_MANY_REQUESTS,
@@ -316,25 +461,72 @@ impl GatewayExecutor {
                         );
                         return rate_limited_response(client_format, until);
                     }
+                    let mut any_local_policy = false;
                     let soonest = route_set
                         .routes
                         .iter()
                         .filter_map(|route| {
-                            route
-                                .routing
-                                .account
-                                .cooldown_ends_at_for(route.routing.channel, decision_wall)
+                            let credential = live
+                                .credentials
+                                .iter()
+                                .find(|row| row.id == route.routing.account.id)?;
+                            let cooldown = credential
+                                .cooldown_ends_at_for(route.routing.channel, decision_wall);
+                            let quota = (!credential.quota_probe)
+                                .then_some(credential.quota_recovery.as_ref())
+                                .flatten()
+                                .and_then(|recovery| {
+                                    (recovery.next_retry_at > decision_wall)
+                                        .then_some(recovery.next_retry_at)
+                                });
+                            let free_contract =
+                                route.routing.channel == crate::models::UpstreamChannel::Free;
+                            let temporary = ResourceSet::from_snapshot(
+                                &live,
+                                credential,
+                                "",
+                                &route.plan.model,
+                                free_contract,
+                            )
+                            .ok()
+                            .and_then(|resources| {
+                                state
+                                    .recovery
+                                    .credential_retry_until(&resources, decision_wall)
+                            });
+                            if let Ok(resources) = capture_route_resources(&live, route, &snapshots)
+                                && let Err(wait) = state.recovery.inspect_admission(
+                                    &resources,
+                                    decision_wall,
+                                    decision_mono,
+                                )
+                                && (wait.is_local_policy() || wait.is_capacity())
+                            {
+                                any_local_policy = true;
+                            }
+                            let free = free_contract.then_some(free_egress_wait).flatten();
+                            // A Key must outwait every known blocker; another Key
+                            // may become available sooner.
+                            [cooldown, quota, temporary, free]
+                                .into_iter()
+                                .flatten()
+                                .max()
                         })
                         .min();
+                    let probe_only = soonest.is_none()
+                        && route_set.routes.iter().any(|route| {
+                            live.credentials.iter().any(|credential| {
+                                credential.id == route.routing.account.id && credential.quota_probe
+                            })
+                        });
                     return match soonest {
                         Some(until) => {
-                            record_plan_failure(
+                            record_request_failure(
                                 &state,
                                 &trace,
                                 &client_body,
                                 loop_state.attempt.max(1),
-                                client_format,
-                                &requested_plan,
+                                &facts,
                                 "gateway",
                                 "account_selection",
                                 StatusCode::TOO_MANY_REQUESTS,
@@ -342,19 +534,60 @@ impl GatewayExecutor {
                             );
                             rate_limited_response(client_format, until)
                         }
-                        None => {
-                            let msg = loop_state.last_error.clone().unwrap_or_else(|| {
-                                route_set.incompatibility.unwrap_or_else(|| {
-                                    "no compatible provider accounts are available".to_string()
-                                })
-                            });
-                            record_plan_failure(
+                        None if probe_only => {
+                            let msg = "quota recovery trial is already in flight";
+                            record_request_failure(
                                 &state,
                                 &trace,
                                 &client_body,
                                 loop_state.attempt.max(1),
+                                &facts,
+                                "gateway",
+                                "account_selection",
+                                StatusCode::SERVICE_UNAVAILABLE,
+                                msg,
+                            );
+                            protocol_error_response(
                                 client_format,
-                                &requested_plan,
+                                StatusCode::SERVICE_UNAVAILABLE,
+                                msg,
+                                None,
+                            )
+                        }
+                        None if any_local_policy => {
+                            let msg = "all compatible accounts are waiting on local_policy";
+                            record_request_failure(
+                                &state,
+                                &trace,
+                                &client_body,
+                                loop_state.attempt.max(1),
+                                &facts,
+                                "gateway",
+                                "local_policy",
+                                StatusCode::SERVICE_UNAVAILABLE,
+                                msg,
+                            );
+                            protocol_error_response(
+                                client_format,
+                                StatusCode::SERVICE_UNAVAILABLE,
+                                msg,
+                                None,
+                            )
+                        }
+                        None => {
+                            let msg = live_authorization_error
+                                .or_else(|| loop_state.last_error.clone())
+                                .unwrap_or_else(|| {
+                                    route_set.incompatibility.unwrap_or_else(|| {
+                                        "no compatible provider accounts are available".to_string()
+                                    })
+                                });
+                            record_request_failure(
+                                &state,
+                                &trace,
+                                &client_body,
+                                loop_state.attempt.max(1),
+                                &facts,
                                 "gateway",
                                 "account_selection",
                                 StatusCode::SERVICE_UNAVAILABLE,
@@ -372,13 +605,12 @@ impl GatewayExecutor {
                 Err(error) => {
                     let (status, message) =
                         routing_selector_invariant(SelectorInvariant::Duplicate(error));
-                    record_plan_failure(
+                    record_request_failure(
                         &state,
                         &trace,
                         &client_body,
                         loop_state.attempt.max(1),
-                        client_format,
-                        &requested_plan,
+                        &facts,
                         "gateway",
                         "account_selection",
                         status,
@@ -387,20 +619,19 @@ impl GatewayExecutor {
                     return protocol_error_response(client_format, status, &message, None);
                 }
             };
-            let route = match route_set.routes.into_iter().nth(selected_index) {
-                Some(route) => route,
+            let route_index = match route_order.get(selected_index).copied() {
+                Some(index) => index,
                 None => {
                     let (status, message) =
                         routing_selector_invariant(SelectorInvariant::CandidateIndexOutOfRange {
                             selected_index,
                         });
-                    record_plan_failure(
+                    record_request_failure(
                         &state,
                         &trace,
                         &client_body,
                         loop_state.attempt.max(1),
-                        client_format,
-                        &requested_plan,
+                        &facts,
                         "gateway",
                         "account_selection",
                         status,
@@ -409,25 +640,92 @@ impl GatewayExecutor {
                     return protocol_error_response(client_format, status, &message, None);
                 }
             };
+            let mut route = route_set.routes[route_index].clone();
+            route.routing.account = routing_candidates[selected_index].account.clone();
+            let selection =
+                LiveSendSelection::from_execution(&route, &client_model, &routing_model);
+            if let Ok(resources) = capture_route_resources(&live, &route, &snapshots)
+                && let Err(wait) =
+                    state
+                        .recovery
+                        .inspect_admission(&resources, decision_wall, decision_mono)
+            {
+                loop_state.attempt = loop_state.attempt.saturating_add(1);
+                let skip_route = send_route_label(&snapshots, route.routing.adapter, &route.plan);
+                let _ = log_unsent_admission_skip(
+                    &state,
+                    &route.routing.account,
+                    &route.plan,
+                    skip_route,
+                    &route.spec,
+                    &trace,
+                    &client_body,
+                    loop_state.attempt,
+                    client_key_id.as_deref(),
+                    &prices[route_index],
+                    &wait,
+                );
+                loop_state.last_error = Some(
+                    if wait.is_local_policy() {
+                        "compatible upstream resource is waiting on local_policy; no upstream request sent"
+                    } else if wait.is_capacity() {
+                        "compatible upstream resource cannot be tracked (recovery_capacity); no upstream request sent"
+                    } else {
+                        "compatible upstream resource is waiting for recovery; no upstream request sent"
+                    }
+                    .into(),
+                );
+                loop_state.failed_ids.push(route.routing.account.id.clone());
+                continue;
+            }
+            let adapter = route.routing.adapter;
             let account = route.routing.account;
             let active_plan = route.plan;
+            let frozen_spec = route.spec;
 
             let mut retried_same_account = false;
             loop {
+                if loop_state.send_attempts >= MAX_REQUEST_ATTEMPTS
+                    || tokio::time::Instant::now() >= request_deadline
+                {
+                    let message =
+                        "Gateway request retry budget exhausted; no further upstream attempt sent";
+                    record_plan_failure(
+                        &state,
+                        &trace,
+                        &client_body,
+                        loop_state.attempt.max(1),
+                        client_format,
+                        &active_plan,
+                        "gateway",
+                        "request_budget",
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        message,
+                    );
+                    return protocol_error_response(
+                        client_format,
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        message,
+                        None,
+                    );
+                }
                 loop_state.attempt = loop_state.attempt.saturating_add(1);
                 // Re-resolve the leg on every attempt: free fallback or sticky
                 // rewrites can swap `active_plan.model` mid-request.
                 let (client, selected_route) = snapshots.routes.client_for(&active_plan.model);
-                let route = if account.provider_id == crate::provider::CPA_PROVIDER_ID {
+                let route = if adapter == crate::provider::ProviderAdapterKind::Cpa {
                     RouteLabel::Direct
                 } else {
                     selected_route
                 };
-                match forward_request(
+                // The attempt owns timeout finalization so a known HTTP status
+                // and the selected account cannot be lost to outer cancellation.
+                let forwarded = forward_request_with_deadline(
                     client,
                     route,
                     &state,
                     &account,
+                    adapter,
                     &snapshots.config,
                     &active_plan,
                     &trace,
@@ -435,30 +733,37 @@ impl GatewayExecutor {
                     loop_state.attempt,
                     !retried_same_account,
                     headers.clone(),
-                    snapshots.pricing.clone(),
+                    prices[route_index].clone(),
                     client_key_id.as_deref(),
-                    &snapshots.dynamics,
+                    &frozen_spec,
+                    &selection,
+                    Some(request_deadline),
                 )
-                .await
-                {
-                    Ok(result) => match result.action {
-                        ForwardAction::Return => return result.response,
-                        ForwardAction::RetrySameAccount if !retried_same_account => {
-                            retried_same_account = true;
-                            continue;
+                .await;
+                match forwarded {
+                    Ok(result) => {
+                        if result.sent {
+                            loop_state.send_attempts = loop_state.send_attempts.saturating_add(1);
                         }
-                        ForwardAction::RetrySameAccount => return result.response,
-                        ForwardAction::ExhaustFreeChannel => {
-                            loop_state.last_error = result.error_message.clone();
-                            loop_state.failed_ids.push(account.id.clone());
-                            break;
+                        match result.action {
+                            ForwardAction::Return => return result.response,
+                            ForwardAction::RetrySameAccount if !retried_same_account => {
+                                retried_same_account = true;
+                                continue;
+                            }
+                            ForwardAction::RetrySameAccount => return result.response,
+                            ForwardAction::ExhaustFreeChannel => {
+                                loop_state.last_error = result.error_message.clone();
+                                loop_state.failed_ids.push(account.id.clone());
+                                break;
+                            }
+                            ForwardAction::TryNextAccount => {
+                                loop_state.last_error = result.error_message.clone();
+                                loop_state.failed_ids.push(account.id.clone());
+                                break;
+                            }
                         }
-                        ForwardAction::TryNextAccount => {
-                            loop_state.last_error = result.error_message.clone();
-                            loop_state.failed_ids.push(account.id.clone());
-                            break;
-                        }
-                    },
+                    }
                     Err(e) => {
                         let message = format!("forward error: {e}");
                         record_plan_failure(
@@ -487,6 +792,30 @@ impl GatewayExecutor {
 }
 
 #[allow(clippy::too_many_arguments)]
+fn record_request_failure(
+    state: &CoreState,
+    trace: &RequestTrace,
+    client_body: &[u8],
+    attempt: u32,
+    facts: &RequestFacts,
+    error_source: &str,
+    error_stage: &str,
+    status: StatusCode,
+    message: &str,
+) {
+    let mut diagnostic =
+        ErrorDiagnostic::new(trace, attempt, error_source, error_stage, facts.client)
+            .with_request_summary(client_body);
+    diagnostic.client_body_bytes = Some(client_body.len());
+    diagnostic.model = Some(facts.client_model.clone());
+    diagnostic.stream = Some(facts.stream);
+    diagnostic.downstream_status = Some(status.as_u16());
+    let encoded = serialize_diagnostic(diagnostic.clone());
+    log_request_failure(&state.db.lock(), trace, &diagnostic, &encoded, message);
+    emit_failure(&encoded);
+}
+
+#[allow(clippy::too_many_arguments)]
 fn record_plan_failure(
     state: &CoreState,
     trace: &RequestTrace,
@@ -509,6 +838,16 @@ fn record_plan_failure(
     diagnostic.model = Some(plan.model.clone());
     diagnostic.stream = Some(plan.stream);
     diagnostic.downstream_status = Some(status.as_u16());
+    if error_stage == "request_budget" {
+        diagnostic.retry_action = Some(
+            if error_source == "transport" {
+                "no_replay_outcome_unknown"
+            } else {
+                "return"
+            }
+            .to_string(),
+        );
+    }
     let encoded = serialize_diagnostic(diagnostic.clone());
     log_request_failure(&state.db.lock(), trace, &diagnostic, &encoded, message);
     emit_failure(&encoded);
@@ -520,7 +859,7 @@ enum SelectorInvariant {
 }
 
 /// Status/message pair for selector invariant failures. Callers pass the same
-/// values to both `record_plan_failure` and `protocol_error_response`.
+/// values to both `record_request_failure` and `protocol_error_response`.
 fn routing_selector_invariant(failure: SelectorInvariant) -> (StatusCode, String) {
     let detail = match failure {
         SelectorInvariant::Duplicate(error) => error.to_string(),
@@ -534,33 +873,47 @@ fn routing_selector_invariant(failure: SelectorInvariant) -> (StatusCode, String
     )
 }
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn duplicate_selection_error_maps_to_internal_selector_invariant() {
-        let error = ocg_gateway::selector::SelectionError::DuplicateAccountId {
-            first: 0,
-            duplicate: 2,
-        };
-        let (status, message) =
-            super::routing_selector_invariant(super::SelectorInvariant::Duplicate(error));
-        assert_eq!(status, axum::http::StatusCode::INTERNAL_SERVER_ERROR);
-        assert_eq!(
-            message,
-            "routing selector invariant: duplicate account id at candidate index 2 (first seen at 0)"
-        );
-    }
-
-    #[test]
-    fn out_of_range_selected_index_maps_to_internal_selector_invariant() {
-        let (status, message) =
-            super::routing_selector_invariant(super::SelectorInvariant::CandidateIndexOutOfRange {
-                selected_index: 9,
-            });
-        assert_eq!(status, axum::http::StatusCode::INTERNAL_SERVER_ERROR);
-        assert_eq!(
-            message,
-            "routing selector invariant: candidate index 9 is out of range"
-        );
+fn send_route_label(
+    snapshots: &RequestSnapshots,
+    adapter: crate::provider::ProviderAdapterKind,
+    plan: &RequestPlan,
+) -> RouteLabel {
+    if adapter == crate::provider::ProviderAdapterKind::Cpa {
+        RouteLabel::Direct
+    } else {
+        snapshots.routes.client_for(&plan.model).1
     }
 }
+
+fn capture_route_resources(
+    live: &crate::routing_snapshot::RoutingSnapshot,
+    route: &crate::gateway::materialize::ExecutionRoute,
+    snapshots: &RequestSnapshots,
+) -> anyhow::Result<ResourceSet> {
+    let account = live
+        .credentials
+        .iter()
+        .find(|row| row.id == route.routing.account.id)
+        .unwrap_or(&route.routing.account);
+    let url = route.spec.request_url().unwrap_or_default();
+    let route_label = send_route_label(snapshots, route.routing.adapter, &route.plan);
+    let proxy_identity =
+        (route_label == RouteLabel::Proxy).then_some(snapshots.config.proxy_url.as_str());
+    let endpoint =
+        restriction_endpoint_identity(&url, route_label, route.plan.upstream, proxy_identity);
+    let free_contract = matches!(
+        classify_http(
+            429,
+            &account.provider_id,
+            route.plan.channel,
+            route.spec.auth == UpstreamAuth::None
+        ),
+        ProviderErrorClass::RateLimited {
+            profile: ocg_gateway::classify::ErrorProfile::ZenFree
+        }
+    );
+    ResourceSet::from_snapshot(live, account, &endpoint, &route.plan.model, free_contract)
+}
+
+#[cfg(test)]
+mod tests;

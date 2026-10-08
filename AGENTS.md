@@ -4,23 +4,29 @@ Open Console Gateway is a local multi-Plan console: Rust workspace, Vue 3 dashbo
 
 ## Boundaries that affect changes
 
-- The dashboard uses HTTP `/dashboard/api/v3`; mutations use CAS. Contract changes belong in `schema/dashboard-api-v3.schema.json` and generated types. Do not revive retired V2 REST or add Tauri `invoke` commands.
-- Provider and Plan share `provider_id`. Adapter implementations stay static/sealed; user-defined Provider data binds Configurable HTTP. Custom API is account-owned; CPA is a separate static external integration.
-- Preserve authentication, Key obfuscation/redaction, URL validation, cooldown state writes, SSE pass-through, data integrity, and supported compatibility. Do not reintroduce remote sync or an Admin API.
+- The dashboard uses HTTP `/dashboard/api/v4`; mutations use CAS. `/dashboard/api/v3` is a 410 tombstone. Contract changes belong in `schema/dashboard-api-v4.schema.json` and generated types. There is no V2 or V3 REST surface and no Tauri `invoke` commands; do not add either.
+- The V3 kernel DTO contract toolchain stays active: `contract:v3:generate/check` maintains `schema/dashboard-api-v3.schema.json` and `src/api/generated/dashboard-v3.ts` for V3 kernel handlers remounted under the V4 prefix. The REST surface remains V4-only; do not add V3 routes.
+- Provider and Plan share `provider_id` on catalog rows. Adapter implementations stay static/sealed; user-defined Provider data binds Configurable HTTP. Legacy Custom API rows are distinct configurable `http` destinations that may hold multiple credentials while preserving public-name-only resolution; CPA is a separate static external integration.
+- Preserve authentication, Key obfuscation/redaction, URL validation, cooldown state writes, SSE pass-through, data integrity, and supported compatibility. There is no remote sync and no Admin API; do not add either.
 - Changes to user-visible facts update paired English and `.zh-CN.md` guides. Keep capability tables in `docs/user/`, not the root README.
-- Rust tests belong in sibling `tests.rs` modules. Test behavior, not source text, documentation wording, or workflow spelling.
+- Rust tests belong in sibling `tests.rs` modules. Test behavior, not source text, documentation wording, or workflow spelling. Frontend tests likewise never assert literal UI copy: domain functions return semantic codes, copy mapping lives in exported `*_KEYS` tables (`Record<Code, MessageKey>`), and views compose text with `t()`.
+- Frontend server state has a single owner: the Pinia stores in `src/stores/`. Loads are generation-guarded so stale responses never commit, mutations commit their results into the store in place, revalidations keep current content rendered (loading gates show skeletons only before the first successful load), and `dropSession` wipes cached resources on logout/401. Views keep only UI-local state (modals, drafts, filters, optimistic layers) and must not copy store data into local refs; shared presentation logic stays pure in `src/domain/`.
+- New components and pages prefer Reka UI primitives with Tailwind CSS v4 utilities; existing Naive UI usage stays as-is. The token bridge is `src/styles/tailwind.css` (theme + utilities only, never preflight), and overlay components are wrapped once under `src/components/ocg/`.
 
 ## Read for the affected task
 
 - Gateway routing, aliases, provider/catalog, protocols, Keys, proxy, usage, or CPA: [runtime invariants](docs/maintainer/runtime-invariants.md).
-- Vue appearance: [DESIGN.md](DESIGN.md) and `src/theme.ts`; shared presentation logic lives in `src/domain/`. Keep the **Key** name and fixed navigation.
+- Vue appearance: [DESIGN.md](DESIGN.md) and `src/theme.ts`. Keep the **Key** name and fixed navigation.
 - SQLite/schema: [storage migration](docs/maintainer/storage-migration.md).
 - Commands and checks: [development](docs/maintainer/development.md).
 - Release: [releasing](docs/maintainer/releasing.md).
 - Extension paths: [extending](docs/maintainer/extending.md).
 - Known limits: [known debt](docs/maintainer/known-debt.md).
+- Per-version upgrade and change notes: [release notes](docs/releases/README.md).
 - User docs: [docs/USER.md](docs/USER.md). Maintainer index: [docs/MAINTAINER.md](docs/MAINTAINER.md).
 
-Use checks that can expose a failure in the changed behavior. Documentation-only work needs link/content checks, not a Rust or frontend build. V3 contract changes require `pnpm run contract:v3:check`; Vue changes require `pnpm run build:web`.
+Use checks that can expose a failure in the changed behavior. Documentation-only work needs paired English and `.zh-CN.md` content review, not a Rust or frontend build. Contract changes require `pnpm run contract:v4:check`; Vue changes require `pnpm run build:web`.
 
 Quit the release tray app before local Tauri development. Report source checks, builds, and real desktop use as distinct evidence.
+
+For releases, use the current release procedure as the gate and completion checklist. Reuse exact-commit CI evidence; do not add blanket local packaging, repeated full suites, all-platform asset downloads, or local image pulls after CI has already verified them. Select extra runtime checks by the changed boundary and report material stage changes or failures rather than narrating every poll.

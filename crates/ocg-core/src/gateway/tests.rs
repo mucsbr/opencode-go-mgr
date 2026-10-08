@@ -45,7 +45,6 @@ async fn gateway_request_body_limit_override_covers_all_inference_routes() {
         "/v1/chat/completions",
         "/v1/responses",
         "/v1/messages",
-        "/claude-desktop/v1/messages",
         "/v1beta/models/test:generateContent",
         "/v1/models/test:streamGenerateContent",
     ] {
@@ -222,9 +221,6 @@ async fn unauthorized_and_expected_fallback_requests_are_not_persisted() {
             .get(format!("{root}/v1/models"))
             .bearer_auth("wrong-key"),
         client
-            .get(format!("{root}/claude-desktop/v1/models"))
-            .header("x-api-key", "wrong-key"),
-        client
             .post(format!("{root}/v1/chat/completions"))
             .bearer_auth("wrong-key")
             .json(&chat_body),
@@ -234,10 +230,6 @@ async fn unauthorized_and_expected_fallback_requests_are_not_persisted() {
             .json(&responses_body),
         client
             .post(format!("{root}/v1/messages"))
-            .header("x-api-key", "wrong-key")
-            .json(&messages_body),
-        client
-            .post(format!("{root}/claude-desktop/v1/messages"))
             .header("x-api-key", "wrong-key")
             .json(&messages_body),
         client
@@ -362,11 +354,30 @@ async fn unauthorized_and_expected_fallback_requests_are_not_persisted() {
             .expect("parse failure should keep bounded diagnostic detail");
         assert!(diagnostic["upstream_body_bytes"].is_null());
         assert_eq!(diagnostic["client_body_bytes"], 1);
+        let runtime = db
+            .query_gateway_logs(10, Some(invalid_request_id))
+            .expect("runtime logs should query");
+        assert!(runtime.is_empty());
+        let logical = db
+            .query_request_logs(&crate::log_types::RequestLogQuery {
+                request_id: Some(invalid_request_id.to_string()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(logical.total, 1);
+        assert_eq!(logical.summary.total_attempts, 0);
         assert!(
-            db.query_gateway_logs(10, Some(invalid_request_id))
-                .expect("runtime logs should query")
-                .is_empty(),
-            "request failures must not enter runtime logs"
+            runtime
+                .iter()
+                .all(|row| row.request_id.as_deref() == Some(invalid_request_id))
+        );
+        let encoded = serde_json::to_string(&runtime).unwrap();
+        assert!(!encoded.contains("gateway-test-key"));
+        assert!(
+            runtime
+                .iter()
+                .filter_map(|row| row.diagnostic.as_ref())
+                .all(|value| value.get("body").is_none())
         );
     }
 
@@ -377,18 +388,36 @@ async fn unauthorized_and_expected_fallback_requests_are_not_persisted() {
 }
 
 #[tokio::test]
-async fn claude_desktop_routes_are_wired_and_protected() {
+async fn gemini_and_messages_routes_stay_wired() {
     let mut dir = std::env::temp_dir();
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("system clock should be valid")
         .as_nanos();
-    dir.push(format!("ocg-claude-desktop-routes-{nanos}"));
+    dir.push(format!("ocg-client-routes-{nanos}"));
     fs::create_dir_all(&dir).expect("test data directory should be created");
     let db = Database::open(dir.clone()).expect("test database should open");
     let cipher: Arc<dyn KeyCipher + Send + Sync> = Arc::new(StaticKeyCipher::new("test"));
     let state = Arc::new(CoreStateInner::new(db, dir.clone(), cipher).expect("state should load"));
     let mut config = state.config();
+    // Exercise wired routes with a saved catalog, independently of account availability.
+    state
+        .db
+        .lock()
+        .set_contract_catalog(
+            &crate::provider_contracts::ContractScope::provider(
+                crate::provider::OPENCODE_PROVIDER_ID,
+            ),
+            &crate::kernel::protocol::supported_model_ids()
+                .map(str::to_string)
+                .collect::<Vec<_>>(),
+            Some(chrono::Utc::now()),
+            "test_refreshed_catalog",
+            "https://example.test/models",
+            chrono::Utc::now(),
+        )
+        .unwrap();
+    state.reload_provider_contracts().unwrap();
     // Pin the primary key value for the test requests.
     config.gateway_key = "gateway-test-key".to_string();
     state.set_config(config).expect("test config should save");
@@ -473,100 +502,434 @@ async fn claude_desktop_routes_are_wired_and_protected() {
         .expect("unknown Gemini action should complete");
     assert_eq!(unknown_action.status(), StatusCode::NOT_FOUND);
 
-    let unauthorized = client
-        .get(format!("{root}/claude-desktop/v1/models"))
+    let ordinary_messages = client
+        .post(format!("{root}/v1/messages"))
+        .json(&json!({"model":"minimax-m3","max_tokens":1,"messages":[]}))
         .send()
         .await
-        .expect("models request should complete");
-    assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
-
-    let models = client
-        .get(format!("{root}/claude-desktop/v1/models"))
-        .header("x-api-key", "gateway-test-key")
-        .send()
-        .await
-        .expect("authorized models request should complete");
-    assert_eq!(models.status(), StatusCode::OK);
-    let models: serde_json::Value = models.json().await.expect("models response should be JSON");
-    assert_eq!(models["data"][0]["id"], "claude-sonnet-4-6");
-
-    let messages = client
-        .post(format!("{root}/claude-desktop/v1/messages"))
-        .json(&json!({"model":"claude-sonnet-4-6","max_tokens":1,"messages":[]}))
-        .send()
-        .await
-        .expect("messages request should complete");
-    assert_eq!(messages.status(), StatusCode::UNAUTHORIZED);
-    let unsupported = client
-        .post(format!("{root}/claude-desktop/v1/messages"))
-        .header("x-api-key", "gateway-test-key")
-        .json(&json!({"model":"claude-unknown","max_tokens":1,"messages":[]}))
-        .send()
-        .await
-        .expect("authorized messages request should complete");
-    assert_eq!(unsupported.status(), StatusCode::BAD_REQUEST);
-
-    let dashboard = client
-        .get(format!("{root}/dashboard/api/claude-desktop/models"))
-        .header("x-forwarded-for", "203.0.113.1")
-        .send()
-        .await
-        .expect("dashboard request should complete");
-    assert_eq!(dashboard.status(), StatusCode::UNAUTHORIZED);
-
-    let retired = client
-        .put(format!("{root}/dashboard/api/claude-desktop/models"))
-        .json(&json!({"sonnet":"","opus":"","haiku":""}))
-        .send()
-        .await
-        .expect("retired V2 dashboard update should complete");
-    assert_eq!(retired.status(), StatusCode::GONE);
-
-    let invalid = client
-        .put(format!("{root}/dashboard/api/v3/claude-desktop/models"))
-        .json(&json!({
-            "expectedRevision": state.settings_revision(),
-            "processGeneration": state.process_generation(),
-            "sonnet": "",
-            "opus": "",
-            "haiku": ""
-        }))
-        .send()
-        .await
-        .expect("dashboard update should complete");
-    assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
-
-    let updated = client
-        .put(format!("{root}/dashboard/api/v3/claude-desktop/models"))
-        .json(&json!({
-            "expectedRevision": state.settings_revision(),
-            "processGeneration": state.process_generation(),
-            "sonnet": "",
-            "opus": "glm-5.2",
-            "haiku": ""
-        }))
-        .send()
-        .await
-        .expect("dashboard update should complete");
-    assert_eq!(updated.status(), StatusCode::OK);
-    let updated: serde_json::Value = updated.json().await.expect("update should return JSON");
-    assert_eq!(updated["sonnet"], "glm-5.2");
-    assert_eq!(updated["opus"], "glm-5.2");
-    assert_eq!(updated["haiku"], "glm-5.2");
-    let fetched: serde_json::Value = client
-        .get(format!("{root}/dashboard/api/v3/claude-desktop/models"))
-        .send()
-        .await
-        .expect("dashboard models request should complete")
-        .json()
-        .await
-        .expect("dashboard models response should be JSON");
-    assert_eq!(fetched["sonnet"], updated["sonnet"]);
-    assert_eq!(fetched["opus"], updated["opus"]);
-    assert_eq!(fetched["haiku"], updated["haiku"]);
+        .expect("ordinary messages route should complete");
+    assert_eq!(ordinary_messages.status(), StatusCode::UNAUTHORIZED);
 
     let _ = handle.shutdown.send(());
     handle.task.await.expect("test gateway should stop");
+    drop(state);
+    fs::remove_dir_all(dir).expect("test data directory should be removed");
+}
+
+const CATALOGED_MODEL: &str = "vendor/cataloged";
+const UNCATEGORIZED_MODEL: &str = "vendor/plain";
+
+/// Publishes the fixture's routeable Custom models on one account.
+fn publish_models_endpoint_fixture(state: &crate::state::CoreState, ids: &[&str]) {
+    use crate::models::{
+        Account, AccountCustomConfigInput, AccountModelCapabilityInput, AccountSetupStep,
+        AccountType,
+    };
+    use crate::provider::{CUSTOM_PROVIDER_ID, CredentialKind, QuotaScope, UpstreamProtocolKind};
+    let now = chrono::Utc::now();
+    state
+        .db
+        .lock()
+        .create_account_with_contract(
+            &Account {
+                id: "models-endpoint-custom".into(),
+                provider_id: CUSTOM_PROVIDER_ID.into(),
+                credential_kind: CredentialKind::ApiKey,
+                quota_scope: QuotaScope::Key,
+                name: "Models endpoint test".into(),
+                username: None,
+                password_cipher: None,
+                key_cipher: state
+                    .encrypt_key("sk-ocg-models-endpoint-upstream")
+                    .unwrap(),
+                enabled: true,
+                account_type: AccountType::Key,
+                setup_step: AccountSetupStep::Ready,
+                referral_code: None,
+                purchase_date: String::new(),
+                expires_on: String::new(),
+                cooldown_until: None,
+                cooldown_generic_until: None,
+                cooldown_5h_until: None,
+                cooldown_week_until: None,
+                cooldown_month_until: None,
+                cooldown_free_until: None,
+                last_error: None,
+                auth_error: None,
+                notes: None,
+                created_at: now,
+                updated_at: now,
+            },
+            Some(&AccountCustomConfigInput {
+                endpoint_url: "https://example.test/v1/chat/completions".into(),
+                upstream_protocol: UpstreamProtocolKind::ChatCompletions,
+            }),
+            &ids.iter()
+                .map(|id| AccountModelCapabilityInput {
+                    public_model: (*id).to_string(),
+                    upstream_model: (*id).to_string(),
+                    protocol: UpstreamProtocolKind::ChatCompletions,
+                    source: None,
+                })
+                .collect::<Vec<_>>(),
+        )
+        .expect("fixture account should be created");
+}
+
+fn models_endpoint_state(label: &str) -> (std::path::PathBuf, crate::state::CoreState) {
+    models_endpoint_state_with(label, &[CATALOGED_MODEL, UNCATEGORIZED_MODEL])
+}
+
+fn models_endpoint_state_with(
+    label: &str,
+    ids: &[&str],
+) -> (std::path::PathBuf, crate::state::CoreState) {
+    let dir = std::env::temp_dir().join(format!("ocg-models-{label}-{}", uuid::Uuid::new_v4()));
+    fs::create_dir_all(&dir).unwrap();
+    let state = Arc::new(
+        CoreStateInner::new(
+            Database::open(dir.clone()).unwrap(),
+            dir.clone(),
+            Arc::new(StaticKeyCipher::new(label)),
+        )
+        .unwrap(),
+    );
+    // A fresh catalog keeps `ensure_fresh` off the network and gives one model
+    // real models.dev facts while the other stays unknown.
+    *state.modelsdev_catalog.write() = Arc::new(crate::modelsdev::ModelsDevCatalog::fresh_flat(
+        [(
+            CATALOGED_MODEL.to_string(),
+            crate::model_metadata::ModelMetadata {
+                name: Some("Cataloged model".into()),
+                context_window: Some(262_144),
+                max_output_tokens: Some(32_768),
+                input_modalities: Some(vec!["text".into(), "image".into()]),
+                output_modalities: Some(vec!["text".into()]),
+                tool_calling: Some(true),
+                ..Default::default()
+            },
+        )]
+        .into_iter()
+        .collect(),
+    ));
+    publish_models_endpoint_fixture(&state, ids);
+    (dir, state)
+}
+
+fn models_endpoint_headers(state: &crate::state::CoreState) -> axum::http::HeaderMap {
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert(
+        axum::http::header::AUTHORIZATION,
+        format!("Bearer {}", state.config().gateway_key)
+            .parse()
+            .unwrap(),
+    );
+    headers
+}
+
+/// GET `/v1/models` captures under `settings_update`, then builds the same
+/// inventory BYOK callers see while they already hold that gate.
+#[tokio::test]
+async fn models_endpoint_serves_the_enriched_rows_captured_under_the_lock() {
+    use axum::body::to_bytes;
+    let (dir, state) = models_endpoint_state("enriched");
+    let headers = models_endpoint_headers(&state);
+
+    let locked_rows = {
+        let _settings_update = state.settings_update.lock();
+        super::handler::published_models_data_locked(&state)
+            .expect("locked model rows should build")
+    };
+    assert_eq!(
+        locked_rows.len(),
+        2,
+        "both published Custom models should be routeable"
+    );
+
+    let response = super::handler::models(axum::extract::State(state.clone()), headers).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .expect("response body should be readable");
+    let body: serde_json::Value = serde_json::from_slice(&bytes).expect("response should be JSON");
+
+    assert_eq!(body["object"], json!("list"));
+    assert_eq!(
+        body["data"],
+        json!(locked_rows),
+        "response rows must match the rows captured under the lock exactly"
+    );
+
+    let row = body["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == json!(CATALOGED_MODEL))
+        .expect("cataloged model should be listed");
+    assert_eq!(row["object"], json!("model"));
+    assert_eq!(row["created"], json!(0));
+    assert_eq!(row["owned_by"], json!(crate::provider::CUSTOM_PROVIDER_ID));
+    assert_eq!(row["name"], json!("Cataloged model"));
+    assert_eq!(row["contextWindow"], json!(262_144));
+    assert_eq!(row["maxTokens"], json!(32_768));
+    assert_eq!(row["ocg"]["schemaVersion"], json!(2));
+    assert!(row["ocg"].get("clientProtocol").is_none());
+    assert_eq!(
+        row["ocg"]["protocols"],
+        json!({"preferred": "chat_completions", "supported": ["chat_completions"]})
+    );
+    assert_eq!(row["ocg"]["status"], json!("declared"));
+    assert_eq!(row["ocg"]["sources"], json!(["modelsdev"]));
+    assert_eq!(row["ocg"]["inputModalities"], json!(["text", "image"]));
+    assert_eq!(row["ocg"]["toolCalling"], json!(true));
+
+    let unknown = body["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == json!(UNCATEGORIZED_MODEL))
+        .expect("uncataloged model should be listed");
+    assert_eq!(unknown["ocg"]["schemaVersion"], json!(2));
+    assert!(unknown["ocg"].get("clientProtocol").is_none());
+    assert_eq!(unknown["ocg"]["status"], json!("unknown"));
+    assert_eq!(unknown["ocg"]["sources"], json!(["unknown"]));
+    assert_eq!(
+        unknown["ocg"]["protocols"],
+        json!({"preferred": "chat_completions", "supported": ["chat_completions"]})
+    );
+    assert!(
+        unknown.get("contextWindow").is_none(),
+        "an unknown model must not declare a context window"
+    );
+
+    drop(state);
+    fs::remove_dir_all(dir).expect("test data directory should be removed");
+}
+
+#[tokio::test]
+async fn models_endpoint_releases_the_settings_gate_before_building_rows() {
+    use axum::body::to_bytes;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let (dir, state) = models_endpoint_state("catalog-gate");
+    let headers = models_endpoint_headers(&state);
+    let acquired = std::sync::Arc::new(AtomicBool::new(false));
+    struct CaptureHookGuard;
+    impl Drop for CaptureHookGuard {
+        fn drop(&mut self) {
+            super::handler::clear_after_published_models_capture();
+        }
+    }
+    let _guard = CaptureHookGuard;
+    let acquired_flag = acquired.clone();
+    let probe_state = state.clone();
+    super::handler::set_after_published_models_capture(Box::new(move || {
+        let Some(_gate) = probe_state.settings_update.try_lock() else {
+            panic!("GET /v1/models must drop settings_update before building rows");
+        };
+        acquired_flag.store(true, Ordering::SeqCst);
+    }));
+    let response = super::handler::models(axum::extract::State(state.clone()), headers).await;
+    assert!(
+        acquired.load(Ordering::SeqCst),
+        "capture probe must run after the settings_update gate is released"
+    );
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .expect("response body should be readable");
+    let body: serde_json::Value = serde_json::from_slice(&bytes).expect("response should be JSON");
+    assert_eq!(body["object"], json!("list"));
+    assert_eq!(
+        body["data"].as_array().map(|rows| rows.len()),
+        Some(2),
+        "releasing settings_update before the row builder must not change publication eligibility"
+    );
+    let locked_rows = {
+        let _settings_update = state.settings_update.lock();
+        super::handler::published_models_data_locked(&state)
+            .expect("locked model rows should build")
+    };
+    assert_eq!(
+        body["data"],
+        json!(locked_rows),
+        "GET rows must stay consistent with a later gate-held capture"
+    );
+    drop(state);
+    fs::remove_dir_all(dir).expect("test data directory should be removed");
+}
+
+const SCOPED_OUT_MODEL: &str = "vendor/scoped-out";
+
+/// Catalog-enabled names still need a derived protocol profile. Scope gaps are
+/// omitted; unknown capability with a valid profile is kept; cooldown and an
+/// old auth error do not gate that profile. Keyless AuthScheme::None routes
+/// already qualify in model_metadata tests and survive the same retain.
+#[tokio::test]
+async fn models_endpoint_omits_unqualified_rows_and_ignores_cooldown() {
+    use crate::model_metadata::read_published_protocol_profile;
+    use ocg_domain::credential::ModelScope;
+
+    let (dir, state) = models_endpoint_state_with(
+        "unqualified",
+        &[CATALOGED_MODEL, UNCATEGORIZED_MODEL, SCOPED_OUT_MODEL],
+    );
+    let scope = serde_json::to_string(&ModelScope::Only {
+        models: vec![CATALOGED_MODEL.into(), UNCATEGORIZED_MODEL.into()],
+    })
+    .unwrap();
+    {
+        let db = state.db.lock();
+        let updated = db
+            .conn
+            .execute(
+                "UPDATE credentials
+                 SET scope_json = ?1, cooldown_until = ?2, auth_error = ?3
+                 WHERE legacy_account_id = ?4",
+                rusqlite::params![
+                    scope,
+                    "2099-01-01T00:00:00Z",
+                    "stale-auth",
+                    "models-endpoint-custom"
+                ],
+            )
+            .expect("fresh schema 66 credentials row should accept the fixture write");
+        assert!(
+            updated > 0,
+            "expected a credentials row for legacy_account_id=models-endpoint-custom"
+        );
+    }
+
+    let rows = {
+        let _settings_update = state.settings_update.lock();
+        super::handler::published_models_data_locked(&state)
+            .expect("locked model rows should build")
+    };
+    let mut ids: Vec<_> = rows
+        .iter()
+        .map(|row| row["id"].as_str().unwrap().to_string())
+        .collect();
+    ids.sort();
+    assert_eq!(
+        ids,
+        vec![CATALOGED_MODEL.to_string(), UNCATEGORIZED_MODEL.to_string()]
+    );
+    for row in &rows {
+        assert!(
+            read_published_protocol_profile(
+                row.get("ocg").and_then(|value| value.get("protocols"))
+            )
+            .is_ok(),
+            "{}",
+            row["id"]
+        );
+    }
+    let unknown = rows
+        .iter()
+        .find(|row| row["id"] == json!(UNCATEGORIZED_MODEL))
+        .unwrap();
+    assert_eq!(unknown["ocg"]["status"], json!("unknown"));
+    assert!(unknown.get("contextWindow").is_none());
+    assert_eq!(
+        unknown["ocg"]["protocols"],
+        json!({"preferred": "chat_completions", "supported": ["chat_completions"]})
+    );
+
+    drop(state);
+    fs::remove_dir_all(dir).expect("test data directory should be removed");
+}
+
+/// A generic Custom route does not match a catalog provider. Tiers still come
+/// from `parse_api` through the canonical model, not from a hand-built record.
+#[tokio::test]
+async fn models_endpoint_publishes_canonical_tiers_from_the_parsed_catalog() {
+    use axum::body::to_bytes;
+    let (dir, state) = {
+        let dir = std::env::temp_dir().join(format!("ocg-models-parsed-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let state = Arc::new(
+            CoreStateInner::new(
+                Database::open(dir.clone()).unwrap(),
+                dir.clone(),
+                Arc::new(StaticKeyCipher::new("parsed-catalog")),
+            )
+            .unwrap(),
+        );
+        let mut catalog = crate::modelsdev::parse_api(
+            br#"{
+            "openai": {"models": {
+                "gpt-5.2": {
+                    "reasoning": true,
+                    "limit": {"context": 400000, "output": 128000},
+                    "reasoning_options": [{"type": "effort", "values": ["low", "medium", "high", "xhigh"]}]
+                },
+                "gpt-5.3-codex": {
+                    "reasoning": true,
+                    "reasoning_options": [{"type": "effort", "values": ["low", "high", "xhigh"]}]
+                },
+                "o3": {
+                    "reasoning": true,
+                    "reasoning_options": [{"type": "effort", "values": ["low", "medium", "high"]}]
+                }
+            }},
+            "proxy": {"api": "https://proxy.test/v1", "models": {
+                "gpt-5.2": {"canonical_model_id": "openai/gpt-5.2"},
+                "gpt-5.3-codex": {"canonical_model_id": "openai/gpt-5.3-codex"},
+                "o3": {"canonical_model_id": "openai/o3"}
+            }},
+            "unrelated": {"api": "https://other.test/v1", "models": {
+                "different": {"limit": {"context": 1000}}
+            }}
+        }"#,
+        );
+        catalog.fetched_at = Some(chrono::Utc::now());
+        assert!(
+            catalog.is_fresh(chrono::Utc::now()),
+            "a parsed catalog with a fetch time must not refresh during the request"
+        );
+        *state.modelsdev_catalog.write() = Arc::new(catalog);
+        publish_models_endpoint_fixture(&state, &["gpt-5.2", "gpt-5.3-codex", "o3"]);
+        (dir, state)
+    };
+    let headers = models_endpoint_headers(&state);
+    let response = super::handler::models(axum::extract::State(state.clone()), headers).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .expect("response body should be readable");
+    let body: serde_json::Value = serde_json::from_slice(&bytes).expect("response should be JSON");
+    let row = |id: &str| {
+        body["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["id"] == json!(id))
+            .unwrap_or_else(|| panic!("{id} should be listed"))
+            .clone()
+    };
+    let gpt = row("gpt-5.2");
+    assert_eq!(gpt["ocg"]["schemaVersion"], json!(2));
+    assert!(gpt["ocg"].get("clientProtocol").is_none());
+    assert_eq!(
+        gpt["ocg"]["protocols"],
+        json!({"preferred": "chat_completions", "supported": ["chat_completions"]})
+    );
+    assert_eq!(gpt["ocg"]["sources"], json!(["modelsdev"]));
+    assert_eq!(gpt["ocg"]["status"], json!("declared"));
+    assert_eq!(gpt["contextWindow"], json!(400000));
+    assert_eq!(gpt["maxTokens"], json!(128000));
+    assert_eq!(
+        gpt["ocg"]["reasoningEfforts"],
+        json!({"low": "low", "medium": "medium", "high": "high", "xhigh": "xhigh"})
+    );
+    assert_eq!(
+        row("gpt-5.3-codex")["ocg"]["reasoningEfforts"],
+        json!({"low": "low", "high": "high", "xhigh": "xhigh"})
+    );
+    assert_eq!(
+        row("o3")["ocg"]["reasoningEfforts"],
+        json!({"low": "low", "medium": "medium", "high": "high"})
+    );
+
     drop(state);
     fs::remove_dir_all(dir).expect("test data directory should be removed");
 }

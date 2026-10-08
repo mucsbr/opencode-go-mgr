@@ -88,7 +88,7 @@ async fn dashboard_cas_is_not_shared_with_cli_or_tauri_shaped_db_writes() {
         .await
         .unwrap();
     let client = loopback_client();
-    let base = format!("http://127.0.0.1:{}/dashboard/api/v3", handle.port);
+    let base = format!("http://127.0.0.1:{}/dashboard/api/v4", handle.port);
     let revision_after_config = state.settings_revision();
     let generation = state.process_generation();
 
@@ -247,47 +247,4 @@ fn direct_db_creates_respect_catalog_enablement_without_dashboard_cas() {
 
     drop(state);
     let _ = fs::remove_dir_all(dir);
-}
-
-#[tokio::test]
-async fn dashboard_custom_create_defaults_enabled_while_verification_is_pending() {
-    let state = state("dashboard-custom");
-    let handle = gateway::start_gateway_on(state.clone(), SocketAddr::from(([127, 0, 0, 1], 0)))
-        .await
-        .unwrap();
-    let client = loopback_client();
-    let base = format!("http://127.0.0.1:{}/dashboard/api/v3", handle.port);
-    let revision = state.settings_revision();
-
-    let response = client
-        .post(format!("{base}/accounts"))
-        .json(&json!({
-            "expectedRevision": revision,
-            "processGeneration": state.process_generation(),
-            "providerId": CUSTOM_PROVIDER_ID,
-            "name": "dash-custom",
-            "key": "custom-key",
-            "customConfig": {
-                "endpointUrl": "http://127.0.0.1:1/chat/completions",
-                "upstreamProtocol": "chat_completions"
-            },
-            "modelCapabilities": [{
-                "modelId": "dash-custom-model",
-                "protocol": "chat_completions"
-            }]
-        }))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-    let body: serde_json::Value = response.json().await.unwrap();
-    assert_eq!(body["account"]["enabled"], true, "{body}");
-    assert_eq!(
-        body["account"]["verificationStatus"].as_str(),
-        Some("pending")
-    );
-    assert_eq!(state.settings_revision(), revision + 1);
-
-    gateway::stop_gateway(handle);
-    let _ = fs::remove_dir_all(state.data_dir());
 }

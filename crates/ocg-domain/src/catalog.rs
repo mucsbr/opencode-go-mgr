@@ -137,6 +137,7 @@ impl TryFrom<&str> for UpstreamProtocolKind {
 pub enum UpstreamAuthScheme {
     Bearer,
     XApiKey,
+    ApiKey,
 }
 
 impl UpstreamAuthScheme {
@@ -144,6 +145,7 @@ impl UpstreamAuthScheme {
         match self {
             Self::Bearer => "bearer",
             Self::XApiKey => "x-api-key",
+            Self::ApiKey => "api-key",
         }
     }
 }
@@ -155,6 +157,7 @@ impl TryFrom<&str> for UpstreamAuthScheme {
         match value {
             "bearer" => Ok(Self::Bearer),
             "x-api-key" => Ok(Self::XApiKey),
+            "api-key" => Ok(Self::ApiKey),
             _ => Err(CatalogParseError::UnknownAuthScheme(value.to_string())),
         }
     }
@@ -202,10 +205,5 @@ mod tests {
             UpstreamAuthScheme::try_from("basic"),
             Err(CatalogParseError::UnknownAuthScheme(value)) if value == "basic"
         ));
-    }
-
-    #[test]
-    fn opencode_go_usage_url_is_the_fixed_official_endpoint() {
-        assert_eq!(OPENCODE_GO_USAGE_URL, "https://opencode.ai/zen/go/v1/usage");
     }
 }

@@ -1,14 +1,23 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  CPA_CARD_STATUS_KEYS,
   CPA_LOG_TAIL_LINES,
   CPA_OAUTH_PROVIDERS,
+  CPA_RUNTIME_PHASE_KEYS,
   cpaAccountKey,
+  cpaCardProcessDown,
+  cpaCardStatus,
+  cpaCardStatusTagType,
+  cpaCliImportAlreadyPresent,
+  cpaCliImportFilenameToken,
+  cpaOAuthProviderForCliAccount,
   cpaClientKeysAvailable,
   cpaLogTail,
   cpaManagedRuntimeConfirmed,
   cpaRuntimeControls,
   cpaRuntimeMode,
+  cpaStartupRestorePending,
   formatCpaQuota,
   groupCpaCatalogModels,
   isCpaOAuthSuccessStatus,
@@ -20,6 +29,10 @@ import type { CpaIntegration, CpaRuntime, CpaRuntimeKey } from "../api/generated
 
 function runtime(overrides: Partial<CpaRuntime> = {}): CpaRuntime {
   return {
+    actions: { install: false, start: false, stop: true, checkUpdate: true, update: false, rollback: false, remove: true },
+    clientKeysAvailable: true,
+    codexDeviceLoginAvailable: true,
+    startupRestorePending: false,
     assetSha256: null,
     baseUrl: "http://127.0.0.1:8317",
     currentOperation: null,
@@ -34,6 +47,7 @@ function runtime(overrides: Partial<CpaRuntime> = {}): CpaRuntime {
     processGeneration: 1,
     revision: 1,
     running: true,
+    desiredRunning: false,
     supported: true,
     unavailableReason: null,
     updateAvailable: false,
@@ -114,12 +128,10 @@ test("CPA catalog groups by source and keeps unknown sources last", () => {
   );
 });
 
-test("client keys exist only for an owned, installed, supported managed runtime", () => {
-  assert.ok(cpaClientKeysAvailable(runtime()));
+test("client keys use the server capability even when raw facts disagree", () => {
+  assert.ok(cpaClientKeysAvailable(runtime({ installed: false, clientKeysAvailable: true })));
   assert.ok(!cpaClientKeysAvailable(null));
-  assert.ok(!cpaClientKeysAvailable(runtime({ supported: false })));
-  assert.ok(!cpaClientKeysAvailable(runtime({ owned: false })));
-  assert.ok(!cpaClientKeysAvailable(runtime({ installed: false })));
+  assert.ok(!cpaClientKeysAvailable(runtime({ clientKeysAvailable: false })));
 });
 
 test("busy phases are exactly the lifecycle phases that block controls", () => {
@@ -131,95 +143,21 @@ test("busy phases are exactly the lifecycle phases that block controls", () => {
   assert.ok(!isCpaPhaseBusy("failed"));
 });
 
-test("every control is disabled while busy, unsupported, or an unowned installed runtime", () => {
-  const updateCheck = {
-    currentVersion: "1.0.0",
-    latestVersion: "1.1.0",
-    processGeneration: 1,
-    releaseUrl: "https://example.com/release",
-    revision: 1,
-    updateAvailable: true,
-  };
+test("controls consume server eligibility with only local busy gating", () => {
   const allOff = { install: false, start: false, stop: false, checkUpdate: false, update: false, rollback: false, remove: false };
-  assert.deepEqual(cpaRuntimeControls({ runtime: runtime(), busy: true, updateCheck }), allOff);
-  assert.deepEqual(
-    cpaRuntimeControls({ runtime: runtime({ phase: "downloading" }), busy: false, updateCheck }),
-    allOff,
-  );
-  assert.deepEqual(
-    cpaRuntimeControls({ runtime: runtime({ supported: false }), busy: false, updateCheck }),
-    allOff,
-  );
-  assert.deepEqual(
-    cpaRuntimeControls({ runtime: runtime({ owned: false }), busy: false, updateCheck }),
-    allOff,
-  );
-  assert.deepEqual(cpaRuntimeControls({ runtime: null, busy: false, updateCheck }), allOff);
+  assert.deepEqual(cpaRuntimeControls({ runtime: null, busy: false }), allOff);
+  assert.deepEqual(cpaRuntimeControls({ runtime: runtime(), busy: true }), allOff);
+  const actions = { ...allOff, update: true, remove: true };
+  const server = runtime({ supported: false, installed: false, actions });
+  assert.deepEqual(cpaRuntimeControls({ runtime: server, busy: false }), actions);
+  assert.deepEqual(cpaRuntimeControls({ runtime: runtime({ actions: allOff }), busy: false }), allOff);
+  assert.deepEqual(server.actions, actions, "local gating leaves the server snapshot intact");
 });
 
-test("control availability follows install/run/version state", () => {
-  const noUpdate = { updateCheck: null, busy: false };
-  const installedRunning = cpaRuntimeControls({ runtime: runtime(), ...noUpdate });
-  assert.deepEqual(installedRunning, {
-    install: false,
-    start: false,
-    stop: true,
-    checkUpdate: true,
-    update: false,
-    rollback: false,
-    remove: true,
-  });
-
-  const fresh = cpaRuntimeControls({ runtime: runtime({ installed: false, running: false }), ...noUpdate });
-  assert.ok(fresh.install && !fresh.start && !fresh.stop && !fresh.remove);
-
-  const freshChecked = cpaRuntimeControls({
-    runtime: runtime({ installed: false, running: false }),
-    busy: false,
-    updateCheck: {
-      currentVersion: null,
-      latestVersion: "1.1.0",
-      processGeneration: 1,
-      releaseUrl: "https://example.com/release",
-      revision: 1,
-      updateAvailable: true,
-    },
-  });
-  assert.ok(!freshChecked.update);
-
-  const installedStopped = cpaRuntimeControls({
-    runtime: runtime({ running: false, previousVersion: "0.9.0" }),
-    ...noUpdate,
-  });
-  assert.ok(installedStopped.start && !installedStopped.stop && installedStopped.rollback);
-
-  const withUpdate = cpaRuntimeControls({
-    runtime: runtime(),
-    busy: false,
-    updateCheck: {
-      currentVersion: "1.0.0",
-      latestVersion: "1.1.0",
-      processGeneration: 1,
-      releaseUrl: "https://example.com/release",
-      revision: 1,
-      updateAvailable: true,
-    },
-  });
-  assert.ok(withUpdate.update);
-
-  const checkedCurrent = cpaRuntimeControls({
-    runtime: runtime(),
-    busy: false,
-    updateCheck: {
-      currentVersion: "1.1.0",
-      latestVersion: "1.1.0",
-      processGeneration: 1,
-      releaseUrl: "https://example.com/release",
-      revision: 1,
-      updateAvailable: false,
-    },
-  });
-  assert.ok(!checkedCurrent.update);
+test("startup restore hint consumes the server fact", () => {
+  assert.ok(cpaStartupRestorePending(runtime({ installed: false, startupRestorePending: true })));
+  assert.ok(!cpaStartupRestorePending(runtime({ desiredRunning: true, startupRestorePending: false })));
+  assert.ok(!cpaStartupRestorePending(null));
 });
 
 test("log tail is bounded, trailing blank lines are stripped, CRLF is normalized", () => {
@@ -249,28 +187,104 @@ test("account identity is name plus optional authIndex", () => {
   assert.equal(cpaAccountKey({ name: "acc", authIndex: null }), "acc:");
 });
 
-test("quota renders scalars directly and falls back to JSON or a dash", () => {
+test("quota hides empty CPA trackers and renders scalars or JSON", () => {
   assert.equal(formatCpaQuota("100/200"), "100/200");
   assert.equal(formatCpaQuota(42), "42");
   assert.equal(formatCpaQuota({ remaining: 5 }), '{"remaining":5}');
-  assert.equal(formatCpaQuota(null), "—");
-  assert.equal(formatCpaQuota(undefined), "—");
+  assert.equal(formatCpaQuota({ signals: { gpt: { used: 1 } } }), '{"signals":{"gpt":{"used":1}}}');
+  assert.equal(formatCpaQuota(null), null);
+  assert.equal(formatCpaQuota(undefined), null);
+  assert.equal(formatCpaQuota({}), null);
+  assert.equal(formatCpaQuota({ signals: {} }), null);
+  assert.equal(formatCpaQuota({ signals: { gpt: {} } }), null);
   const circular: Record<string, unknown> = {};
   circular.self = circular;
-  assert.equal(formatCpaQuota(circular), "—");
+  assert.equal(formatCpaQuota(circular), null);
 });
 
 test("OAuth provider registry keeps the fixed five providers in order", () => {
   assert.deepEqual(
-    CPA_OAUTH_PROVIDERS.map(({ id, label }) => [id, label]),
-    [
-      ["codex", "Codex"],
-      ["anthropic", "Claude"],
-      ["antigravity", "Antigravity"],
-      ["kimi", "Kimi"],
-      ["xai", "xAI"],
-    ],
+    CPA_OAUTH_PROVIDERS.map(({ id }) => id),
+    ["codex", "anthropic", "antigravity", "kimi", "xai"],
   );
+});
+
+test("CLI import filename tokens match CPA account names", () => {
+  assert.equal(cpaCliImportFilenameToken("codex"), "codex");
+  assert.equal(cpaCliImportFilenameToken("anthropic"), "claude");
+  assert.equal(cpaCliImportFilenameToken("kimi"), "kimi");
+  const accounts = [
+    { name: "ocg-cli-codex-a1b2c3.json" },
+    { name: "ocg-cli-claude-f0e1d2.json" },
+    { name: "chatgpt-oauth.json" },
+  ];
+  assert.ok(cpaCliImportAlreadyPresent("codex", accounts));
+  assert.ok(cpaCliImportAlreadyPresent("anthropic", accounts));
+  assert.ok(!cpaCliImportAlreadyPresent("kimi", accounts));
+  assert.ok(!cpaCliImportAlreadyPresent("codex", [{ name: "codex-work.json" }]));
+  assert.equal(cpaOAuthProviderForCliAccount({ name: "ocg-cli-claude-f0e1d2.json" }), "anthropic");
+  assert.equal(cpaOAuthProviderForCliAccount({ name: "chatgpt-oauth.json" }), null);
+});
+
+test("CPA card status prefers lifecycle phase then managed running/stopped", () => {
+  const owned = integration({ configured: true, runtimeOwned: true, runtimeRunning: true, installedVersion: "1.0.0" });
+  assert.equal(cpaCardStatus(owned, runtime({ running: true, installed: true, owned: true })), "running");
+  assert.equal(cpaCardStatus(owned, runtime({ running: false, installed: true, owned: true })), "stopped");
+  assert.equal(
+    cpaCardStatus(owned, runtime({ running: false, installed: false, owned: true })),
+    "not_installed",
+  );
+  assert.equal(
+    cpaCardStatus(owned, runtime({ phase: "starting", running: false, installed: true, owned: true })),
+    "starting",
+  );
+  assert.equal(
+    cpaCardStatus(owned, runtime({ phase: "failed", running: false, installed: true, owned: true })),
+    "failed",
+  );
+  assert.equal(cpaCardStatus(owned, null), "running");
+  assert.equal(
+    cpaCardStatus(integration({ configured: true, runtimeOwned: true, runtimeRunning: false, installedVersion: "1.0.0" }), null),
+    "stopped",
+  );
+  assert.equal(
+    cpaCardStatus(integration({ configured: true, runtimeOwned: false, runtimeRunning: false }), runtime({ owned: false, running: false })),
+    "external",
+  );
+  assert.equal(cpaCardStatus(integration({ configured: false, runtimeOwned: false }), null), null);
+  assert.equal(cpaCardStatus(null, runtime()), null);
+});
+
+test("CPA card status keys cover every code and tag type stays semantic", () => {
+  const statuses = [
+    "checking",
+    "downloading",
+    "installing",
+    "starting",
+    "failed",
+    "running",
+    "stopped",
+    "not_installed",
+    "external",
+  ] as const;
+  assert.deepEqual(Object.keys(CPA_CARD_STATUS_KEYS).sort(), [...statuses].sort());
+  assert.deepEqual(
+    Object.keys(CPA_RUNTIME_PHASE_KEYS).sort(),
+    ["checking", "downloading", "failed", "idle", "installing", "starting"].sort(),
+  );
+  assert.equal(cpaCardStatusTagType("running"), "success");
+  assert.equal(cpaCardStatusTagType("failed"), "error");
+  assert.equal(cpaCardStatusTagType("starting"), "warning");
+  assert.equal(cpaCardStatusTagType("not_installed"), "warning");
+  assert.equal(cpaCardStatusTagType("stopped"), "default");
+  assert.equal(cpaCardStatusTagType("external"), "default");
+  assert.equal(cpaCardProcessDown("running"), false);
+  assert.equal(cpaCardProcessDown("external"), false);
+  assert.equal(cpaCardProcessDown(null), false);
+  assert.equal(cpaCardProcessDown("stopped"), true);
+  assert.equal(cpaCardProcessDown("not_installed"), true);
+  assert.equal(cpaCardProcessDown("failed"), true);
+  assert.equal(cpaCardProcessDown("starting"), true);
 });
 
 test("OAuth polling stops on terminal statuses and refreshes accounts only on success", () => {

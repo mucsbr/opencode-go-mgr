@@ -10,12 +10,12 @@ not obvious from the YAML.
 Runs on pull requests and `main`, and via `workflow_call` from a production
 tag. Manual release candidates skip it. Three parallel jobs:
 
-- **Web** — `contract:v3:check`, `typecheck`, `test:web`, Vite production
-  build, `DESIGN.md` lint, and
+- **Web** — `contract:v3:check`, `contract:v4:check`, `typecheck`, `test:web`,
+  `test:tooling`, Vite production build, `DESIGN.md` lint, and
   `docker compose -f compose.example.yaml config --quiet`.
-  `pnpm run test:tooling` is not in this job.
 - **Rust** — `cargo fmt --all -- --check`, locked workspace tests and Clippy
-  `-D warnings` with `--exclude ocg-manager` (the desktop crate needs WebKit
+  `-D warnings` with `--features ocg-core/ollama-cloud-loopback-test` and
+  `--exclude ocg-manager` (the desktop crate needs WebKit
   headers and a `dist/index.html` stub; Windows covers it; Linux `src-tauri`
   compile is the release matrix).
 - **Windows Tauri** — `cargo test -p ocg-manager --lib` and Clippy `-D warnings`
@@ -42,10 +42,13 @@ only for a strictly newer stable SemVer. Prerelease tags set
 `prerelease=true` and `make_latest=false`.
 
 Windows GUI smoke is `scripts/smoke-windows-release.ps1` (V3 CAS for
-auto-start and the in-place NSIS `/UPDATE` path). macOS checks universal
-`lipo` plus ad-hoc `codesign`. Linux launches the AppImage under Xvfb.
+auto-start, in-place NSIS `/UPDATE`, silent uninstall keeping data, and
+reinstall into the remembered directory). macOS checks universal
+`lipo` plus ad-hoc `codesign`, and re-runs Unix CPA process-ownership
+tests (`cpa_runtime::host`) that Linux already covered in quality.yml.
+Linux launches the AppImage under Xvfb.
 
-## Updater signing
+## Updater Signing
 
 Generate the key once outside the checkout:
 
@@ -85,7 +88,7 @@ gate on the first run.
 Publishes `docs/` to GitHub Pages (`docs/index.html`). Set the repository
 Pages source to **GitHub Actions** before the first deployment.
 
-## What CI does not cover
+## What CI Does Not Cover
 
 Quality covers frontend + Linux Rust excluding the desktop crate + Windows
 desktop unit tests. Native installer smokes run on candidates and tags.
@@ -98,6 +101,7 @@ Choose applicable manual checks using [Release Procedure](releasing.md) and
 record omissions. Real payment is not a routine release requirement. Database
 downgrade is unsupported; rollback uses a pre-upgrade backup as described in
 [Storage And Migrations](storage-migration.md).
+
 ---
 
 [Maintainer guide index](../MAINTAINER.md) · [简体中文](ci.zh-CN.md) · [Docs index](../README.md)

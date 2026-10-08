@@ -1,26 +1,24 @@
-//! Custom API runtime helpers: capability matching, verification probe, and
-//! per-account route identity.
+//! Custom API runtime helpers: connection-owned route configuration projected
+//! per credential for capability matching and verification.
 //!
 //! Account model capabilities are the client-facing IDs and the exact upstream
-//! IDs, each bound to the account's one upstream protocol. Verification sends
+//! IDs, each bound to its effective destination route. Verification sends
 //! one protocol-correct non-stream request against the first declared model.
 //! Discovery never mutates the declared list.
 //! The adapter identity is Configurable HTTP, not a base class other providers
-//! inherit from. Custom keeps a configurable API URL and explicit enablement;
+//! inherit from. Custom keeps destination-owned HTTP configuration and per-Key enablement;
 //! connection verification is an optional tool, not an enablement gate.
 
 use crate::custom_http::{
     self, CustomHttpClient, HttpInferenceTransport, InferenceHttpError, custom_auth_scheme,
     json_content_headers, resolve_custom_endpoints,
 };
-use crate::kernel::ids::CUSTOM_PROVIDER_ID;
 use crate::kernel::protocol::ApiFormat;
 use crate::models::{
     AccountCustomConfig, AccountCustomConfigInput, AccountModelCapability,
     AccountModelCapabilityInput, AppConfig, CustomModelDiscoveryResult,
 };
-use crate::provider::ConnectionVerificationStatus;
-use crate::provider::{UpstreamProtocolKind, is_custom_api};
+use crate::provider::{ConnectionVerificationStatus, UpstreamProtocolKind};
 use reqwest::StatusCode;
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
@@ -36,8 +34,8 @@ pub use crate::custom_http::{
     CustomUrlHost, CustomUrlTarget, inspect_custom_url, validate_custom_endpoint_url,
 };
 
-/// Upper bound for a Custom verification response. The probe only needs a 2xx
-/// JSON object; anything larger is rejected without certifying the account.
+/// Upper bound for a protocol-correct verification response. Larger bodies
+/// are rejected without certifying the account.
 pub const MAX_CUSTOM_VERIFICATION_BODY_BYTES: usize = 64 * 1024;
 
 /// Discovery is an interactive dashboard aid, not an unbounded upstream
@@ -60,19 +58,61 @@ pub struct CustomAccountRuntime {
     pub verification_status: ConnectionVerificationStatus,
     pub setup_ready: bool,
     pub has_key: bool,
+    pub auth_kind: ocg_domain::dynamic::DynamicAuthKind,
     pub config: AccountCustomConfig,
     pub capabilities: Vec<AccountModelCapability>,
+    pub route_overrides: Vec<(String, ocg_domain::dynamic::DynamicModelUpstreamOverride)>,
+    /// Linked New API / Sub2API Key. The contract admits Chat, Messages, and
+    /// Responses. Selection still tries the saved preferred protocol, then the
+    /// enabled client protocol, then the remaining authorized protocols.
+    pub protocol_passthrough: bool,
 }
 
 impl CustomAccountRuntime {
     pub fn eligible(&self) -> bool {
-        self.enabled && self.setup_ready && self.has_key && is_custom_api(CUSTOM_PROVIDER_ID)
+        self.enabled && self.setup_ready && self.has_key
     }
 
     pub fn capability_matching_public(&self, requested: &str) -> Option<&AccountModelCapability> {
         self.capabilities
             .iter()
             .find(|capability| custom_model_id_matches(&capability.public_model, requested))
+    }
+
+    pub fn route_override_matching_public(
+        &self,
+        requested: &str,
+    ) -> Option<&ocg_domain::dynamic::DynamicModelUpstreamOverride> {
+        self.route_overrides
+            .iter()
+            .find(|(public_model, _)| custom_model_id_matches(public_model, requested))
+            .map(|(_, route)| route)
+    }
+
+    /// Public-name / protocol rows used to build the Custom contract.
+    ///
+    /// A passthrough Key admits Chat, Responses, and Messages for each declared
+    /// model. Selection still tries the saved preferred protocol first.
+    /// Ordinary Custom Keys keep the single stored protocol.
+    pub fn declared_protocols(&self) -> Vec<(String, UpstreamProtocolKind)> {
+        if !self.protocol_passthrough {
+            return self
+                .capabilities
+                .iter()
+                .map(|capability| (capability.public_model.clone(), capability.protocol))
+                .collect();
+        }
+        let mut rows = Vec::new();
+        let mut seen = HashSet::new();
+        for capability in &self.capabilities {
+            if !seen.insert(capability.public_model.to_ascii_lowercase()) {
+                continue;
+            }
+            for protocol in UpstreamProtocolKind::ALL {
+                rows.push((capability.public_model.clone(), protocol));
+            }
+        }
+        rows
     }
 }
 
@@ -207,16 +247,39 @@ pub(crate) async fn discover_models_with_auth(
     auth: Option<crate::provider::UpstreamAuthScheme>,
     api_key: &str,
 ) -> Result<CustomModelDiscoveryResult, CustomModelDiscoveryFailure> {
-    tokio::time::timeout(
+    discover_models_with_metadata(config, input, auth, api_key)
+        .await
+        .map(|(result, _)| result)
+}
+
+pub(crate) async fn discover_models_with_metadata(
+    config: &AppConfig,
+    input: &AccountCustomConfigInput,
+    auth: Option<crate::provider::UpstreamAuthScheme>,
+    api_key: &str,
+) -> Result<
+    (
+        CustomModelDiscoveryResult,
+        std::collections::BTreeMap<String, crate::model_metadata::ModelMetadata>,
+    ),
+    CustomModelDiscoveryFailure,
+> {
+    let mut metadata = std::collections::BTreeMap::new();
+    let result = tokio::time::timeout(
         Duration::from_secs(CUSTOM_MODEL_DISCOVERY_TIMEOUT_SECS),
-        discover_custom_models_inner(config, input, auth, api_key),
+        discover_custom_models_inner(config, input, auth, api_key, &mut metadata),
     )
     .await
     .map_err(|_| CustomModelDiscoveryFailure {
         message: format!(
             "Custom model discovery timed out after {CUSTOM_MODEL_DISCOVERY_TIMEOUT_SECS} seconds"
         ),
-    })?
+    })??;
+    metadata.retain(|id, value| {
+        value.redact_secret(api_key);
+        result.models.contains(id) && (api_key.is_empty() || !id.contains(api_key))
+    });
+    Ok((result, metadata))
 }
 
 async fn discover_custom_models_inner(
@@ -224,6 +287,7 @@ async fn discover_custom_models_inner(
     input: &AccountCustomConfigInput,
     auth: Option<crate::provider::UpstreamAuthScheme>,
     api_key: &str,
+    metadata: &mut std::collections::BTreeMap<String, crate::model_metadata::ModelMetadata>,
 ) -> Result<CustomModelDiscoveryResult, CustomModelDiscoveryFailure> {
     if auth.is_some() && api_key.trim().is_empty() {
         return Err(CustomModelDiscoveryFailure {
@@ -264,8 +328,12 @@ async fn discover_custom_models_inner(
             });
         }
         let page_result = parse_model_discovery_page(&body)?;
+        let page_metadata = crate::model_metadata::parse_catalog(&body);
         for model in page_result.models {
             if seen_models.insert(model.to_ascii_lowercase()) {
+                if let Some(facts) = page_metadata.get(&model) {
+                    metadata.insert(model.clone(), facts.clone());
+                }
                 models.push(model);
                 if models.len() >= MAX_CUSTOM_MODEL_DISCOVERY_MODELS {
                     return Ok(CustomModelDiscoveryResult {
@@ -318,8 +386,7 @@ pub fn derive_custom_models_endpoint(
     };
     resolved.models.ok_or_else(|| CustomModelDiscoveryFailure {
         message: format!(
-            "cannot derive Custom /models endpoint: use an API root, a base ending in `/v1`, or a {:?} endpoint ending with `{suffix}`; add model IDs manually for non-standard paths",
-            protocol
+            "cannot derive Custom /models endpoint: use an API root, a base ending in `/v1`, or a {protocol:?} endpoint ending with `{suffix}`; add model IDs manually for non-standard paths"
         ) })
 }
 
@@ -541,7 +608,8 @@ pub fn minimal_verification_body(
         UpstreamProtocolKind::Responses => json!({
             "model": model_id,
             "input": "ping",
-            "max_output_tokens": 1,
+            // OpenAI-compatible Responses rejects budgets below 16.
+            "max_output_tokens": 16,
             "store": false,
             "stream": false
         }),
@@ -558,7 +626,8 @@ pub fn minimal_verification_body(
 }
 
 /// POST one protocol-correct non-stream request to the resolved inference endpoint.
-/// Only a 2xx JSON object proves verified. Never uses GET /models or mutates capabilities.
+/// Requires a successful response in the requested protocol, not arbitrary JSON.
+/// Never uses GET /models or mutates capabilities.
 pub async fn probe_custom_connection(
     config: &AppConfig,
     custom_config: &AccountCustomConfig,
@@ -623,7 +692,7 @@ async fn probe_custom_protocol(
             auth.map(|scheme| (scheme, api_key)),
             extra,
             Some(body),
-            Some(Duration::from_secs(config.non_stream_timeout_secs)),
+            Some(Duration::from_secs(config.non_stream_timeout_secs.min(30))),
         )
         .await
         .map_err(|error| CustomVerifyFailure {
@@ -631,7 +700,7 @@ async fn probe_custom_protocol(
         })?;
     let status = response.status();
     let bytes = read_custom_verification_body(response).await?;
-    prove_verified_json_object(status, &bytes)
+    prove_verified_protocol_response(status, &bytes, protocol)
 }
 
 async fn read_custom_verification_body(
@@ -655,7 +724,11 @@ fn oversized_verification_body() -> CustomVerifyFailure {
     }
 }
 
-fn prove_verified_json_object(status: StatusCode, body: &[u8]) -> Result<(), CustomVerifyFailure> {
+pub(crate) fn prove_verified_protocol_response(
+    status: StatusCode,
+    body: &[u8],
+    protocol: UpstreamProtocolKind,
+) -> Result<(), CustomVerifyFailure> {
     if !status.is_success() {
         return Err(CustomVerifyFailure {
             message: format!("Custom verification upstream returned {}", status.as_u16()),
@@ -667,6 +740,42 @@ fn prove_verified_json_object(status: StatusCode, body: &[u8]) -> Result<(), Cus
     if !parsed.is_object() {
         return Err(CustomVerifyFailure {
             message: "Custom verification did not return a JSON object".to_string(),
+        });
+    }
+    if parsed.get("error").is_some_and(|error| !error.is_null())
+        || parsed.get("type").and_then(Value::as_str) == Some("error")
+    {
+        return Err(CustomVerifyFailure {
+            message: "upstream returned a protocol error".to_string(),
+        });
+    }
+    let valid = match protocol {
+        UpstreamProtocolKind::ChatCompletions => parsed
+            .get("choices")
+            .and_then(Value::as_array)
+            .is_some_and(|choices| {
+                !choices.is_empty()
+                    && choices
+                        .iter()
+                        .all(|choice| choice.get("message").is_some_and(Value::is_object))
+            }),
+        UpstreamProtocolKind::Responses => {
+            parsed.get("object").and_then(Value::as_str) == Some("response")
+                && parsed.get("output").is_some_and(Value::is_array)
+                && !matches!(
+                    parsed.get("status").and_then(Value::as_str),
+                    Some("failed" | "cancelled" | "queued" | "in_progress")
+                )
+        }
+        UpstreamProtocolKind::Messages => {
+            parsed.get("type").and_then(Value::as_str) == Some("message")
+                && parsed.get("role").and_then(Value::as_str) == Some("assistant")
+                && parsed.get("content").is_some_and(Value::is_array)
+        }
+    };
+    if !valid {
+        return Err(CustomVerifyFailure {
+            message: format!("upstream response does not match {protocol:?}"),
         });
     }
     Ok(())

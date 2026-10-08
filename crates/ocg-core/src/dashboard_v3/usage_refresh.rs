@@ -1,11 +1,11 @@
-//! Official account-usage refresh dispatcher.
+//! Official OpenCode Go usage refresh.
 //!
 //! `POST /accounts/{id}/usage/refresh` is a persistent operational mutation.
 //! It requires `expectedRevision` and `processGeneration`, validates those
 //! tokens before any outbound work, and rechecks them before caller-owned
-//! side effects. OpenCode Go stays on its shared automatic/manual coordinator;
-//! Command Code GOAT dispatches to a separate manual-only implementation. Both
-//! calibrate existing windows without bumping `settings_revision`.
+//! side effects. Calibration, throttle, dedupe, last-known-good preservation,
+//! and official-failure classification stay in the shared usage coordinator
+//! and do not bump `settings_revision`.
 
 use axum::Json;
 use axum::body::Bytes;
@@ -15,19 +15,21 @@ use axum::response::{IntoResponse, Response};
 use chrono::{DateTime, Utc};
 
 use crate::go_usage::GoUsageError;
+use crate::log_types::OperationOutcome;
 use crate::models::UsageWindow as ModelUsageWindow;
 use crate::state::CoreState;
 use crate::usage_sync::{
     OfficialUsageRefreshError, OfficialUsageRefreshSuccess, UsageSyncCommitAuthorization,
     UsageSyncTrigger, refresh_official_usage_with_authorization,
 };
+use crate::user_operation::UserOperation;
 
 use super::types::{
     ERROR_THROTTLED, UsageRefresh, UsageRefreshThrottleError, UsageRefreshUpdate, UsageWindow,
 };
 use super::{V3ApiError, check_expectation, parse_mutation_json};
 
-pub(super) enum RefreshApiError {
+pub(crate) enum RefreshApiError {
     Api(V3ApiError),
     Throttled {
         body: UsageRefreshThrottleError,
@@ -61,24 +63,67 @@ impl IntoResponse for RefreshApiError {
     }
 }
 
+pub(super) fn record_refresh<T>(
+    op: UserOperation,
+    state: &CoreState,
+    result: Result<T, RefreshApiError>,
+) -> Result<T, RefreshApiError> {
+    match &result {
+        Ok(_) => op.complete(
+            OperationOutcome::Success,
+            None,
+            super::settings::metadata_for(state, &[], Some(1), Some(1), None, None),
+        ),
+        Err(RefreshApiError::Throttled { .. }) => op.complete(
+            OperationOutcome::Rejected,
+            Some("throttled"),
+            super::settings::metadata_for(state, &[], Some(1), None, Some(1), None),
+        ),
+        Err(RefreshApiError::Api(error)) => {
+            let reason = error.operation_reason();
+            op.complete(
+                super::settings::outcome_for_api_reason(reason),
+                Some(reason),
+                super::settings::metadata_for(state, &[], Some(1), None, Some(1), None),
+            );
+        }
+    }
+    result
+}
+
 pub(super) async fn refresh_account_usage(
     State(state): State<CoreState>,
     Path(id): Path<String>,
     body: Bytes,
 ) -> Result<Json<UsageRefresh>, RefreshApiError> {
+    let op = super::settings::open_dashboard(
+        &state,
+        "account.usage.refresh",
+        "account",
+        super::settings::known_subject(&id),
+    );
+    let result = refresh_account_usage_inner(state.clone(), id, body).await;
+    record_refresh(op, &state, result)
+}
+
+async fn refresh_account_usage_inner(
+    state: CoreState,
+    id: String,
+    body: Bytes,
+) -> Result<Json<UsageRefresh>, RefreshApiError> {
     let input = parse_mutation_json::<UsageRefreshUpdate>(&body)?;
-    let provider_id = {
+    {
         let _settings_update = state.settings_update.lock();
         check_expectation(&state, &input.expectation)?;
-        state
-            .db
-            .lock()
-            .get_account(&id)
+    }
+
+    let provider_id = {
+        let db = state.db.lock();
+        db.get_account(&id)
             .map_err(V3ApiError::internal)?
             .ok_or_else(|| V3ApiError::not_found(&state))?
             .provider_id
     };
-
     if provider_id == crate::provider::COMMAND_CODE_PROVIDER_ID {
         return super::command_code_usage_refresh::refresh(&state, &id, &input.expectation)
             .await
@@ -114,9 +159,8 @@ fn usage_refresh_from_success(
     state: &CoreState,
     success: OfficialUsageRefreshSuccess,
 ) -> UsageRefresh {
-    let pricing_revision = Some(state.pricing_snapshot().revision.clone());
     UsageRefresh {
-        usage: usage_window_from_model(state, success.usage, pricing_revision),
+        usage: usage_window_from_model(state, success.usage, None),
         source: success.source.to_string(),
         last_success_at: success.last_success_at,
         next_allowed_at: success.next_allowed_at,
@@ -130,17 +174,18 @@ pub(super) fn usage_window_from_model(
     usage: ModelUsageWindow,
     pricing_revision: Option<String>,
 ) -> UsageWindow {
+    let _ = pricing_revision;
     UsageWindow {
         account_id: usage.account_id,
-        window_5h: usage.window_5h,
-        window_week: usage.window_week,
-        window_month: usage.window_month,
+        window_5h: Some(usage.window_5h),
+        window_week: Some(usage.window_week),
+        window_month: Some(usage.window_month),
         resets_in_5h: rfc3339_opt(usage.resets_in_5h),
         resets_in_week: rfc3339_opt(usage.resets_in_week),
         resets_in_month: rfc3339_opt(usage.resets_in_month),
         revision: state.settings_revision(),
         process_generation: state.process_generation(),
-        pricing_revision,
+        pricing_revision: None,
     }
 }
 
@@ -148,7 +193,10 @@ fn rfc3339_opt(value: Option<DateTime<Utc>>) -> Option<String> {
     value.map(|value| value.to_rfc3339())
 }
 
-fn map_refresh_error(state: &CoreState, error: OfficialUsageRefreshError) -> RefreshApiError {
+pub(super) fn map_refresh_error(
+    state: &CoreState,
+    error: OfficialUsageRefreshError,
+) -> RefreshApiError {
     match error {
         OfficialUsageRefreshError::NotFound => V3ApiError::not_found(state).into(),
         OfficialUsageRefreshError::NotEligible(message) => {

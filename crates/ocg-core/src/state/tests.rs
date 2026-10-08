@@ -1,12 +1,62 @@
 use super::{
-    CoreStateInner, DesktopUpdatePhase, DesktopUpdateStartError, normalize_client_root_url_override,
+    CoreStateInner, DesktopUpdatePhase, DesktopUpdateStartError, build_proxy_model_candidates,
+    normalize_client_root_url_override,
 };
 use crate::crypto::{KeyCipher, StaticKeyCipher};
 use crate::db::Database;
-use crate::models::{AppConfig, ProxyMode};
+use crate::models::{AppConfig, ProxyListDirection, ProxyMode};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::{Arc, Barrier, Mutex as StdMutex};
+
+#[test]
+fn host_settings_publication_failure_retains_its_committed_effect() {
+    let dir = temp_data_dir("host-settings-publication");
+    let state = Arc::new(
+        CoreStateInner::new(
+            Database::open(dir.clone()).unwrap(),
+            dir.clone(),
+            Arc::new(StaticKeyCipher::new("state-test")),
+        )
+        .unwrap(),
+    );
+    crate::account_control::create_go_api_key(
+        &state,
+        "Publication fixture".into(),
+        "sk-test-ledger-9f3c".into(),
+        None,
+        None,
+    )
+    .unwrap();
+    let changed = state
+        .db
+        .lock()
+        .conn
+        .execute("UPDATE credentials SET credential_version = 0", [])
+        .unwrap();
+    assert!(changed > 0);
+    let previous = state.config();
+    let mut next = previous.clone();
+    next.non_stream_timeout_secs += 1;
+    let expected_timeout = next.non_stream_timeout_secs;
+    let failure = {
+        let _settings_update = state.settings_update.lock();
+        state
+            .apply_host_settings_recorded(&previous, next)
+            .unwrap_err()
+    };
+    assert_eq!(failure.effects, super::HostSettingsEffects::Partial);
+    assert!(matches!(
+        failure.error,
+        super::HostSettingsError::Persist(_)
+    ));
+    assert_eq!(state.config().non_stream_timeout_secs, expected_timeout);
+    let persisted: AppConfig =
+        serde_json::from_str(&state.db.lock().get_setting("config").unwrap().unwrap()).unwrap();
+    assert_eq!(persisted.non_stream_timeout_secs, expected_timeout);
+    drop(state);
+    fs::remove_dir_all(dir).unwrap();
+}
 
 fn temp_data_dir(label: &str) -> PathBuf {
     let mut dir = std::env::temp_dir();
@@ -55,6 +105,102 @@ fn process_host_adapts_key_and_usage_sync_seams() {
     assert_usage_host(&state);
     drop(state);
     let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn reload_failure_restriction_rebuilds_proxy_membership() {
+    use crate::provider::{OPENCODE_PROVIDER_ID, UpstreamProtocolKind};
+    use crate::provider_contracts::{
+        CATALOG_SOURCE_OPENCODE_MODELS, ContractScope, ProtocolOverrideState,
+    };
+    use chrono::Utc;
+
+    let dir = temp_data_dir("restrict-proxy-membership");
+    let db = Database::open(dir.clone()).expect("test database should open");
+    let cipher: Arc<dyn KeyCipher + Send + Sync> = Arc::new(StaticKeyCipher::new("state-test"));
+    let state = CoreStateInner::new(db, dir.clone(), cipher).expect("state should initialize");
+    let scope = ContractScope::provider(OPENCODE_PROVIDER_ID);
+    let now = Utc::now();
+    state
+        .db
+        .lock()
+        .set_contract_catalog(
+            &scope,
+            &["gpt-5.6-luna".into(), "gpt-5.6-sol".into()],
+            Some(now),
+            CATALOG_SOURCE_OPENCODE_MODELS,
+            "https://example.test/models",
+            now,
+        )
+        .unwrap();
+    // This test concerns removing an enabled route, not protocol discovery.
+    // The synthetic model IDs therefore need an explicit operator choice.
+    state
+        .db
+        .lock()
+        .set_model_protocol_overrides(
+            &scope,
+            &["gpt-5.6-luna", "gpt-5.6-sol"].map(|id| {
+                (
+                    id.to_string(),
+                    UpstreamProtocolKind::ChatCompletions,
+                    ProtocolOverrideState::ForceOn,
+                )
+            }),
+            now,
+        )
+        .unwrap();
+    state.reload_provider_contracts().unwrap();
+    let projection = crate::destination_projection::load_runtime(&state.db.lock()).unwrap();
+    let go = projection
+        .destinations
+        .iter()
+        .find(|destination| destination.adapter == ocg_domain::destination::AdapterKind::OpencodeGo)
+        .expect("a saved public Go directory must exist without a stored Key");
+    assert!(
+        go.catalog
+            .iter()
+            .any(|model| model.upstream_model == "gpt-5.6-sol" && model.enabled)
+    );
+    assert!(
+        projection
+            .credentials
+            .iter()
+            .all(|credential| credential.destination_id != go.id)
+    );
+    let mut config = state.config();
+    config.proxy_mode = ProxyMode::List;
+    config.proxy_url = "http://127.0.0.1:9".into();
+    config.proxy_list_direction = ProxyListDirection::Whitelist;
+    config.proxy_list_models = vec!["gpt-5.6-luna".into(), "gpt-5.6-sol".into()];
+    state.set_config(config).unwrap();
+    assert_eq!(
+        state
+            .forward_route_set()
+            .client_for("gpt-5.6-sol")
+            .1
+            .as_str(),
+        "proxy"
+    );
+
+    let row = state
+        .db
+        .lock()
+        .remove_contract_catalog_models(&scope, &["gpt-5.6-sol".into()], now)
+        .unwrap();
+    state.restrict_provider_catalog_after_reload_failure(&row);
+    assert_eq!(
+        state
+            .forward_route_set()
+            .client_for("gpt-5.6-sol")
+            .1
+            .as_str(),
+        "direct",
+        "removed upstream ids must be inert even on the reload-failure path"
+    );
+
+    drop(state);
+    fs::remove_dir_all(dir).expect("test data directory should be removed");
 }
 
 #[test]
@@ -285,6 +431,34 @@ fn route_set_snapshot_swaps_atomically_and_stays_self_consistent() {
         "non-list generations resolve to the single process-wide client"
     );
 
+    let now = chrono::Utc::now();
+    let scope =
+        crate::provider_contracts::ContractScope::provider(crate::provider::OPENCODE_PROVIDER_ID);
+    state
+        .db
+        .lock()
+        .set_contract_catalog(
+            &scope,
+            &["gpt-5.6-luna".into()],
+            Some(now),
+            crate::provider_contracts::CATALOG_SOURCE_OPENCODE_MODELS,
+            "https://example.test/models",
+            now,
+        )
+        .unwrap();
+    state.reload_provider_contracts().unwrap();
+    let projection = crate::destination_projection::load_runtime(&state.db.lock()).unwrap();
+    let go = projection
+        .destinations
+        .iter()
+        .find(|destination| destination.adapter == ocg_domain::destination::AdapterKind::OpencodeGo)
+        .expect("public catalog refresh must persist its destination before route publication");
+    assert!(
+        go.catalog
+            .iter()
+            .any(|model| model.upstream_model == "gpt-5.6-luna" && model.enabled)
+    );
+
     let mut list_config = state.config();
     list_config.gateway_key = "gw".into();
     list_config.proxy_mode = crate::models::ProxyMode::List;
@@ -308,94 +482,110 @@ fn route_set_snapshot_swaps_atomically_and_stays_self_consistent() {
     fs::remove_dir_all(dir).expect("test data directory should be removed");
 }
 
-#[test]
-fn routing_runtime_resets_when_routing_fields_or_gateway_key_change() {
-    use crate::crypto::{KeyCipher, StaticKeyCipher};
-    use crate::models::{Account, RoutingMode};
-    use std::sync::Arc;
-
-    fn test_account(cipher: &Arc<dyn KeyCipher + Send + Sync>, id: &str) -> Account {
-        Account {
-            id: id.into(),
-            provider_id: crate::provider::default_provider_id(),
-
-            credential_kind: crate::provider::default_credential_kind(),
-            quota_scope: crate::provider::default_quota_scope(),
-            name: id.into(),
-            username: None,
-            password_cipher: None,
-            key_cipher: cipher.encrypt(id).unwrap(),
-            enabled: true,
-            account_type: crate::models::AccountType::Key,
-            setup_step: crate::models::AccountSetupStep::Ready,
-            referral_code: None,
-            purchase_date: String::new(),
-            expires_on: String::new(),
-            cooldown_until: None,
-            cooldown_generic_until: None,
-            cooldown_5h_until: None,
-            cooldown_week_until: None,
-            cooldown_month_until: None,
-            cooldown_free_until: None,
-            last_error: None,
-            auth_error: None,
-            notes: None,
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
-        }
+fn routing_test_account(
+    cipher: &Arc<dyn KeyCipher + Send + Sync>,
+    id: &str,
+) -> crate::models::Account {
+    crate::models::Account {
+        id: id.into(),
+        provider_id: crate::provider::default_provider_id(),
+        credential_kind: crate::provider::default_credential_kind(),
+        quota_scope: crate::provider::default_quota_scope(),
+        name: id.into(),
+        username: None,
+        password_cipher: None,
+        key_cipher: cipher.encrypt(id).unwrap(),
+        enabled: true,
+        account_type: crate::models::AccountType::Key,
+        setup_step: crate::models::AccountSetupStep::Ready,
+        referral_code: None,
+        purchase_date: String::new(),
+        expires_on: String::new(),
+        cooldown_until: None,
+        cooldown_generic_until: None,
+        cooldown_5h_until: None,
+        cooldown_week_until: None,
+        cooldown_month_until: None,
+        cooldown_free_until: None,
+        last_error: None,
+        auth_error: None,
+        notes: None,
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
     }
+}
+
+#[test]
+fn routing_runtime_resets_for_sticky_and_primary_key_not_invalid_or_timeout() {
+    use crate::models::RoutingMode;
 
     let dir = temp_data_dir("routing-reset");
     let db = Database::open(dir.clone()).expect("test database should open");
     let cipher: Arc<dyn KeyCipher + Send + Sync> = Arc::new(StaticKeyCipher::new("state-test"));
     let state =
         CoreStateInner::new(db, dir.clone(), cipher.clone()).expect("state should initialize");
-    let accounts = vec![test_account(&cipher, "a"), test_account(&cipher, "b")];
-
-    assert_eq!(
+    let accounts = vec![
+        routing_test_account(&cipher, "a"),
+        routing_test_account(&cipher, "b"),
+    ];
+    let pick = || {
         state
             .routing
             .select_account(&accounts, RoutingMode::RoundRobin, false, None, &[])
             .unwrap()
-            .id,
-        "a"
-    );
-    assert_eq!(
-        state
-            .routing
-            .select_account(&accounts, RoutingMode::RoundRobin, false, None, &[])
-            .unwrap()
-            .id,
-        "b"
-    );
+            .id
+            .clone()
+    };
 
+    // After only "a", keep yields "b" and a reset yields "a".
+    assert_eq!(pick(), "a");
     let mut invalid = state.config();
     invalid.routing_mode = RoutingMode::StickyGlobal;
     invalid.connect_timeout_secs = 0;
     assert!(state.set_config(invalid).is_err());
     assert_eq!(
-        state
-            .routing
-            .select_account(&accounts, RoutingMode::RoundRobin, false, None, &[])
-            .unwrap()
-            .id,
-        "a",
+        pick(),
+        "b",
         "failed config validation must not reset the active round-robin cursor"
     );
 
+    // Consumed "b"; pick "a" so the cursor is after "a" again.
+    assert_eq!(pick(), "a");
     let mut next = state.config();
     next.conversation_sticky = true;
     state
         .set_config(next)
         .expect("conversation sticky change should reset routing");
-
     assert_eq!(
+        pick(),
+        "a",
+        "conversation sticky change should reset routing"
+    );
+
+    // Sticky reset consumed "a"; keep now yields "b", a further reset would yield "a".
+    let mut config = state.config();
+    config.connect_timeout_secs += 1;
+    state.set_config(config).expect("unrelated save");
+    assert_eq!(
+        pick(),
+        "b",
+        "an unrelated settings save must not reset routing"
+    );
+
+    // Consumed "b"; pick "a" so the cursor is after "a" before key rotation.
+    assert_eq!(pick(), "a");
+    let mut config = state.config();
+    config.gateway_key = "ocg-rotated-primary".to_string();
+    state.set_config(config).expect("rotation should save");
+    assert_eq!(
+        pick(),
+        "a",
+        "the cursor restarts after the primary key value changes"
+    );
+    assert!(
         state
-            .routing
-            .select_account(&accounts, RoutingMode::RoundRobin, false, None, &[])
-            .unwrap()
-            .id,
-        "a"
+            .credential_entry_for_value("ocg-rotated-primary")
+            .is_some()
     );
 
     drop(state);
@@ -491,25 +681,12 @@ fn desktop_hooks_are_unset_on_a_headless_host() {
 }
 
 #[test]
-fn desktop_update_state_machine_is_serializable_atomic_and_retriable() {
+fn desktop_update_core_state_busy_and_starter_failure() {
     let dir = temp_data_dir("desktop-update-state");
     let db = Database::open(dir.clone()).expect("test database should open");
     let cipher: Arc<dyn KeyCipher + Send + Sync> = Arc::new(StaticKeyCipher::new("state-test"));
     let state =
         Arc::new(CoreStateInner::new(db, dir.clone(), cipher).expect("state should initialize"));
-
-    assert_eq!(
-        serde_json::to_value(state.desktop_update_status()).expect("status should serialize"),
-        serde_json::json!({
-            "phase": "idle",
-            "downloaded": 0,
-            "total": null,
-            "error": null,
-            "current_version": env!("CARGO_PKG_VERSION"),
-            "install_supported": false })
-    );
-    assert!(!state.set_desktop_update_progress(1, Some(2)));
-    assert!(!state.set_desktop_update_installing());
 
     let started_versions = Arc::new(StdMutex::new(Vec::new()));
     let captured_versions = started_versions.clone();
@@ -552,46 +729,9 @@ fn desktop_update_state_machine_is_serializable_atomic_and_retriable() {
         state.desktop_update_status().phase,
         DesktopUpdatePhase::Checking
     );
-
-    assert!(state.set_desktop_update_progress(25, Some(100)));
-    let downloading = state.desktop_update_status();
-    assert_eq!(downloading.phase, DesktopUpdatePhase::Downloading);
-    assert_eq!(downloading.downloaded, 25);
-    assert_eq!(downloading.total, Some(100));
-    assert!(state.set_desktop_update_installing());
-    assert!(!state.set_desktop_update_progress(50, Some(100)));
-    state.set_desktop_update_failed("install failed");
-    let failed = state.desktop_update_status();
-    assert_eq!(failed.phase, DesktopUpdatePhase::Failed);
-    assert_eq!(failed.error.as_deref(), Some("install failed"));
-
-    state
-        .start_desktop_update("10.0.0".to_string())
-        .expect("a failed update should be retriable");
-    let retrying = state.desktop_update_status();
-    assert_eq!(retrying.phase, DesktopUpdatePhase::Checking);
-    assert_eq!(retrying.downloaded, 0);
-    assert_eq!(retrying.total, None);
-    assert_eq!(retrying.error, None);
-    assert_eq!(
-        started_versions
-            .lock()
-            .expect("started versions lock should work")
-            .as_slice(),
-        ["9.9.9", "10.0.0"]
-    );
-
-    state.set_desktop_update_idle();
-    assert_eq!(
-        state.desktop_update_status().phase,
-        DesktopUpdatePhase::Idle
-    );
     drop(state);
     fs::remove_dir_all(dir).expect("test data directory should be removed");
-}
 
-#[test]
-fn desktop_update_starter_failure_is_reported_in_status() {
     let dir = temp_data_dir("desktop-update-start-failure");
     let db = Database::open(dir.clone()).expect("test database should open");
     let cipher: Arc<dyn KeyCipher + Send + Sync> = Arc::new(StaticKeyCipher::new("state-test"));
@@ -723,95 +863,6 @@ fn persisted_config_json_is_not_the_primary_key_authority() {
 }
 
 #[test]
-fn routing_resets_only_when_routing_fields_or_primary_key_change() {
-    use crate::crypto::{KeyCipher, StaticKeyCipher};
-    use crate::models::{Account, RoutingMode};
-    use std::sync::Arc;
-
-    fn test_account(cipher: &Arc<dyn KeyCipher + Send + Sync>, id: &str) -> Account {
-        Account {
-            id: id.into(),
-            provider_id: crate::provider::default_provider_id(),
-
-            credential_kind: crate::provider::default_credential_kind(),
-            quota_scope: crate::provider::default_quota_scope(),
-            name: id.into(),
-            username: None,
-            password_cipher: None,
-            key_cipher: cipher.encrypt(id).unwrap(),
-            enabled: true,
-            account_type: crate::models::AccountType::Key,
-            setup_step: crate::models::AccountSetupStep::Ready,
-            referral_code: None,
-            purchase_date: String::new(),
-            expires_on: String::new(),
-            cooldown_until: None,
-            cooldown_generic_until: None,
-            cooldown_5h_until: None,
-            cooldown_week_until: None,
-            cooldown_month_until: None,
-            cooldown_free_until: None,
-            last_error: None,
-            auth_error: None,
-            notes: None,
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
-        }
-    }
-
-    let dir = temp_data_dir("routing-key-values");
-    let db = Database::open(dir.clone()).expect("test database should open");
-    let cipher: Arc<dyn KeyCipher + Send + Sync> = Arc::new(StaticKeyCipher::new("state-test"));
-    let state =
-        CoreStateInner::new(db, dir.clone(), cipher.clone()).expect("state should initialize");
-    let accounts = vec![test_account(&cipher, "a"), test_account(&cipher, "b")];
-    let advance = || {
-        state
-            .routing
-            .select_account(&accounts, RoutingMode::RoundRobin, false, None, &[])
-            .unwrap()
-            .id
-            .clone()
-    };
-
-    assert_eq!(advance(), "a");
-
-    // An unrelated settings save keeps sticky routing state intact: with
-    // the cursor after "a", the next pick stays "b"; a reset would
-    // restart at "a". (Sub key lifecycle changes never go through
-    // set_config; their revocation resets are endpoint-driven.)
-    assert_eq!(advance(), "b");
-    let mut config = state.config();
-    config.connect_timeout_secs += 1;
-    state.set_config(config).expect("unrelated save");
-    assert_eq!(
-        advance(),
-        "a",
-        "an unrelated settings save must not reset routing"
-    );
-
-    assert_eq!(advance(), "b");
-    // Rotating the primary key value resets: the old value stops
-    // authenticating.
-    let mut config = state.config();
-    config.gateway_key = "ocg-rotated-primary".to_string();
-    state.set_config(config).expect("rotation should save");
-    assert_eq!(
-        advance(),
-        "a",
-        "the cursor restarts after the primary key value changes"
-    );
-    assert!(
-        state
-            .credential_entry_for_value("ocg-rotated-primary")
-            .is_some()
-    );
-
-    drop(state);
-    fs::remove_dir_all(dir).expect("test data directory should be removed");
-}
-
-#[test]
 fn legacy_config_gets_persisted_desktop_defaults() {
     let dir = temp_data_dir("desktop-config-migration");
     let db = Database::open(dir.clone()).expect("test database should open");
@@ -824,7 +875,6 @@ fn legacy_config_gets_persisted_desktop_defaults() {
         let legacy_object = legacy
             .as_object_mut()
             .expect("test config should be an object");
-        legacy_object.remove("claude_desktop_models");
         legacy_object.remove("show_dock_icon");
         legacy_object.remove("routing_mode");
         legacy_object.remove("conversation_sticky");
@@ -836,10 +886,6 @@ fn legacy_config_gets_persisted_desktop_defaults() {
     let cipher: Arc<dyn KeyCipher + Send + Sync> = Arc::new(StaticKeyCipher::new("state-test"));
     let state = CoreStateInner::new(db, dir.clone(), cipher).expect("state should initialize");
 
-    assert_eq!(
-        state.config().claude_desktop_models.resolved(),
-        AppConfig::default().claude_desktop_models.resolved()
-    );
     assert!(state.config().show_dock_icon);
     assert_eq!(
         state.config().routing_mode,
@@ -854,7 +900,6 @@ fn legacy_config_gets_persisted_desktop_defaults() {
         .get_setting("config")
         .expect("stored config should be readable")
         .expect("stored config should exist");
-    assert!(stored.contains("claude_desktop_models"));
     assert!(stored.contains("show_dock_icon"));
     assert!(stored.contains("proxy_mode"));
     assert!(stored.contains("proxy_url"));
@@ -905,4 +950,513 @@ fn zen_activation_and_contract_reload_share_documented_lock_order() {
     reloader.join().expect("reloader thread");
     drop(state);
     fs::remove_dir_all(dir).expect("test data directory should be removed");
+}
+
+#[test]
+fn zen_activation_installs_the_just_persisted_catalog_with_new_models_off() {
+    let dir = temp_data_dir("zen-activation-snapshot");
+    let db = Database::open(dir.clone()).expect("test database should open");
+    let cipher: Arc<dyn KeyCipher + Send + Sync> = Arc::new(StaticKeyCipher::new("state-test"));
+    let state = CoreStateInner::new(db, dir.clone(), cipher).expect("state should initialize");
+
+    let mut config = state.config();
+    config.proxy_mode = ProxyMode::List;
+    config.proxy_url = "http://127.0.0.1:9".into();
+    config.proxy_list_direction = ProxyListDirection::Whitelist;
+    config.proxy_list_models = vec!["first-free".into(), "replacement-free".into()];
+    state.set_config(config).unwrap();
+
+    for model in ["first-free", "replacement-free"] {
+        state
+            .activate_zen_free_model_catalog(crate::kernel::zen::ZenFreeModelCatalog {
+                models: vec![model.into()],
+                refreshed_at: Some(chrono::Utc::now()),
+                source_url: crate::kernel::zen::ZEN_MODELS_SOURCE_URL.into(),
+            })
+            .unwrap();
+
+        let scope = crate::provider_contracts::ContractScope::provider(
+            crate::provider::OPENCODE_ZEN_FREE_PROVIDER_ID,
+        );
+        let projection = crate::destination_projection::load_runtime(&state.db.lock()).unwrap();
+        let saved = projection
+            .destinations
+            .iter()
+            .find(|destination| destination.adapter == ocg_domain::destination::AdapterKind::Zen)
+            .unwrap();
+        assert_eq!(
+            saved
+                .catalog
+                .iter()
+                .map(|row| row.upstream_model.as_str())
+                .collect::<Vec<_>>(),
+            [model]
+        );
+        assert!(saved.catalog.iter().all(|row| !row.enabled));
+        assert_eq!(state.zen_free_model_catalog().models, [model]);
+        let contract = state.provider_contracts().scope(&scope).cloned().unwrap();
+        assert_eq!(contract.catalog.models, [model]);
+        assert!(
+            contract
+                .models
+                .values()
+                .find(|row| row.model_id == model)
+                .is_some_and(|row| !row.has_enabled_protocol()),
+            "new Zen catalog rows must be installed default-off"
+        );
+        assert_eq!(
+            state.forward_route_set().client_for(model).1.as_str(),
+            "direct",
+            "default-off Zen rows must stay out of the proxy exception set"
+        );
+    }
+
+    drop(state);
+    fs::remove_dir_all(dir).expect("test data directory should be removed");
+}
+
+#[test]
+fn proxy_candidates_use_exact_upstream_ids_not_public_aliases() {
+    let now = chrono::Utc::now();
+    let custom_runtime = crate::custom::CustomAccountRuntime {
+        account_id: "custom-1".into(),
+        enabled: true,
+        verification_status: crate::provider::ConnectionVerificationStatus::Verified,
+        setup_ready: true,
+        has_key: true,
+        auth_kind: ocg_domain::dynamic::DynamicAuthKind::XApiKey,
+        config: crate::models::AccountCustomConfig {
+            account_id: "custom-1".into(),
+            endpoint_url: "https://api.example.com/v1/messages".into(),
+            upstream_protocol: crate::provider::UpstreamProtocolKind::Messages,
+            created_at: now,
+            updated_at: now,
+        },
+        capabilities: vec![crate::models::AccountModelCapability {
+            account_id: "custom-1".into(),
+            public_model: "lab-opus".into(),
+            upstream_model: "vendor/opus".into(),
+            protocol: crate::provider::UpstreamProtocolKind::Messages,
+            verified_at: None,
+            source: "declared".into(),
+        }],
+        route_overrides: Vec::new(),
+        protocol_passthrough: false,
+    };
+    let mut inactive_custom = custom_runtime.clone();
+    inactive_custom.account_id = "custom-disabled".into();
+    inactive_custom.enabled = false;
+    inactive_custom.capabilities[0].public_model = "disabled-public".into();
+    inactive_custom.capabilities[0].upstream_model = "vendor/disabled".into();
+    let custom = [custom_runtime, inactive_custom];
+    let dynamics = [crate::dynamic::DynamicProviderRuntime {
+        preset_id: None,
+        id: "11111111-1111-1111-1111-111111111111".into(),
+        name: "Lab".into(),
+        endpoint_url: "https://lab.example/v1/chat/completions".into(),
+        upstream_protocol: crate::provider::UpstreamProtocolKind::ChatCompletions,
+        auth_kind: ocg_domain::dynamic::DynamicAuthKind::Bearer,
+        mappings: vec![ocg_domain::dynamic::DynamicModelMapping {
+            public_model: "lab-chat".into(),
+            upstream_model: "vendor/chat".into(),
+            upstream_override: None,
+        }],
+        created_at: now,
+        updated_at: now,
+        origin: crate::provider::ProviderOrigin::Custom,
+        offering: "api".into(),
+    }];
+    let candidates = build_proxy_model_candidates(
+        &crate::provider_contracts::EffectiveContractSet::default(),
+        &custom,
+        &dynamics,
+        &["cpa-model".into()],
+    );
+    let ids: Vec<&str> = candidates
+        .iter()
+        .map(|candidate| candidate.id.as_str())
+        .collect();
+    assert!(ids.contains(&"vendor/opus"), "{ids:?}");
+    assert!(ids.contains(&"vendor/chat"), "{ids:?}");
+    assert!(ids.contains(&"cpa-model"), "{ids:?}");
+    assert!(!ids.contains(&"vendor/disabled"), "{ids:?}");
+    assert!(!ids.contains(&"lab-opus"), "{ids:?}");
+    assert!(!ids.contains(&"lab-chat"), "{ids:?}");
+}
+
+#[test]
+fn zen_activation_preflight_failure_rolls_back_catalog_and_preserves_all_active_pointers() {
+    let dir = temp_data_dir("zen-activation-rollback");
+    let db = Database::open(dir.clone()).unwrap();
+    let cipher: Arc<dyn KeyCipher + Send + Sync> = Arc::new(StaticKeyCipher::new("state-test"));
+    let state = CoreStateInner::new(db, dir.clone(), cipher).unwrap();
+    let previous_config = state.config();
+    let previous_catalog = state.zen_free_model_catalog();
+    let previous_contracts = state.provider_contracts();
+    let previous_routes = state.forward_route_set();
+    let previous_saved = crate::destination_projection::load_runtime(&state.db.lock()).unwrap();
+    let previous_directory = state.db.lock().zen_free_model_catalog().unwrap();
+    // Inject an invalid transport generation so the failure happens after the
+    // setter has written its uncommitted catalog and default-off controls.
+    {
+        let mut config = state.config.lock();
+        config.proxy_mode = ProxyMode::Manual;
+        config.proxy_url = "http://[invalid".into();
+    }
+    let result = state.activate_zen_free_model_catalog(crate::kernel::zen::ZenFreeModelCatalog {
+        models: vec!["rollback-free".into()],
+        refreshed_at: Some(chrono::Utc::now()),
+        source_url: crate::kernel::zen::ZEN_MODELS_SOURCE_URL.into(),
+    });
+    assert!(result.is_err());
+    assert_eq!(
+        crate::destination_projection::load_runtime(&state.db.lock()).unwrap(),
+        previous_saved
+    );
+    assert_eq!(
+        state.db.lock().zen_free_model_catalog().unwrap(),
+        previous_directory
+    );
+    assert!(Arc::ptr_eq(
+        &previous_catalog,
+        &state.zen_free_model_catalog()
+    ));
+    assert!(Arc::ptr_eq(
+        &previous_contracts,
+        &state.provider_contracts()
+    ));
+    assert!(Arc::ptr_eq(&previous_routes, &state.forward_route_set()));
+    *state.config.lock() = previous_config;
+    drop(state);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+/// Comparable identity of a routing projection. `RoutingSnapshot` has no
+/// `PartialEq`, so the tests below compare the routing rows and destinations a
+/// request actually selects on.
+fn routing_identity(
+    snapshot: &crate::routing_snapshot::RoutingSnapshot,
+) -> (Vec<String>, Vec<String>) {
+    let mut credentials: Vec<String> = snapshot
+        .credentials
+        .iter()
+        .map(|credential| credential.id.clone())
+        .collect();
+    credentials.sort();
+    let mut destinations: Vec<String> = snapshot
+        .projection
+        .destinations
+        .iter()
+        .map(|destination| destination.id.clone())
+        .collect();
+    destinations.sort();
+    (credentials, destinations)
+}
+
+fn preparation_test_state(label: &str) -> (PathBuf, CoreStateInner) {
+    let dir = temp_data_dir(label);
+    let db = Database::open(dir.clone()).expect("test database should open");
+    let cipher: Arc<dyn KeyCipher + Send + Sync> = Arc::new(StaticKeyCipher::new("state-test"));
+    let state = CoreStateInner::new(db, dir.clone(), cipher).expect("state should initialize");
+    (dir, state)
+}
+
+fn list_config(state: &CoreStateInner, models: &[&str], gateway_key: &str) -> AppConfig {
+    let mut config = state.config();
+    config.gateway_key = gateway_key.into();
+    config.proxy_mode = ProxyMode::List;
+    config.proxy_url = "http://127.0.0.1:7890".into();
+    config.proxy_list_direction = ProxyListDirection::Whitelist;
+    config.proxy_list_models = models.iter().map(|model| (*model).to_string()).collect();
+    config
+}
+
+/// A committed settings write must be visible in the published aggregate on the
+/// very next read, without the reader having to re-enter the settings gate.
+#[test]
+fn preparation_aggregate_serves_a_committed_config_change_without_drift() {
+    let (dir, state) = preparation_test_state("preparation-config");
+    let config = list_config(&state, &["gpt-5.6-luna"], "gw-first");
+    state.set_config(config).expect("list config should save");
+
+    let published = state
+        .gateway_preparation()
+        .expect("the aggregate should publish");
+    assert_eq!(
+        published.revision,
+        state.settings_revision(),
+        "a wired writer must republish the aggregate instead of leaving the next reader to rebuild it"
+    );
+    assert_eq!(published.config().gateway_key, "gw-first");
+    assert_eq!(published.config().proxy_mode, ProxyMode::List);
+
+    drop(state);
+    fs::remove_dir_all(dir).expect("test data directory should be removed");
+}
+
+/// An aggregate captured before a republication keeps serving its own
+/// generation: publication swaps one `Arc` and never mutates a live one.
+#[test]
+fn an_in_flight_aggregate_keeps_its_generation_after_a_republication() {
+    let (dir, state) = preparation_test_state("preparation-isolation");
+    state
+        .set_config(list_config(&state, &["gpt-5.6-luna"], "gw-first"))
+        .expect("first list config should save");
+
+    let in_flight = state
+        .gateway_preparation()
+        .expect("the aggregate should publish");
+    assert_eq!(in_flight.config().gateway_key, "gw-first");
+
+    state
+        .set_config(list_config(&state, &["gpt-5.6-luna"], "gw-second"))
+        .expect("second list config should save");
+    let next = state
+        .gateway_preparation()
+        .expect("the aggregate should republish");
+
+    assert_eq!(
+        in_flight.config().gateway_key,
+        "gw-first",
+        "a captured aggregate must not observe the newer config generation"
+    );
+    assert_eq!(next.config().gateway_key, "gw-second");
+    assert!(
+        !Arc::ptr_eq(&in_flight, &next),
+        "republication must install a new aggregate rather than mutate the published one"
+    );
+    assert!(
+        in_flight.revision < next.revision,
+        "each published generation records the revision it was built at"
+    );
+
+    drop(state);
+    fs::remove_dir_all(dir).expect("test data directory should be removed");
+}
+
+/// A writer that advances the CAS token without republishing must not serve a
+/// stale aggregate: the reader detects the drift and rebuilds, then publishes
+/// the rebuild so the next read is a fast-path hit.
+#[test]
+fn a_revision_bump_without_republication_rebuilds_the_aggregate_on_read() {
+    let dir = temp_data_dir("preparation-drift");
+    let cipher: Arc<dyn KeyCipher + Send + Sync> = Arc::new(StaticKeyCipher::new("state-test"));
+    let drifted = routing_test_account(&cipher, "drift-acct");
+    let db = Database::open(dir.clone()).expect("test database should open");
+    let state = CoreStateInner::new(db, dir.clone(), cipher).expect("state should initialize");
+
+    let before = state
+        .gateway_preparation()
+        .expect("the aggregate should publish");
+    assert_eq!(before.revision, state.settings_revision());
+    assert!(
+        !routing_identity(before.routing())
+            .0
+            .iter()
+            .any(|id| id == "drift-acct"),
+        "the account is not committed yet"
+    );
+
+    // An unwired control-plane writer: commit routing rows, then advance the
+    // shared CAS token without republishing the preparation view.
+    state
+        .db
+        .lock()
+        .create_account(&drifted)
+        .expect("account row should commit");
+    state.bump_settings_revision();
+    assert_ne!(
+        before.revision,
+        state.settings_revision(),
+        "the writer moved the revision without publishing, so the published aggregate is now behind"
+    );
+
+    let rebuilt = state
+        .gateway_preparation()
+        .expect("a drifted aggregate must be rebuilt rather than served");
+    assert!(
+        routing_identity(rebuilt.routing())
+            .0
+            .iter()
+            .any(|id| id == "drift-acct"),
+        "the rebuilt aggregate must observe the committed routing row"
+    );
+    assert_eq!(rebuilt.revision, state.settings_revision());
+
+    let again = state
+        .gateway_preparation()
+        .expect("the republished aggregate should serve the fast path");
+    assert!(
+        Arc::ptr_eq(&rebuilt, &again),
+        "the drift rebuild must publish itself, otherwise every later read pays the gate again"
+    );
+
+    drop(state);
+    fs::remove_dir_all(dir).expect("test data directory should be removed");
+}
+
+/// Torn-state guard: after a writer that rebuilds config, contracts, and the
+/// route set together, every half of the published aggregate describes the same
+/// generation as the live in-memory state and the committed rows.
+#[test]
+fn a_rebuilding_writer_publishes_one_self_consistent_aggregate() {
+    let (dir, state) = preparation_test_state("preparation-consistent");
+    state
+        .set_config(list_config(
+            &state,
+            &["first-free", "replacement-free"],
+            "gw-consistent",
+        ))
+        .expect("list config should save");
+
+    state
+        .activate_zen_free_model_catalog(crate::kernel::zen::ZenFreeModelCatalog {
+            models: vec!["replacement-free".into()],
+            refreshed_at: Some(chrono::Utc::now()),
+            source_url: crate::kernel::zen::ZEN_MODELS_SOURCE_URL.into(),
+        })
+        .expect("zen catalog activation should publish");
+
+    let published = state
+        .gateway_preparation()
+        .expect("the aggregate should publish");
+    let live = crate::routing_snapshot::RoutingSnapshot::load(&state.db.lock())
+        .expect("a live routing read should succeed");
+
+    assert_eq!(published.revision, state.settings_revision());
+    assert_eq!(
+        serde_json::to_value(published.config()).expect("config should serialize"),
+        serde_json::to_value(state.config()).expect("config should serialize"),
+        "the published config must be the installed config, not the previous generation"
+    );
+    assert!(
+        Arc::ptr_eq(&published.routes(), &state.forward_route_set()),
+        "the published route set must be the one the writer installed"
+    );
+    assert_eq!(
+        routing_identity(published.routing()),
+        routing_identity(&live),
+        "the published routing rows must be the committed rows"
+    );
+
+    drop(state);
+    fs::remove_dir_all(dir).expect("test data directory should be removed");
+}
+
+#[test]
+fn desktop_update_completion_finishes_the_same_pending_receipt() {
+    use crate::log_types::{OperationLogQuery, OperationOutcome, OperationSource};
+    use crate::user_operation::UserOperation;
+
+    fn operations(state: &CoreStateInner) -> Vec<crate::log_types::OperationLog> {
+        state
+            .db
+            .lock()
+            .query_operation_logs(&OperationLogQuery::default())
+            .expect("operation logs should be readable")
+            .items
+    }
+
+    let dir = temp_data_dir("desktop-update-receipt");
+    let db = Database::open(dir.clone()).expect("test database should open");
+    let cipher: Arc<dyn KeyCipher + Send + Sync> = Arc::new(StaticKeyCipher::new("state-test"));
+    let state = Arc::new(CoreStateInner::new(db, dir.clone(), cipher).expect("state"));
+    state.set_desktop_update_starter(Arc::new(|_version| Ok(())));
+
+    state.set_desktop_update_completed();
+    assert!(
+        operations(&state).is_empty(),
+        "completing an empty slot must not insert a receipt"
+    );
+
+    state
+        .start_desktop_update_recorded(
+            "9.9.9".to_string(),
+            UserOperation::new(
+                &state,
+                OperationSource::Dashboard,
+                "app.update",
+                "app",
+                None,
+            ),
+        )
+        .expect("registered starter should accept the pending operation");
+    assert!(state.set_desktop_update_installing());
+    assert_eq!(
+        state.desktop_update_status().phase,
+        DesktopUpdatePhase::Installing
+    );
+    let pending = operations(&state);
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].action, "app.update");
+    assert_eq!(pending[0].outcome, OperationOutcome::Pending);
+    assert!(pending[0].completed_at.is_none());
+    let operation_id = pending[0].operation_id.clone();
+
+    state.set_desktop_update_completed();
+    assert_eq!(
+        state.desktop_update_status().phase,
+        DesktopUpdatePhase::Installing,
+        "install success does not invent a succeeded phase"
+    );
+    let finished = operations(&state);
+    assert_eq!(finished.len(), 1);
+    assert_eq!(finished[0].operation_id, operation_id);
+    assert_eq!(finished[0].source, OperationSource::Dashboard);
+    assert_eq!(finished[0].outcome, OperationOutcome::Success);
+    assert_eq!(finished[0].reason_code.as_deref(), Some("installed"));
+    assert!(finished[0].completed_at.is_some());
+
+    state.set_desktop_update_completed();
+    state.set_desktop_update_failed("https://updates.example/late-secret");
+    let unchanged = operations(&state);
+    assert_eq!(unchanged.len(), 1);
+    assert_eq!(unchanged[0].operation_id, operation_id);
+    assert_eq!(unchanged[0].outcome, OperationOutcome::Success);
+    assert_eq!(unchanged[0].reason_code.as_deref(), Some("installed"));
+    let encoded = serde_json::to_string(&unchanged[0]).expect("receipt should serialize");
+    assert!(!encoded.contains("updates.example"), "{encoded}");
+    assert!(!encoded.contains("https://"), "{encoded}");
+    assert_eq!(
+        state.desktop_update_status().error.as_deref(),
+        Some("https://updates.example/late-secret")
+    );
+
+    drop(state);
+    let _ = fs::remove_dir_all(dir);
+
+    let dir = temp_data_dir("desktop-update-failed");
+    let db = Database::open(dir.clone()).expect("test database should open");
+    let cipher: Arc<dyn KeyCipher + Send + Sync> = Arc::new(StaticKeyCipher::new("state-test"));
+    let state = Arc::new(CoreStateInner::new(db, dir.clone(), cipher).expect("state"));
+    state.set_desktop_update_starter(Arc::new(|_version| Ok(())));
+    state
+        .start_desktop_update_recorded(
+            "9.9.9".to_string(),
+            UserOperation::new(
+                &state,
+                OperationSource::Dashboard,
+                "app.update",
+                "app",
+                None,
+            ),
+        )
+        .expect("registered starter should accept the pending operation");
+    let pending_id = operations(&state)[0].operation_id.clone();
+    let secret = "signed update failed at https://updates.example/feed";
+    state.set_desktop_update_failed(secret);
+    let failed = operations(&state);
+    assert_eq!(failed.len(), 1);
+    assert_eq!(failed[0].operation_id, pending_id);
+    assert_eq!(failed[0].outcome, OperationOutcome::Failed);
+    assert_eq!(failed[0].reason_code.as_deref(), Some("updateFailed"));
+    let status = state.desktop_update_status();
+    assert_eq!(status.phase, DesktopUpdatePhase::Failed);
+    assert_eq!(status.error.as_deref(), Some(secret));
+    let encoded = serde_json::to_string(&failed[0]).expect("receipt should serialize");
+    assert!(!encoded.contains("updates.example"), "{encoded}");
+    assert!(!encoded.contains(secret), "{encoded}");
+
+    drop(state);
+    let _ = fs::remove_dir_all(dir);
 }

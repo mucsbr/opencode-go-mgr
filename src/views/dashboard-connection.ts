@@ -7,33 +7,6 @@ export function maskConnectionKey(key: string): string {
   return `${key.slice(0, 4)}…${key.slice(-4)}`;
 }
 
-export function restoreMaskedConnectionKey(value: string, maskedKey: string, actualKey: string): string {
-  return value.replaceAll(maskedKey, () => actualKey);
-}
-
-export interface ConnectionDraftContext {
-  gateway_port: number;
-  gateway_key: string;
-  client_root_url: string;
-}
-
-export function connectionDraftContextChanged(
-  previous: ConnectionDraftContext,
-  next: ConnectionDraftContext,
-): boolean {
-  return previous.gateway_port !== next.gateway_port
-    || previous.gateway_key !== next.gateway_key
-    || previous.client_root_url !== next.client_root_url;
-}
-
-export function reconcileConnectionDrafts(
-  previous: ConnectionDraftContext,
-  next: ConnectionDraftContext,
-  drafts: Record<string, string>,
-): Record<string, string> {
-  return connectionDraftContextChanged(previous, next) ? {} : drafts;
-}
-
 export interface ConnectionUrls {
   rootUrl: string;
   apiBaseUrl: string;
@@ -47,14 +20,14 @@ export function normalizeClientRootUrl(value: string): string {
   const input = value.trim();
   if (!input) return "";
   if (!/^https?:\/\//i.test(input)) {
-    throw new Error(t("请输入完整的 http:// 或 https:// 地址"));
+    throw new Error(t("输入完整的 http:// 或 https:// 地址"));
   }
 
   let url: URL;
   try {
     url = new URL(input);
   } catch {
-    throw new Error(t("请输入有效的绝对 URL"));
+    throw new Error(t("输入有效的绝对 URL"));
   }
   if (url.protocol !== "http:" && url.protocol !== "https:") {
     throw new Error(t("仅支持 HTTP 或 HTTPS 地址"));
@@ -70,7 +43,7 @@ export function normalizeClientRootUrl(value: string): string {
   const v1Index = segments.findIndex((segment) => segment.toLowerCase() === "v1");
   if (v1Index >= 0) {
     if (v1Index + 1 !== segments.length) {
-      throw new Error(t("请填写根地址，不要包含 /v1 后的接口路径"));
+      throw new Error(t("填写根地址，不含 /v1 后的接口路径"));
     }
     path = path.slice(0, path.length - 3).replace(/\/+$/, "");
   }
@@ -95,19 +68,6 @@ export function resolveConnectionUrls(
     messagesUrl: `${apiBaseUrl}/messages`,
     insecureHttp: isInsecureHttp(rootUrl),
   };
-}
-
-export function isGeminiCliBaseUrlAllowed(rootUrl: string): boolean {
-  let url: URL;
-  try {
-    url = new URL(rootUrl);
-  } catch {
-    return false;
-  }
-  if (url.protocol === "https:") return true;
-  if (url.protocol !== "http:") return false;
-  const hostname = url.hostname.toLowerCase().replace(/^\[|\]$/g, "");
-  return hostname === "localhost" || hostname === "127.0.0.1" || hostname === "::1";
 }
 
 function isInsecureHttp(rootUrl: string): boolean {

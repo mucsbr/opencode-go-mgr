@@ -1,16 +1,31 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { PLAN_DEFINITIONS } from "./plans.ts";
+import { OPENCODE_GO_PLAN, type ProviderSurface } from "./plans.ts";
 import {
   accountCreatePayloadErrorKey,
   AccountCreatePayloadError,
+  accountCreateRequestInput,
   buildCreateAccountPayload,
 } from "./account-create-payload.ts";
+import { CUSTOM_ENDPOINT_URL_ISSUE_KEYS } from "./custom-account.ts";
 import type { AccountCreatePayloadErrorCode } from "./account-create-payload.ts";
 
-const goPlan = PLAN_DEFINITIONS.find((p) => p.id === "opencode-go")!;
-const goatPlan = PLAN_DEFINITIONS.find((p) => p.id === "command-code-goat")!;
-const customPlan = PLAN_DEFINITIONS.find((p) => p.id === "custom-endpoint")!;
+function surface(providerId: string, extra: Partial<ProviderSurface> = {}): ProviderSurface {
+  return {
+    ...OPENCODE_GO_PLAN,
+    id: providerId,
+    provider_id: providerId,
+    display_name: providerId,
+    label: providerId,
+    legacy: false,
+    managed_registration: false,
+    ...extra,
+  };
+}
+
+const goPlan = OPENCODE_GO_PLAN;
+const goatPlan = surface("command-code", { kind: "api-key" });
+const customPlan = surface("custom", { kind: "custom", offering: "api" });
 
 test("Custom payload uses one API URL and expands every model to its protocol", () => {
   const payload = buildCreateAccountPayload(customPlan, {
@@ -96,9 +111,10 @@ test("non-Custom plans reject Custom-only fields", () => {
 test("dynamic Provider accounts omit Endpoint/protocol/models and skip Key when none-auth", () => {
   const dynamicKeyed = {
     ...goatPlan,
-    id: "dynamic-http" as const,
+    id: "11111111-1111-4111-8111-111111111111",
     provider_id: "11111111-1111-4111-8111-111111111111",
     label: "Lab",
+    dynamic: true,
   };
   assert.throws(
     () => buildCreateAccountPayload(dynamicKeyed, {
@@ -118,10 +134,20 @@ test("dynamic Provider accounts omit Endpoint/protocol/models and skip Key when 
   assert.equal(nonePayload.key, "");
 });
 
-test("payload error messages remain usable without a legacy config vocabulary", () => {
-  assert.equal(
-    accountCreatePayloadErrorKey(new AccountCreatePayloadError("missing_endpoint_url")),
-    "请填写 API 地址",
+test("create request input keeps fields and coerces a missing Key to empty", () => {
+  assert.deepEqual(
+    accountCreateRequestInput({ name: "Lab", provider_id: "lab", key: "sk-lab" }),
+    { name: "Lab", provider_id: "lab", key: "sk-lab" },
   );
-  assert.equal(accountCreatePayloadErrorKey(new Error("internal")), "账号创建失败，请重试");
+  assert.equal(accountCreateRequestInput({ name: "Lab", key: "" }).key, "");
+  assert.equal(accountCreateRequestInput({ name: "Lab", key: undefined as unknown as string }).key, "");
+});
+
+test("payload errors map to Endpoint keys and fall back for unknown failures", () => {
+  const endpoint = accountCreatePayloadErrorKey(new AccountCreatePayloadError("missing_endpoint_url"));
+  assert.equal(endpoint, CUSTOM_ENDPOINT_URL_ISSUE_KEYS.empty);
+  assert.equal(
+    accountCreatePayloadErrorKey(new Error("internal")),
+    accountCreatePayloadErrorKey(new AccountCreatePayloadError("custom_fields_not_allowed")),
+  );
 });

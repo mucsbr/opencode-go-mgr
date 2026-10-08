@@ -1,3 +1,5 @@
+#![cfg(feature = "ollama-cloud-loopback-test")]
+
 //! Gateway integration regressions for the Ollama Cloud sealed family.
 //!
 //! Covers the spec scenarios that only the full request path can prove:
@@ -5,6 +7,10 @@
 //! and SSE reasoning backfill), mixed candidate-chain byte isolation, the
 //! `upstream_body_bytes` diagnostic contract, Cookie-free inference egress,
 //! fail-closed unknown-model 400s, and unpriced-vs-Go pricing attribution.
+//!
+//! The loopback origin substitute lives behind the default-off
+//! `ollama-cloud-loopback-test` feature so this target still compiles in
+//! release without the seam. Project test and CI commands enable the feature.
 
 use axum::http::StatusCode;
 use chrono::Utc;
@@ -27,6 +33,8 @@ use std::time::Duration as StdDuration;
 #[path = "fixtures/fake_upstream.rs"]
 #[allow(dead_code)] // the shared fixture carries delayed/raw helpers this suite never exercises
 mod fake_upstream;
+#[path = "fixtures/refreshed_go_catalog.rs"]
+mod refreshed_go_catalog;
 
 use fake_upstream::{FakeReply, start_fake_upstream};
 
@@ -224,8 +232,8 @@ async fn ollama_cloud_attempt_normalizes_wire_and_never_sends_cookies() {
     let log = state.db.lock().list_forward_logs(1).unwrap().remove(0);
     assert_eq!(log.provider_id.as_deref(), Some(OLLAMA_PROVIDER_ID));
     assert_eq!(log.model, "gpt-oss:120b");
-    assert_eq!(log.status, "success_unpriced");
-    assert_eq!(log.cost_state, "unpriced", "the family has no price table");
+    assert_eq!(log.status, "success");
+    assert_eq!(log.cost_state, "unknown", "the family has no price table");
     assert!(log.cost.is_none());
     assert!(log.pricing_revision_id.is_none());
     assert_eq!(log.route, "direct", "the attempt's route leg is recorded");
@@ -331,6 +339,7 @@ async fn mixed_candidate_chain_keeps_go_attempt_bytes_identical() {
     let (state, dir) = build_state(base_url.clone());
     persist_ollama_catalog(&state, &["deepseek-v4-flash:0731", "gpt-oss:120b"]);
 
+    refreshed_go_catalog::persist_refreshed_go_catalog(&state);
     // Go account sorts first: the shared alias is served by Go.
     let mut go = base_account(&state, "go-1", GO_KEY);
     go.provider_id = ocg_core::provider::OPENCODE_PROVIDER_ID.into();
@@ -365,8 +374,8 @@ async fn mixed_candidate_chain_keeps_go_attempt_bytes_identical() {
         log.provider_id.as_deref(),
         Some(ocg_core::provider::OPENCODE_PROVIDER_ID)
     );
-    assert_eq!(log.cost_state, "priced");
-    assert!(log.pricing_revision_id.is_some());
+    assert_eq!(log.cost_state, "unknown");
+    assert!(log.pricing_revision_id.is_none());
     assert_eq!(
         log.model, "deepseek-v4-flash",
         "client-facing name is preserved"
@@ -405,7 +414,7 @@ async fn shared_alias_served_by_ollama_is_unpriced_and_uses_the_snapshot_id_upst
 
     let log = state.db.lock().list_forward_logs(1).unwrap().remove(0);
     assert_eq!(log.provider_id.as_deref(), Some(OLLAMA_PROVIDER_ID));
-    assert_eq!(log.cost_state, "unpriced");
+    assert_eq!(log.cost_state, "unknown");
     assert!(log.cost.is_none());
     assert!(log.raw_cost_usd.is_none());
     assert!(log.pricing_revision_id.is_none());
@@ -453,6 +462,10 @@ async fn ollama_catalog_does_not_add_v1_models_entries() {
     let (base_url, calls, stop_mock) = start_fake_upstream(replies).await;
     let (state, dir) = build_state(base_url.clone());
     persist_ollama_catalog(&state, &["deepseek-v4-flash:0731", "gpt-oss:120b"]);
+    refreshed_go_catalog::persist_refreshed_go_catalog(&state);
+    let mut go = base_account(&state, "go-1", GO_KEY);
+    go.provider_id = ocg_core::provider::OPENCODE_PROVIDER_ID.into();
+    state.db.lock().create_account(&go).unwrap();
     let (port, gateway_handle) = start_gateway(state.clone()).await;
 
     let response = loopback_client()

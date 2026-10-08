@@ -11,7 +11,7 @@ Gateway 启动后，接入客户端主要是复制配置。请使用接入中心
 
 **Key** 是你唯一要交给客户端的秘密。它接受三种请求头形态——`Authorization: Bearer <key>`、Anthropic 风格的 `x-api-key: <key>`、Gemini 风格的 `x-goog-api-key: <key>`。Gateway 从 SQLite 取出 OpenCode-Go 账号 Key，并自行注入上游。
 
-五类兼容入口的最小 POSIX shell 检查：
+四类兼容入口的最小 POSIX shell 检查：
 
 ```bash
 BASE=http://127.0.0.1:9042
@@ -31,11 +31,6 @@ curl "$BASE/v1/responses" -H "Authorization: Bearer $KEY" \
 curl "$BASE/v1/messages" -H "x-api-key: $KEY" \
   -H "anthropic-version: 2023-06-01" -H "Content-Type: application/json" \
   -d '{"model":"deepseek-v4-flash","max_tokens":16,"messages":[{"role":"user","content":"ping"}]}'
-
-# Claude Desktop: 别名会改写为已保存的 sonnet/opus/haiku 映射
-curl "$BASE/claude-desktop/v1/messages" -H "x-api-key: $KEY" \
-  -H "anthropic-version: 2023-06-01" -H "Content-Type: application/json" \
-  -d '{"model":"claude-sonnet-4-6","max_tokens":16,"messages":[{"role":"user","content":"ping"}]}'
 
 # Gemini generateContent
 curl "$BASE/v1beta/models/deepseek-v4-flash:generateContent" \

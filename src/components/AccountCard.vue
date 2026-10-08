@@ -1,405 +1,100 @@
 <template>
-  <n-card
-    :data-account-id="account.id"
-    size="small"
-    class="account-card"
-    :class="{
-      'account-card--cooling': isCooling(account, now),
-      'account-card--pending': !accountIsReady(account),
-      'account-card--draft': isDraft,
-      'account-card--dragging': dragging,
-    }"
+  <AccountCardFrame
+    :route-id="account.id"
+    :name="account.name"
+    :family="brandFamily"
+    :type-label="typeLabel"
+    :subtitle="capabilities.endpointOnAccount ? account.custom_config?.endpoint_url ?? '' : ''"
+    :tone="tone"
+    :order-handle-disabled="orderHandleDisabled"
+    :dragging="dragging"
+    @order-keydown="emit('order-keydown', $event)"
+    @order-drag-start="emit('order-drag-start', $event)"
   >
-    <template #header>
-      <div class="account-title">
-        <n-tooltip trigger="hover">
-          <template #trigger>
-            <n-button
-              circle
-              quaternary
-              size="small"
-              class="account-order-handle"
-              :class="{ 'account-order-handle--dragging': dragging }"
-              :disabled="orderHandleDisabled"
-              :aria-label="t('拖动调整账号 {name} 的优先级', { name: account.name })"
-              aria-describedby="account-order-instructions"
-              @click.prevent
-              @keydown="emit('order-keydown', $event)"
-              @pointerdown="emit('order-drag-start', $event)"
-            >
-              <template #icon><n-icon :component="HolderOutlined" /></template>
-            </n-button>
-          </template>
-          {{ t("拖动调整账号 {name} 的优先级", { name: account.name }) }}
-        </n-tooltip>
-        <div class="account-heading">
-          <div class="account-name-row">
-            <span class="account-name">{{ account.name }}</span>
-            <n-tag v-if="isCpa" type="info" size="small" :bordered="false">
-              {{ t("CPA 订阅池") }}
-            </n-tag>
-            <n-tag v-else-if="account.account_type === 'managed'" type="info" size="small" :bordered="false">
-              {{ t("托管注册") }}
-            </n-tag>
-            <n-tag v-else-if="isZen" type="info" size="small" :bordered="false">
-              {{ t("免费通道") }}
-            </n-tag>
-            <n-tag
-              v-else
-              :type="isDraft ? 'warning' : 'default'"
-              size="small"
-              :bordered="false"
-            >
-              {{ planLabel(account, catalog) }}
-            </n-tag>
-            <n-tooltip v-if="account.auth_error || isCooling(account, now)">
-              <template #trigger>
-                <n-tag :type="accountStatusTagType(account, now)" size="small">
-                  {{ accountStatusLabel(account, now) }}
-                </n-tag>
-              </template>
-              {{ account.auth_error || cooldownDetails(account, now, limits) }}
-            </n-tooltip>
-            <n-tag v-else :type="accountStatusTagType(account, now)" size="small">
-              {{ accountStatusLabel(account, now) }}
-            </n-tag>
-            <n-popover
-              v-if="hasValidityPeriod"
-              :show="purchaseDatePopoverShown"
-              trigger="click"
-              placement="bottom-start"
-              :show-arrow="false"
-              @update:show="handlePurchaseDatePopover"
-            >
-              <template #trigger>
-                <n-button
-                  text
-                  size="small"
-                  class="account-expiry-trigger"
-                  :disabled="purchaseDateSaving"
-                  :aria-label="`${accountExpiryLabel(account, now)}；${t('到期于 {date}', { date: account.expires_on })}；${t('修改购买日期')}`"
-                >
-                  <n-tag
-                    :type="accountExpiryTagType(account, now)"
-                    size="small"
-                    :bordered="false"
-                  >
-                    {{ accountExpiryLabel(account, now) }} ·
-                    {{ t("到期于 {date}", { date: account.expires_on }) }}
-                  </n-tag>
-                </n-button>
-              </template>
-              <div class="purchase-date-popover">
-                <strong>{{ t("购买日期") }}</strong>
-                <n-date-picker
-                  v-model:formatted-value="purchaseDateDraft"
-                  type="date"
-                  value-format="yyyy-MM-dd"
-                  format="yyyy-MM-dd"
-                  :to="false"
-                  :clearable="false"
-                  :disabled="purchaseDateSaving"
-                  :is-date-disabled="isPurchaseDateDisabled"
-                  :aria-label="t('购买日期')"
-                />
-                <div class="purchase-date-popover__actions">
-                  <n-button
-                    size="small"
-                    :disabled="purchaseDateSaving || account.purchase_date === today"
-                    @click="commitPurchaseDate(today)"
-                  >
-                    {{ t("更新到今天") }}
-                  </n-button>
-                  <n-button
-                    type="primary"
-                    size="small"
-                    :loading="purchaseDateSaving"
-                    :disabled="!canSavePurchaseDate"
-                    @click="commitPurchaseDate(purchaseDateDraft)"
-                  >
-                    {{ t("保存") }}
-                  </n-button>
-                </div>
-              </div>
-            </n-popover>
-          </div>
-        </div>
-      </div>
+    <template #tags>
+      <CredentialTags
+        :account="account"
+        :identity="identity"
+        :catalog="catalog"
+        :limits="limits"
+        :now="now"
+        :purchase-date-saving="purchaseDateSaving"
+        :account-names="accountNames"
+        @update-purchase-date="emit('update-purchase-date', $event)"
+      />
     </template>
 
-    <template #header-extra>
-      <div class="account-actions" :class="{ 'account-actions--goat': isGoat }">
-        <div v-if="accountIsReady(account)" class="account-action account-action--enabled">
-          <n-tooltip trigger="hover">
-            <template #trigger>
-              <n-switch
-                :value="account.enabled"
-                :disabled="!!toggleBlockedReason"
-                :aria-label="account.enabled ? t('禁用账号 {name}', { name: account.name }) : t('启用账号 {name}', { name: account.name })"
-                @update:value="emit('toggle')"
-              />
-            </template>
-            {{ toggleBlockedReason || (account.enabled
-              ? t("禁用账号 {name}", { name: account.name })
-              : t("启用账号 {name}", { name: account.name })) }}
-          </n-tooltip>
-        </div>
-
-        <div v-if="(isGo || isGoat || isOfficialCn) && accountIsReady(account)" class="account-action account-action--secondary">
-          <n-tooltip trigger="hover">
-            <template #trigger>
-              <n-button
-                circle
-                quaternary
-                size="small"
-                :aria-label="t('刷新额度')"
-                :loading="usageRefreshLoading"
-                :disabled="(!isOfficialCn && isUsageRefreshBlocked(account, now)) || usageLoading || !!usageLoadError"
-                @click="emit('refresh-usage')"
-              >
-                <template #icon><n-icon :component="ReloadOutlined" /></template>
-              </n-button>
-            </template>
-            {{ isOfficialCn ? t("刷新额度") : usageRefreshTooltip(account, now) }}
-          </n-tooltip>
-        </div>
-
-        <div
-          v-if="manualUsageCalibration && accountIsReady(account) && edits"
-          class="account-action account-action--calibration"
-        >
-          <n-popover
-            trigger="click"
-            placement="bottom-end"
-            :show-arrow="false"
-            :width="320"
-            style="max-width: calc(100vw - 64px)"
-            @update:show="(show: boolean) => show && emit('usage-editor-open')"
-          >
-          <template #trigger>
-            <n-tooltip trigger="hover">
-              <template #trigger>
-                <n-button
-                  circle
-                  quaternary
-                  size="small"
-                  :aria-label="t('校准用量')"
-                  :disabled="!usageEditorAvailable"
-                >
-                  <template #icon><n-icon :component="EditOutlined" /></template>
-                </n-button>
-              </template>
-              {{ t("校准用量") }}
-            </n-tooltip>
-          </template>
-
-            <AccountUsageEditor
-              :account="account"
-              :usage="usage"
-              :limits="limits"
-              :edits="edits!"
-              :loading="usageLoading"
-              :now="now"
-              @update-draft="(key, value) => emit('usage-update-draft', key, value)"
-              @update-resets-first="(key, value) => emit('usage-update-resets-first', key, value)"
-              @update-resets-second="(key, value) => emit('usage-update-resets-second', key, value)"
-              @save="(key) => emit('usage-save', key)"
-            />
-          </n-popover>
-        </div>
-
-        <div v-if="!isCpa" class="account-action account-action--test">
-          <n-tooltip trigger="hover">
-            <template #trigger>
-              <n-button
-                circle
-                quaternary
-                size="small"
-                :disabled="!accountIsReady(account)"
-                :aria-label="t('测试账号 {name} 的连接', { name: account.name })"
-                @click="emit('test-connection')"
-              >
-                <template #icon><n-icon :component="ApiOutlined" /></template>
-              </n-button>
-            </template>
-            {{ accountIsReady(account) ? t("测试连接") : t("完成注册后可测试连接") }}
-          </n-tooltip>
-        </div>
-
-        <div v-if="menuOptions.length > 0" class="account-action account-action--menu">
-          <n-dropdown
-            :options="menuOptions"
-            trigger="click"
-            placement="bottom-end"
-            @select="(key: string | number) => emit('menu-select', key)"
-          >
-            <n-tooltip trigger="hover">
-              <template #trigger>
-                <n-button
-                  circle
-                  quaternary
-                  size="small"
-                  :aria-label="t('更多操作')"
-                >
-                  <template #icon><n-icon :component="MoreOutlined" /></template>
-                </n-button>
-              </template>
-              {{ t("更多操作") }}
-            </n-tooltip>
-          </n-dropdown>
-        </div>
-      </div>
+    <template #actions>
+      <CredentialActions
+        :account="account"
+        :identity="identity"
+        :catalog="catalog"
+        :usage="usage"
+        :limits="limits"
+        :edits="edits"
+        :now="now"
+        :usage-loading="usageLoading"
+        :usage-load-error="usageLoadError"
+        :usage-refresh-loading="usageRefreshLoading"
+        :menu-options="menuOptions"
+        :connections="connections"
+        @toggle="emit('toggle')"
+        @test-connection="emit('test-connection')"
+        @refresh-usage="emit('refresh-usage')"
+        @menu-select="emit('menu-select', $event)"
+        @usage-editor-open="emit('usage-editor-open')"
+        @usage-update-draft="(key, value) => emit('usage-update-draft', key, value)"
+        @usage-update-resets-first="(key, value) => emit('usage-update-resets-first', key, value)"
+        @usage-update-resets-second="(key, value) => emit('usage-update-resets-second', key, value)"
+        @usage-save="(key) => emit('usage-save', key)"
+      />
     </template>
 
-    <div v-if="!accountIsReady(account)" class="managed-pending">
-      <div>
-        <strong>{{ managedStepLabel(account.setup_step) }}</strong>
-        <p>{{ t("注册进度已保存。继续后仍会使用该账号自己的浏览器 Profile。") }}</p>
-      </div>
-      <n-button type="primary" secondary @click="emit('open-wizard')">
-        {{ t("继续注册") }}
-      </n-button>
-    </div>
-    <div v-else-if="isDraft" class="provider-unconfigured" role="status">
-      <p>{{ draftDescription }}</p>
-    </div>
-    <div v-else-if="isOllamaCloud && ollamaNeedsBilling" class="provider-unconfigured" role="status">
-      <p>{{ t("请配置 Ollama 计费档位以显示本月额度") }}</p>
-    </div>
-    <div v-else-if="manualUsageCalibration" class="manual-usage-block">
-      <div v-if="usageLoadError" class="usage-load-error" role="alert">
-        <span>{{ t("用量加载失败") }}</span>
-        <n-button
-          text
-          size="tiny"
-          type="primary"
-          :loading="usageLoading"
-          @click="emit('reload-usage')"
-        >
-          {{ t("重试") }}
-        </n-button>
-      </div>
-      <UsageStrip
-        v-else
-        :account="account"
-        :usage="usage"
-        :limits="limits"
-        :editing="!!edits"
-      />
-      <p v-if="isGoat && !usageLoadError" class="usage-sync-meta">
-        {{ usageSyncCaption(account, now) }}
-      </p>
-    </div>
-    <div v-else-if="isCustom" class="custom-endpoint">
-      <div class="custom-endpoint__meta">
-        <span v-if="account.custom_config?.endpoint_url" class="custom-endpoint__url">
-          {{ account.custom_config.endpoint_url }}
-        </span>
-        <span class="custom-endpoint__models">
-          {{ t("{count} 个模型", { count: account.model_capabilities.length }) }}
-        </span>
-      </div>
-    </div>
-    <div v-else-if="isGo && !quotaLimitsFailed">
-      <div v-if="usageLoadError" class="usage-load-error" role="alert">
-        <span>{{ t("用量加载失败") }}</span>
-        <n-button
-          text
-          size="tiny"
-          type="primary"
-          :loading="usageLoading"
-          @click="emit('reload-usage')"
-        >
-          {{ t("重试") }}
-        </n-button>
-      </div>
-      <UsageStrip
-        v-else
-        :account="account"
-        :usage="usage"
-        :limits="limits"
-        :editing="!!edits"
-      />
-      <p
-        v-if="!usageLoadError"
-        class="usage-sync-meta"
-      >
-        {{ usageSyncCaption(account, now) }}
-      </p>
-    </div>
-    <div v-else-if="isOfficialCn" class="official-plan-usage">
-      <div v-if="usageLoadError" class="usage-load-error" role="alert">
-        <span>{{ t("用量加载失败") }}</span>
-        <n-button text size="tiny" type="primary" :loading="usageLoading" @click="emit('reload-usage')">
-          {{ t("重试") }}
-        </n-button>
-      </div>
-      <ProviderQuotaSummary v-else :usage="providerUsage" :now="now" />
-    </div>
-
-
-  </n-card>
+    <CredentialBody
+      :account="account"
+      :identity="identity"
+      :catalog="catalog"
+      :provider-usage="providerUsage"
+      :now="now"
+      :usage-loading="usageLoading"
+      :usage-load-error="usageLoadError"
+      :connections="connections"
+      @reload-usage="emit('reload-usage')"
+      @open-wizard="emit('open-wizard')"
+    />
+  </AccountCardFrame>
 </template>
 
 <script setup lang="ts">
-import { computed, ref, watch } from "vue";
-import {
-  NButton,
-  NCard,
-  NDatePicker,
-  NDropdown,
-  NIcon,
-  NPopover,
-  NSwitch,
-  NTag,
-  NTooltip,
-} from "naive-ui";
-import {
-  ApiOutlined,
-  EditOutlined,
-  HolderOutlined,
-  MoreOutlined,
-  ReloadOutlined,
-} from "@vicons/antd";
+import { useDestinationsStore } from "../stores/destinations.ts";
+import { useProvidersStore } from "../stores/providers.ts";
+import { computed } from "vue";
 import type { Account, UsageWindow } from "../api/dashboard";
+import type { Identity } from "../api/identities.ts";
 import type {
   ProviderCatalogEntry,
   ProviderUsageResponse,
 } from "../api/providers.ts";
-import { isCooling, isUsageLimitReached } from "../domain/accounts-usage.ts";
+import { isCooling } from "../domain/accounts-usage.ts";
 import type { UsageKey } from "../domain/accounts-usage.ts";
 import {
-  accountExpiryLabel,
-  accountExpiryTagType,
   accountIsReady,
-  accountRoutingDraftDescription,
-  accountStatusLabel,
-  accountStatusTagType,
-  cooldownDetails,
-  isUsageRefreshBlocked,
-  managedStepLabel,
-  usageRefreshTooltip,
-  usageSyncCaption,
+  accountTypeLabel,
+  type AccountMenuOption,
 } from "../domain/account-display.ts";
-import type { AccountMenuOption } from "../domain/account-display.ts";
-import {
-  isCommandCodeGoatAccount,
-  isCpaIntegrationAccount,
-  isOllamaCloudAccount,
-  isOfficialCnPlanAccount,
-  isZenFreeAccount,
-} from "../domain/account-providers.ts";
-import { isCustomApiAccount } from "../domain/custom-account.ts";
-import { localDateString } from "../domain/account-lifecycle.ts";
-import { planLabel } from "../domain/plans.ts";
+import { accountTypeLabelText } from "../views/account-status-text.ts";
+import { accountBrandFamily } from "../domain/account-brand.ts";
+import { accountCapabilities } from "../domain/account-capabilities.ts";
 import type { AccountUsageEdits, UsageLimitView } from "../domain/useAccountUsage.ts";
-import { t } from "../i18n/index.ts";
-import AccountUsageEditor from "./AccountUsageEditor.vue";
-import UsageStrip from "./UsageStrip.vue";
-import ProviderQuotaSummary from "./ProviderQuotaSummary.vue";
+import type { Connection } from "../api/connections.ts";
+import AccountCardFrame, { type AccountCardTone } from "./AccountCardFrame.vue";
+import CredentialActions from "./CredentialActions.vue";
+import CredentialBody from "./CredentialBody.vue";
+import CredentialTags from "./CredentialTags.vue";
 
 const props = defineProps<{
   account: Account;
+  identity?: Identity | null;
   catalog: readonly ProviderCatalogEntry[] | null;
   usage: UsageWindow;
   providerUsage: ProviderUsageResponse | null;
@@ -412,8 +107,9 @@ const props = defineProps<{
   usageLoadError: string | null;
   usageRefreshLoading: boolean;
   purchaseDateSaving: boolean;
-  quotaLimitsFailed: boolean;
   menuOptions: AccountMenuOption[];
+  accountNames?: Readonly<Record<string, string>>;
+  connections?: readonly Connection[] | null;
 }>();
 
 const emit = defineEmits<{
@@ -433,326 +129,22 @@ const emit = defineEmits<{
   "usage-save": [key: UsageKey];
 }>();
 
-const isZen = computed(() => isZenFreeAccount(props.account));
-const isCpa = computed(() => isCpaIntegrationAccount(props.account));
-const isGo = computed(() => props.account.provider_id === "opencode");
-const isGoat = computed(() => isCommandCodeGoatAccount(props.account));
-const isCustom = computed(() => isCustomApiAccount(props.account));
-const isOfficialCn = computed(() => isOfficialCnPlanAccount(props.account));
-const isOllamaCloud = computed(() => isOllamaCloudAccount(props.account));
-const ollamaNeedsBilling = computed(() => !props.account.ollama_billing_tier);
-const hasValidityPeriod = computed(() => (
-  accountIsReady(props.account)
-  && !isCustom.value
-  && !isZen.value
-  && !!props.account.purchase_date
-  && !!props.account.expires_on
+const destinations = useDestinationsStore();
+const providersStore = useProvidersStore();
+const destination = computed(() => destinations.destinationForAccount(props.account.id));
+const capabilities = computed(() => accountCapabilities(props.account, props.catalog, destination.value));
+const brandFamily = computed(() => accountBrandFamily(props.account, props.catalog, providersStore.presetIds));
+const typeLabel = computed(() => (
+  accountTypeLabelText(accountTypeLabel(props.account, props.catalog, destination.value))
 ));
-const purchaseDatePopoverShown = ref(false);
-const purchaseDateDraft = ref<string | null>(props.account.purchase_date || null);
-const today = computed(() => localDateString(props.now));
-const canSavePurchaseDate = computed(() => (
-  !props.purchaseDateSaving
-  && !!purchaseDateDraft.value
-  && purchaseDateDraft.value <= today.value
-  && purchaseDateDraft.value !== props.account.purchase_date
-));
-const plan = computed(() => props.catalog?.find((entry) => (
-  entry.provider_id === props.account.provider_id
-)));
-// Manual calibration display is catalog-driven: no hardcoded per-plan meters.
-const manualUsageCalibration = computed(() => (
-  plan.value?.manual_usage_calibration ?? false
-));
-const toggleBlockedReason = computed(() => {
-  if (!props.account.plan_routable) return t("该方案暂不可路由");
-  return "";
-});
 const isDraft = computed(() => (
   accountIsReady(props.account)
   && !props.account.plan_routable
 ));
-
-const draftDescription = computed(() => {
-  const key = accountRoutingDraftDescription(props.account);
-  return key ? t(key) : "";
-});
-
-const usageEditorAvailable = computed(() => {
-  if (props.usageLoading || props.usageLoadError) return false;
-  return props.limits.some(({ key }) => !isUsageLimitReached(props.account, key, props.now));
-});
-
-function handlePurchaseDatePopover(show: boolean): void {
-  purchaseDatePopoverShown.value = show;
-  if (show) purchaseDateDraft.value = props.account.purchase_date || today.value;
-}
-
-function isPurchaseDateDisabled(timestamp: number): boolean {
-  return localDateString(timestamp) > today.value;
-}
-
-function commitPurchaseDate(date: string | null): void {
-  if (!date || date > today.value || date === props.account.purchase_date) {
-    purchaseDatePopoverShown.value = false;
-    return;
-  }
-  emit("update-purchase-date", date);
-  purchaseDatePopoverShown.value = false;
-}
-
-watch(() => props.account.purchase_date, (value) => {
-  if (!purchaseDatePopoverShown.value) purchaseDateDraft.value = value || null;
+const tone = computed<AccountCardTone>(() => {
+  if (isCooling(props.account, props.now)) return "cooling";
+  if (!accountIsReady(props.account)) return "pending";
+  if (isDraft.value) return "draft";
+  return null;
 });
 </script>
-
-<style scoped>
-.account-card {
-  border-radius: 14px;
-  box-shadow: var(--ocg-shadow-sm);
-  transition: border-color 0.16s ease, box-shadow 0.16s ease, opacity 0.16s ease;
-}
-
-.account-card--cooling {
-  border-color: color-mix(in srgb, var(--ocg-error) 45%, transparent);
-}
-
-.account-card--pending,
-.account-card--draft {
-  border-color: color-mix(in srgb, var(--ocg-primary) 32%, var(--ocg-divider));
-}
-
-.account-card--dragging {
-  border-color: var(--ocg-primary);
-  box-shadow: 0 10px 28px color-mix(in srgb, var(--ocg-primary) 18%, transparent);
-  opacity: 0.72;
-}
-
-.provider-unconfigured {
-  color: var(--ocg-warning);
-  font-size: var(--ocg-font-sm);
-}
-
-.provider-unconfigured > p {
-  margin: 0;
-}
-
-.manual-usage-block {
-  display: grid;
-  gap: 8px;
-  margin-top: 10px;
-}
-
-.official-plan-usage {
-  margin-top: 10px;
-}
-
-.account-actions {
-  display: grid;
-  grid-template-columns: repeat(4, 40px);
-  align-items: center;
-  justify-content: end;
-  column-gap: 8px;
-}
-
-.account-actions--goat {
-  grid-template-columns: repeat(5, 40px);
-}
-
-.account-action {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  min-width: 0;
-}
-
-.account-action--enabled {
-  grid-column: 1;
-}
-
-.account-action--secondary,
-.account-action--calibration {
-  grid-column: 2;
-}
-
-.account-actions--goat .account-action--calibration {
-  grid-column: 3;
-}
-
-.account-actions--goat .account-action--test {
-  grid-column: 4;
-}
-
-.account-actions--goat .account-action--menu {
-  grid-column: 5;
-}
-
-.account-action--test {
-  grid-column: 3;
-}
-
-.account-action--menu {
-  grid-column: 4;
-}
-
-.custom-endpoint {
-  display: grid;
-  justify-items: start;
-  gap: 8px;
-}
-
-.custom-endpoint__meta {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 4px 12px;
-  min-width: 0;
-}
-
-.custom-endpoint__url {
-  overflow-wrap: anywhere;
-  color: var(--ocg-ink);
-  font-size: var(--ocg-font-sm);
-}
-
-.custom-endpoint__models {
-  color: var(--ocg-muted);
-  font-size: var(--ocg-font-sm);
-}
-
-.account-title {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  min-width: 0;
-  width: 100%;
-}
-
-.account-order-handle {
-  flex: 0 0 auto;
-  cursor: grab;
-  touch-action: none;
-  user-select: none;
-}
-
-.account-order-handle--dragging {
-  cursor: grabbing;
-}
-
-.account-heading {
-  display: flex;
-  align-items: center;
-  flex: 1 1 auto;
-  min-width: 0;
-}
-
-.account-name-row {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 4px 6px;
-  min-width: 0;
-}
-
-.account-name {
-  overflow: hidden;
-  color: var(--ocg-ink);
-  font-size: var(--ocg-font-md);
-  font-weight: 600;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.account-name-row :deep(.n-tag) {
-  flex: 0 0 auto;
-}
-
-.account-expiry-trigger {
-  min-width: 0;
-}
-
-.account-expiry-trigger :deep(.n-button__content) {
-  min-width: 0;
-}
-
-.purchase-date-popover {
-  display: grid;
-  gap: 10px;
-  width: min(280px, calc(100vw - 64px));
-}
-
-.purchase-date-popover__actions {
-  display: flex;
-  justify-content: flex-end;
-  gap: 8px;
-}
-
-.managed-pending {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 16px;
-  padding: 10px 2px 2px;
-}
-
-.managed-pending strong {
-  color: var(--ocg-ink);
-  font-size: var(--ocg-font-md);
-}
-
-.managed-pending p {
-  margin: 4px 0 0;
-  color: var(--ocg-muted);
-  font-size: var(--ocg-font-sm);
-}
-
-.usage-sync-meta {
-  margin: 8px 0 0;
-  color: var(--ocg-text-3);
-  font-size: var(--ocg-font-size-12);
-  line-height: 1.4;
-}
-
-.usage-load-error {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 8px;
-  min-height: 42px;
-  color: var(--ocg-error);
-  font-size: var(--ocg-font-sm);
-}
-
-@media (max-width: 900px) {
-  .account-card :deep(.n-card-header) {
-    align-items: flex-start;
-  }
-
-  .account-card :deep(.n-card-header__extra) {
-    margin-left: 8px;
-  }
-}
-
-@media (max-width: 640px) {
-  .managed-pending {
-    align-items: stretch;
-    flex-direction: column;
-  }
-
-  .account-card :deep(.n-card-header) {
-    flex-wrap: wrap;
-    gap: 8px;
-  }
-
-  .account-card :deep(.n-card-header__main),
-  .account-card :deep(.n-card-header__extra) {
-    width: 100%;
-  }
-
-  .account-card :deep(.n-card-header__extra) {
-    display: flex;
-    justify-content: flex-end;
-    margin-left: 0;
-  }
-}
-</style>

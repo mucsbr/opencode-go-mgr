@@ -1,4 +1,4 @@
-//! Local observability reads shared by Dashboard V2 and V3.
+//! Local observability reads for Dashboard V3.
 //!
 //! Every function is a runtime/SQLite read. None of these paths issue outbound
 //! HTTP. Secret redaction matches the historical V2 diagnostic/account-secret
@@ -9,17 +9,18 @@
 
 use crate::alias;
 use crate::db::{Database, ForwardLogQueryOptions};
-use crate::kernel::pricing::PricingSnapshot;
 use crate::models::{
     Account, DailyModelTokens, DashboardSummary, ForwardLog, ForwardLogClientKey, ForwardLogPage,
     ForwardLogSummary, GatewayLog, UpstreamChannel,
 };
 use crate::provider::CredentialKind;
-use crate::provider_contracts::{ContractScope, EffectiveContractSet};
+use crate::provider_contracts::EffectiveContractSet;
 use crate::redaction::redact_known_secret;
+use crate::route_availability::credential_contributes_production_route;
 use crate::routing_runtime::{account_channel, account_is_available_for_at};
+use crate::routing_snapshot::RoutingSnapshot;
 use chrono::{DateTime, SecondsFormat, Utc};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 
 pub(crate) struct GatewayRuntimeStatus {
     pub running: bool,
@@ -32,6 +33,8 @@ pub(crate) struct GatewayRuntimeStatus {
 pub(crate) struct GatewayLogReadQuery {
     pub limit: Option<i64>,
     pub request_id: Option<String>,
+    pub level: Option<String>,
+    pub category: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -105,73 +108,52 @@ pub(crate) fn gateway_runtime_status(
     }
 }
 
-/// Latest `error`/`gateway` log message, with every known decrypted account
-/// secret redacted using the same policy as gateway log lists.
-pub(crate) fn redacted_latest_gateway_error(
-    db: &Database,
-    decrypt_key: impl Fn(&str) -> Option<String>,
-) -> Option<String> {
-    let message = db.latest_gateway_error().ok().flatten()?;
-    let secrets = dashboard_account_secrets(db, decrypt_key).ok()?;
-    Some(redact_known_secrets(&message, &secrets))
-}
-
-pub(crate) fn application_models(
-    snapshot: &PricingSnapshot,
-    contracts: Option<&EffectiveContractSet>,
-) -> Vec<String> {
-    application_models_from_snapshot(snapshot, contracts)
+pub(crate) fn application_models(contracts: Option<&EffectiveContractSet>) -> Vec<String> {
+    application_models_from_snapshot(contracts)
 }
 
 pub(crate) fn application_models_from_snapshot(
-    snapshot: &PricingSnapshot,
     contracts: Option<&EffectiveContractSet>,
 ) -> Vec<String> {
-    let priced = snapshot
-        .models
-        .iter()
-        .map(|model| model.model_id.as_str())
-        .collect::<HashSet<_>>();
-    alias::routeable_aliases_for(crate::provider::OPENCODE_PROVIDER_ID)
-        .into_iter()
-        .filter(|alias| {
-            application_alias_is_priced(alias, &priced)
-                && contracts.is_none_or(|contracts| go_alias_has_enabled_protocol(alias, contracts))
+    let Some(contracts) = contracts else {
+        return Vec::new();
+    };
+    let Some(scope) = contracts
+        .providers
+        .get(crate::provider::OPENCODE_PROVIDER_ID)
+        .filter(|scope| {
+            scope.catalog.source == crate::provider_contracts::CATALOG_SOURCE_OPENCODE_MODELS
         })
-        .collect()
-}
-
-fn go_alias_has_enabled_protocol(alias: &str, contracts: &EffectiveContractSet) -> bool {
-    match crate::alias::resolve(alias) {
-        Ok(crate::alias::ResolvedModel::Alias { mappings, .. }) => mappings.iter().any(|mapping| {
-            mapping.routeable
-                && mapping.provider_id == crate::provider::OPENCODE_PROVIDER_ID
-                && contracts.mapping_has_enabled_protocol(mapping)
-        }),
-        Ok(crate::alias::ResolvedModel::PinnedRaw { mapping, .. }) => {
-            mapping.routeable
-                && mapping.provider_id == crate::provider::OPENCODE_PROVIDER_ID
-                && contracts.mapping_has_enabled_protocol(&mapping)
-        }
-        Err(_) => false,
-    }
-}
-
-fn application_alias_is_priced(alias: &str, priced: &HashSet<&str>) -> bool {
-    priced.contains(alias)
-        || alias
-            .strip_suffix("-highspeed")
-            .is_some_and(|base| priced.contains(base))
+    else {
+        return Vec::new();
+    };
+    let catalogs = alias::RuntimeCatalogs {
+        go: &scope.catalog.models,
+        ..alias::RuntimeCatalogs::default()
+    };
+    alias::routeable_models_for_with_runtime_catalogs(
+        crate::provider::OPENCODE_PROVIDER_ID,
+        catalogs,
+    )
+    .into_iter()
+    .filter(|name| {
+        alias::resolve_with_runtime_catalogs(name, catalogs).is_ok_and(|resolved| {
+            resolved.routeable_mappings().iter().any(|mapping| {
+                mapping.is_opencode_go() && contracts.mapping_has_enabled_protocol(mapping)
+            })
+        })
+    })
+    .collect()
 }
 
 pub(crate) fn dashboard_summary(
     db: &Database,
     gateway_running: bool,
-    contracts: &EffectiveContractSet,
     decrypt_key: impl Fn(&str) -> Option<String>,
 ) -> Result<DashboardSummary, ObservabilityError> {
     let accounts = db.list_accounts()?;
     let total_accounts = accounts.len();
+    let snapshot = RoutingSnapshot::load(db).map_err(ObservabilityError::Internal)?;
     let now = Utc::now();
     let free_channel_cooling = db.free_channel_cooldown_until()?.is_some();
     let available_accounts = accounts
@@ -179,9 +161,9 @@ pub(crate) fn dashboard_summary(
         .filter(|account| {
             dashboard_account_is_available(
                 account,
+                &snapshot,
                 now,
                 free_channel_cooling,
-                contracts,
                 &decrypt_key,
             )
         })
@@ -197,11 +179,16 @@ pub(crate) fn dashboard_summary(
     })
 }
 
+/// One legacy account row can contribute a production route.
+///
+/// The count uses the same destination, credential, and grant facts as
+/// routing. Being a builtin provider is not required. A stored Key must still
+/// decrypt to a non-empty value; that check does not send a request.
 fn dashboard_account_is_available(
     account: &Account,
+    snapshot: &RoutingSnapshot,
     now: DateTime<Utc>,
     free_channel_cooling: bool,
-    contracts: &EffectiveContractSet,
     decrypt_key: &impl Fn(&str) -> Option<String>,
 ) -> bool {
     let Some(channel) = account_channel(account) else {
@@ -219,23 +206,30 @@ fn dashboard_account_is_available(
         CredentialKind::None => true,
     };
     credential_available
-        && ContractScope::from_account(account)
-            .and_then(|scope| contracts.scope(&scope))
-            .is_some_and(|contract| {
-                contract.catalog_routable
-                    && contract.production_inference
-                    && contract
-                        .models
-                        .values()
-                        .any(|model| model.has_enabled_protocol())
-            })
+        && snapshot.credentials.iter().any(|credential| {
+            credential.id == account.id
+                && snapshot
+                    .projection
+                    .destinations
+                    .iter()
+                    .find(|destination| destination.id == credential.destination_id)
+                    .is_some_and(|destination| {
+                        credential_contributes_production_route(credential, destination)
+                    })
+        })
 }
 
 pub(crate) fn daily_tokens_by_model(
     db: &Database,
     days: Option<i64>,
 ) -> Result<Vec<DailyModelTokens>, ObservabilityError> {
-    db.daily_tokens_by_model(days.unwrap_or(30))
+    let days = days.unwrap_or(30);
+    if days < 1 {
+        return Err(ObservabilityError::InvalidQuery(
+            "days must be at least 1".into(),
+        ));
+    }
+    db.daily_tokens_by_model(days)
         .map_err(ObservabilityError::from)
 }
 
@@ -244,8 +238,20 @@ pub(crate) fn gateway_logs(
     query: GatewayLogReadQuery,
     decrypt_key: impl Fn(&str) -> Option<String>,
 ) -> Result<Vec<GatewayLog>, ObservabilityError> {
-    let mut logs =
-        db.query_gateway_logs(query.limit.unwrap_or(100), query.request_id.as_deref())?;
+    let level = query
+        .level
+        .as_deref()
+        .map(|value| {
+            crate::runtime_log::Level::parse(value)
+                .ok_or_else(|| ObservabilityError::InvalidQuery("invalid log level".into()))
+        })
+        .transpose()?;
+    let mut logs = db.query_gateway_logs_filtered(
+        query.limit.unwrap_or(100),
+        query.request_id.as_deref(),
+        level.map(|level| level.as_str()),
+        query.category.as_deref(),
+    )?;
     let secrets = dashboard_account_secrets(db, decrypt_key)?;
     for log in &mut logs {
         log.message = redact_known_secrets(&log.message, &secrets);
@@ -396,12 +402,34 @@ pub(crate) fn dashboard_account_secrets(
     db: &Database,
     decrypt_key: impl Fn(&str) -> Option<String>,
 ) -> Result<BTreeMap<String, String>, ObservabilityError> {
-    let accounts = db.list_accounts()?;
-    Ok(accounts
+    dashboard_account_secrets_on(&db.conn, decrypt_key)
+}
+
+pub(crate) fn dashboard_account_secrets_on(
+    conn: &rusqlite::Connection,
+    decrypt_key: impl Fn(&str) -> Option<String>,
+) -> Result<BTreeMap<String, String>, ObservabilityError> {
+    let accounts = crate::db::account_store::list_accounts_on(conn)?;
+    let mut secrets: BTreeMap<_, _> = accounts
         .into_iter()
         .filter(|account| !account.key_cipher.is_empty())
         .filter_map(|account| decrypt_key(&account.key_cipher).map(|secret| (account.id, secret)))
-        .collect())
+        .collect();
+    // Include disabled/deleted receiving Keys as well: historical rows can
+    // still contain their values in caller-supplied labels or error text.
+    let mut statement = conn
+        .prepare("SELECT id, key FROM access_keys")
+        .map_err(anyhow::Error::from)?;
+    let keys = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(anyhow::Error::from)?;
+    for key in keys {
+        let (id, value) = key.map_err(anyhow::Error::from)?;
+        secrets.insert(format!("access:{id}"), value);
+    }
+    Ok(secrets)
 }
 
 pub(crate) fn redact_known_secrets(text: &str, secrets: &BTreeMap<String, String>) -> String {

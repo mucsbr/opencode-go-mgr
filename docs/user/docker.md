@@ -2,14 +2,18 @@
 
 # Docker
 
-Open Console Gateway runs headlessly in Docker, serving the same dashboard and gateway
-on port `9042`. Pull the image from GHCR anonymously — it ships `linux/amd64`
-and `linux/arm64`, and Docker picks the right variant. Save the release's
-`compose.example.yaml` as `compose.yaml`, add `.env` if needed, and run the
-commands below. You can also use a checkout of the matching tag.
+Open Console Gateway runs headlessly in Docker, serving the same dashboard and
+gateway on port `9042`. Pull the image from GHCR anonymously — it ships
+`linux/amd64` and `linux/arm64`, and Docker picks the right variant. Save the
+release's `compose.example.yaml` as `compose.yaml`, add `.env` if needed, and
+run the commands below; they pin one release through a `VERSION` shell
+variable, and the pinned value matches the `compose.example.yaml` shipped with
+that release — substitute the latest release when you run them. You can also
+use a checkout of the matching tag.
 
 ```bash
-git clone --branch v2.2.1 --depth 1 https://github.com/klarkxy/open-console-gateway.git
+VERSION=2.7.0
+git clone --branch "v$VERSION" --depth 1 https://github.com/klarkxy/open-console-gateway.git
 cd open-console-gateway
 cp .env.example .env
 # PowerShell: Copy-Item .env.example .env
@@ -24,17 +28,16 @@ Image tags move; decide how pinned you want to be.
 ## Choosing An Image
 
 The source repository is `klarkxy/open-console-gateway`. The published GHCR
-packages retain `ghcr.io/klarkxy/opencode-go-mgr` and
-`ghcr.io/klarkxy/opencode-go-mgr-browser`; renaming the repository does not
-rename those packages. Compose and the container publishing workflow keep
-these existing image names so upgrades continue on the same channels.
+packages are `ghcr.io/klarkxy/opencode-go-mgr` and
+`ghcr.io/klarkxy/opencode-go-mgr-browser`; Compose and the container publishing
+workflow use these image names.
 
 - The checkout's `compose.yaml` defaults to `latest`; the Release
   `compose.example.yaml` pins its matching full version.
 - For repeatable production deployments, set `OCG_IMAGE` in `.env` to a full
-  release tag such as `ghcr.io/klarkxy/opencode-go-mgr:2.2.1`.
+  release tag such as `ghcr.io/klarkxy/opencode-go-mgr:<version>`.
 - Full-version and `sha-<commit>` tags identify one release and are intended
-  not to move; `1.5` and `latest` do. Only a digest such as
+  not to move; `latest` does. Only a digest such as
   `ghcr.io/klarkxy/opencode-go-mgr@sha256:...` is truly immutable.
 - To build the current checkout instead, set `OCG_IMAGE=ocg-manager:local`
   and run `docker compose up -d --build`. `NPM_REGISTRY` and
@@ -47,6 +50,7 @@ these existing image names so upgrades continue on the same channels.
 | `OCG_PORT` | Compose | Host loopback port; the container still listens on `9042`. |
 | `OCG_ADMIN_USERNAME` + `OCG_ADMIN_PASSWORD` | First start | Optional administrator bootstrap; both or neither. |
 | `OCG_CLIENT_ROOT_URL` | Runtime | Read-only external client root override. |
+| `OCG_MAX_REQUEST_BODY_BYTES` | Runtime | Maximum gateway JSON request body size in bytes; defaults to 64 MiB. |
 | `OCG_CPA_BASE_URL` | Compose CPA profile | Read-only CPA sibling URL; leave at `http://cpa:8317`. |
 | `CPA_MANAGEMENT_PASSWORD` | Compose CPA profile | CPA Management API password; keep only in the deployment's `.env`. |
 | `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` / `NO_PROXY` | Runtime | Standard proxy variables used by `Automatic (system / environment)` outbound proxy mode. |
@@ -83,9 +87,9 @@ does not read or copy those files. Back up `cpa-auth` separately from
 configuration and keys. `docker compose down` preserves all three named
 volumes, while `docker compose down -v` permanently deletes them.
 
-Open **Extensions → CPA** after the container is running. Save the same CPA
-inference key from `cpa-config.yaml` and the Management password, run
-the application-level test, and perform OAuth inside CPA. The OCG container
+Open **Extensions → CPA** after the container is running. Save the CPA
+inference key from `cpa-config.yaml` together with the Management password,
+run the application-level test, and perform OAuth inside CPA. The OCG container
 does not start, stop, upgrade, or health-check CPA on your behalf.
 
 ## Optional Remote Browser
@@ -126,15 +130,15 @@ runtime volume, but always stop and back up the two sensitive persistent
 volumes, `ocg-data` and `ocg-browser-profiles`, together.
 
 Google may treat a data-center egress IP as high risk, require additional
-verification, or reject registration/login. Open Console Gateway does not bypass that
-risk control. Complete Google's checks yourself, or use the desktop build on
-a residential connection. Real payment is always an explicit user action on
-the official site.
+verification, or reject registration/login. Open Console Gateway does not
+bypass that risk control. Complete Google's checks yourself, or use the desktop
+build on a residential connection. Real payment is always an explicit user
+action on the official site.
 
 ## Administrator Bootstrap
 
-`OCG_ADMIN_USERNAME` and `OCG_ADMIN_PASSWORD` create the administrator **only
-when the database has no administrator yet**.
+The administrator is created by `OCG_ADMIN_USERNAME` and `OCG_ADMIN_PASSWORD`
+**only when the database has no administrator yet**.
 
 - Both must be set together; setting only one stops startup with an error.
 - Once an administrator exists, later environment changes do not reset it.
@@ -164,6 +168,9 @@ configure the listener, DNS, or reverse proxy. Normally use
 `https://ocg.example.com`, not `/dashboard/` or a concrete API endpoint; a
 trailing `/v1` is accepted.
 
+This covers the deployment encryption key, not the Gateway **Key** clients
+authenticate with. Regenerate the Gateway Key if it leaks.
+
 ## Runtime Behavior
 
 Set `OCG_PORT` in `.env` to change the host port; the container still uses
@@ -189,9 +196,10 @@ port `9042`. Open `http://127.0.0.1:<OCG_PORT>/dashboard/` and sign in. Use
   sandboxes. The sidecar does not use `--no-sandbox` and has 1 GiB of shared
   memory. `ocg-data` and `ocg-browser-profiles` are the two persistent state
   volumes.
-- The startup log contains the Key, so log output and Docker daemon
-  access are sensitive. Configure log rotation on the Docker host if its
-  defaults are not bounded.
+- CLI builds with `status --show-key` hide the Gateway Key in startup logs.
+  Older images may print it, so existing logs and Docker daemon access remain
+  sensitive. Configure log rotation on the Docker host if its defaults are not
+  bounded.
 
 Routine operational checks:
 
@@ -214,20 +222,21 @@ provenance, and a GitHub signed provenance attestation. Inspect and verify a
 release with:
 
 ```bash
-docker buildx imagetools inspect ghcr.io/klarkxy/opencode-go-mgr:2.2.1
-docker buildx imagetools inspect ghcr.io/klarkxy/opencode-go-mgr-browser:2.2.1
+VERSION=2.7.0
+docker buildx imagetools inspect ghcr.io/klarkxy/opencode-go-mgr:$VERSION
+docker buildx imagetools inspect ghcr.io/klarkxy/opencode-go-mgr-browser:$VERSION
 gh attestation verify \
-  oci://ghcr.io/klarkxy/opencode-go-mgr:2.2.1 \
+  oci://ghcr.io/klarkxy/opencode-go-mgr:$VERSION \
   --repo klarkxy/open-console-gateway
 gh attestation verify \
-  oci://ghcr.io/klarkxy/opencode-go-mgr-browser:2.2.1 \
+  oci://ghcr.io/klarkxy/opencode-go-mgr-browser:$VERSION \
   --repo klarkxy/open-console-gateway
 ```
 
-Both `gh attestation verify` commands require an authenticated GitHub CLI. Public pulls are
-anonymous; if the OCI client still requests registry credentials,
-authenticate to `ghcr.io` with a token that can read packages. Provenance
-proves how the artifact was produced.
+Both `gh attestation verify` commands require an authenticated GitHub CLI.
+Public pulls are anonymous; if the OCI client still requests registry
+credentials, authenticate to `ghcr.io` with a token that can read packages.
+Provenance proves how the artifact was produced.
 
 Regenerate the Key if it leaks.
 

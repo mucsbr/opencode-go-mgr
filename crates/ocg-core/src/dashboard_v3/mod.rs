@@ -1,16 +1,15 @@
 //! Dashboard V3 HTTP contract kernel.
 //!
-//! Mounted at `/dashboard/api/v3` beside the retired V2 REST tombstone and the
-//! preserved V2 auth/browser-WebSocket routes. This module owns the shared DTO
-//! / error / CAS envelope, process
+//! Handlers are remounted at `/dashboard/api/v4` (see `dashboard_v4::api_router`).
+//! The `/dashboard/api/v3` prefix is a 410 tombstone. This module owns the
+//! shared DTO / error / CAS envelope, process
 //! generation, public auth/session issuance, connection/settings reads, the settings write path,
 //! access-key lifecycle, the local accounts control plane including connection
 //! verify, local account usage calibration, official Go usage refresh, and
 //! provider-usage reads, the local/Zen provider catalog,
 //! contracts, Zen Free control plane, pricing, the settings proxy diagnostic,
 //! session-protected desktop update check/status/install, read-only
-//! observability, Go/Zen protocol probes, the Claude Desktop three-role model
-//! mapping, the local/native/remote browser runtime, and managed-account Key
+//! observability, Go/Zen protocol probes, the local/native/remote browser runtime, and managed-account Key
 //! verification. Custom model discovery is an authenticated operational probe
 //! (no `expectedRevision`, no revision bump).
 //! `GET /settings/check-update` and `GET /settings/update-status` are reads
@@ -22,28 +21,28 @@
 mod account_model_test;
 mod account_transfer;
 mod account_verify;
-mod accounts;
-mod application_connectors;
+pub(crate) mod accounts;
 mod auth;
 mod browser;
-mod claude_desktop;
 mod command_code_usage_refresh;
 mod connection;
 mod cpa;
 mod custom_discovery;
-mod dynamic_providers;
+pub(crate) mod dynamic_providers;
 mod keys;
 mod managed_key_verify;
-mod model_aliases;
-mod observability;
+pub(crate) mod observability;
+pub(crate) mod platforms;
 mod pricing;
-mod providers;
+pub(crate) mod providers;
 mod proxy_test;
+#[cfg(test)]
+mod receipt_test_support;
 mod settings;
 mod types;
 mod updater;
-mod usage;
-mod usage_refresh;
+pub(crate) mod usage;
+pub(crate) mod usage_refresh;
 
 use axum::extract::{DefaultBodyLimit, FromRequestParts, Query, Request, State};
 use axum::http::StatusCode;
@@ -62,11 +61,13 @@ use crate::state::CoreState;
 pub use managed_key_verify::{
     ManagedKeyVerifyTargetGuard, install_managed_key_verify_target_for_tests,
 };
+pub(crate) use providers::provider_contracts_response;
 #[cfg(debug_assertions)]
 pub use providers::set_zen_models_source_url_override_for_tests;
 pub use proxy_test::PROXY_TEST_TARGET;
 #[cfg(debug_assertions)]
 pub use proxy_test::{ProxyTestTargetGuard, install_proxy_test_target_for_tests};
+pub(crate) use types::ContractEvidenceSource;
 pub use types::{
     Account, AccountAuthScheme, AccountCreate, AccountCredentialKind, AccountCustomConfig,
     AccountCustomConfigUpdate, AccountCustomConfigWrite, AccountExport, AccountExportRequest,
@@ -76,40 +77,38 @@ pub use types::{
     AccountModelCapability, AccountModelCapabilityWrite, AccountModelTestRequest,
     AccountModelTestResponse, AccountMutation, AccountOrder, AccountQuotaScope, AccountSetupStep,
     AccountSetupUpdate, AccountType, AccountUpdate, AccountUpstreamProtocol, AccountUsageUpdate,
-    AccountVerificationStatus, AccountVerify, ApplicationConnectorAction,
-    ApplicationConnectorChange, ApplicationConnectorCommitRequest,
-    ApplicationConnectorCommitResult, ApplicationConnectorItem, ApplicationConnectorPreview,
-    ApplicationConnectorPreviewRequest, ApplicationConnectorStatus, ApplicationConnectors,
-    ApplicationModels, AuthLogin, AuthLogout, AuthRegister, AuthStatus, BrowserCapabilities,
-    BrowserMode, BrowserOpen, BrowserOpenRequest, BrowserTarget, CATALOG_TYPE_NAMES,
-    CapabilitySummary, CardCapabilitySummary, ClaudeDesktopModels, ClaudeDesktopModelsUpdate,
-    ConnectionInfo, ConnectionSubKey, ContractScopeKind, ControlRevision, CpaAccount,
-    CpaAccountDelete, CpaAccountStatusUpdate, CpaAccounts, CpaConnectionReport, CpaIntegration,
-    CpaIntegrationUpdate, CpaModel, CpaModels, CpaOAuthProvider, CpaOAuthSessionDelete,
-    CpaOAuthStart, CpaOAuthStartRequest, CpaOAuthStatus, CpaQuotaReset, CpaRuntime,
-    CpaRuntimeCheck, CpaRuntimeInstall, CpaRuntimeKey, CpaRuntimeKeyCreated, CpaRuntimeKeys,
-    CpaRuntimeLogs, CpaRuntimePhase, CpaTestRequest, CreditBalance, CustomEndpointContract,
+    AccountVerificationStatus, AccountVerify, ApplicationModels, AuthLogin, AuthLogout,
+    AuthRegister, AuthStatus, BrowserCapabilities, BrowserMode, BrowserOpen, BrowserOpenRequest,
+    BrowserTarget, CATALOG_TYPE_NAMES, CapabilitySummary, CardCapabilitySummary, ConnectionInfo,
+    ConnectionSubKey, ContractScopeKind, ControlRevision, CpaAccount, CpaAccountDelete,
+    CpaAccountStatusUpdate, CpaAccounts, CpaConnectionReport, CpaIntegration, CpaIntegrationUpdate,
+    CpaModel, CpaModels, CpaOAuthProvider, CpaOAuthSessionDelete, CpaOAuthStart,
+    CpaOAuthStartRequest, CpaOAuthStatus, CpaQuotaReset, CpaRuntime, CpaRuntimeCheck,
+    CpaRuntimeInstall, CpaRuntimeKey, CpaRuntimeKeyCreated, CpaRuntimeKeys, CpaRuntimeLogs,
+    CpaRuntimePhase, CpaTestRequest, CreditBalance, CustomEndpointContract,
     CustomModelDiscoveryRequest, CustomModelDiscoveryResponse, DailyModelTokens,
     DailyTokensByModel, DailyTokensQuery, DashboardSummary, DesktopUpdate, DesktopUpdatePhase,
-    DynamicProvider, DynamicProviderAuthKind, DynamicProviderCreate,
-    DynamicProviderDiscoverRequest, DynamicProviderDiscoverResponse, DynamicProviderModel,
-    DynamicProviderMutation, DynamicProviderTestRequest, DynamicProviderTestResponse,
-    DynamicProviderUpdate, ERROR_CONFLICT, ERROR_FORBIDDEN, ERROR_GATEWAY_TIMEOUT, ERROR_GONE,
-    ERROR_INTERNAL, ERROR_INVALID_JSON, ERROR_INVALID_REQUEST, ERROR_MISSING_EXPECTED_REVISION,
-    ERROR_NOT_FOUND, ERROR_NOT_IMPLEMENTED, ERROR_OUTBOUND_FAILED, ERROR_PRECONDITION_FAILED,
+    ERROR_BUILTIN_PROVIDER_IMMUTABLE, ERROR_CONFLICT, ERROR_FORBIDDEN, ERROR_GATEWAY_TIMEOUT,
+    ERROR_GONE, ERROR_INTERNAL, ERROR_INVALID_JSON, ERROR_INVALID_REQUEST,
+    ERROR_MISSING_EXPECTED_REVISION, ERROR_NOT_FOUND, ERROR_NOT_IMPLEMENTED,
+    ERROR_OPERATION_PAYLOAD_MISMATCH, ERROR_OUTBOUND_FAILED, ERROR_PRECONDITION_FAILED,
     ERROR_REVISION_CONFLICT, ERROR_SERVICE_UNAVAILABLE, ERROR_THROTTLED, ERROR_UNAUTHORIZED,
     EffectiveCatalog, EffectiveModelContract, EffectiveModelProtocols, EffectiveProtocolEvidence,
     ForwardLog, ForwardLogClientKey, ForwardLogKeys, ForwardLogModels, ForwardLogQuery,
     ForwardLogSummary, ForwardLogs, GatewayLog, GatewayLogQuery, GatewayLogs, GatewayStatus,
-    InstallUpdate, KeyCreate, KeyUpdate, ModelAliasBinding, ModelAliasBindingsUpdate,
-    ModelProtocolOverride, ModelProtocolOverridesUpdate, MutationAck, MutationExpectation,
-    OllamaBillingTier, PricingAdjustment, PricingAvailability, PricingLimits, PricingModel,
-    PricingMultiplierChange, PricingMultiplierWrite, PricingMultipliersUpdate, PricingRefresh,
-    PricingRefreshPolicy, PricingRefreshStatus, PricingRefreshUpdate, PricingRevision,
-    PricingSnapshot, PricingTimeWindow, ProtocolOverrideState, ProtocolProbeRequest,
-    ProtocolProbeResponse, ProtocolProbeResult, ProviderAccountChoice, ProviderCatalog,
-    ProviderCatalogEntry, ProviderCatalogFormField, ProviderCatalogRiskNotice,
-    ProviderContractGroup, ProviderContracts, ProviderModelCapability, ProviderPricing,
+    InstallUpdate, KeyCreate, KeyUpdate, ModelProtocolOverride, ModelProtocolOverridesUpdate,
+    MutationAck, MutationExpectation, OllamaBillingTier, PricingAdjustment, PricingAvailability,
+    PricingLimits, PricingModel, PricingMultiplierChange, PricingMultiplierWrite,
+    PricingMultipliersUpdate, PricingRefresh, PricingRefreshPolicy, PricingRefreshStatus,
+    PricingRefreshUpdate, PricingRevision, PricingSnapshot, PricingTimeWindow,
+    ProtocolOverrideState, ProtocolProbeRequest, ProtocolProbeResponse, ProtocolProbeResult,
+    ProviderAccountChoice, ProviderCatalog, ProviderCatalogEntry, ProviderCatalogFormField,
+    ProviderCatalogPresentation, ProviderCatalogRiskNotice, ProviderContractGroup,
+    ProviderContracts, ProviderDefinition, ProviderDefinitionAuthKind, ProviderDefinitionCreate,
+    ProviderDefinitionDiscoverRequest, ProviderDefinitionDiscoverResponse, ProviderDefinitionModel,
+    ProviderDefinitionMutation, ProviderDefinitionTestRequest, ProviderDefinitionTestResponse,
+    ProviderDefinitionUpdate, ProviderModelAction, ProviderModelCapability,
+    ProviderModelPresentation, ProviderModelUpstreamOverride, ProviderPricing,
     ProviderPricingRefresh, ProviderPricingRefreshUpdate, ProviderUsage, ProxyListDirection,
     ProxyMode, ProxySupportedModel, ProxyTestRequest, ProxyTestResponse, QuotaWindow, RoutingMode,
     Settings, SettingsUpdate, UpdateCheck, UsageAvailability, UsageMutation, UsageRefresh,
@@ -122,6 +121,15 @@ pub use updater::{GITHUB_LATEST_RELEASE_API, GITHUB_LATEST_RELEASE_URL};
 #[cfg(debug_assertions)]
 pub use crate::command_code_usage::{
     CommandCodeUsageTargetGuard, install_command_code_usage_target_for_tests,
+};
+#[cfg(debug_assertions)]
+pub use crate::plan_usage::{PlanUsageTargetGuard, install_plan_usage_target_for_tests};
+
+pub use crate::official_protocols::OfficialProtocolBaseline;
+#[cfg(debug_assertions)]
+pub use crate::official_protocols::{
+    OfficialProtocolFetchGuard, install_official_protocol_fetch_for_tests,
+    install_official_protocol_fetch_unavailable_for_tests,
 };
 #[cfg(debug_assertions)]
 pub use account_verify::{CustomVerifyProbeGuard, install_custom_verify_probe_for_tests};
@@ -156,7 +164,19 @@ pub fn api_router(state: CoreState) -> Router<CoreState> {
         ))
         .layer(middleware::map_response(account_transfer::add_no_store));
     let protected = Router::new()
-        .route("/contract", get(get_contract))
+        .route(
+            "/platform-accounts",
+            get(platforms::list).post(platforms::create),
+        )
+        .route(
+            "/platform-accounts/{id}",
+            put(platforms::update).delete(platforms::delete),
+        )
+        .route("/platform-accounts/{id}/refresh", post(platforms::refresh))
+        .route(
+            "/accounts/{id}/platform-link",
+            put(platforms::link).delete(platforms::unlink),
+        )
         .route("/connection", get(connection::get_connection))
         .route(
             "/external-integrations/cpa",
@@ -246,42 +266,13 @@ pub fn api_router(state: CoreState) -> Router<CoreState> {
             delete(cpa::delete_runtime_key),
         )
         .route(
-            "/applications/connectors",
-            get(application_connectors::list_connectors),
-        )
-        .route(
-            "/applications/connectors/{id}/preview",
-            post(application_connectors::preview_connector),
-        )
-        .route(
-            "/applications/connectors/{id}/commit",
-            post(application_connectors::commit_connector),
-        )
-        .route(
             "/settings",
             get(settings::get_settings).put(settings::put_settings),
         )
         .route("/settings/test-proxy", post(proxy_test::test_proxy))
-        .route(
-            "/claude-desktop/models",
-            get(claude_desktop::get_claude_desktop_models)
-                .put(claude_desktop::put_claude_desktop_models),
-        )
         .route("/settings/check-update", get(updater::check_update))
         .route("/settings/update-status", get(updater::get_update_status))
         .route("/settings/install-update", post(updater::install_update))
-        .route(
-            "/providers/{provider_id}/pricing/refresh",
-            post(pricing::refresh_provider_pricing),
-        )
-        .route(
-            "/providers/{provider_id}/pricing/multipliers",
-            put(pricing::put_pricing_multipliers),
-        )
-        .route(
-            "/providers/{provider_id}/pricing",
-            get(pricing::get_provider_pricing),
-        )
         .route(
             "/keys/primary/regenerate",
             post(keys::regenerate_primary_key),
@@ -292,10 +283,8 @@ pub fn api_router(state: CoreState) -> Router<CoreState> {
             patch(keys::update_key).delete(keys::delete_key),
         )
         .route("/keys/{id}/regenerate", post(keys::regenerate_key))
-        .route(
-            "/accounts",
-            get(accounts::list_accounts).post(accounts::create_account),
-        )
+        .route("/account-records", get(accounts::list_accounts))
+        .route("/accounts", post(accounts::create_account))
         .route("/accounts/managed", post(accounts::create_managed_account))
         .route("/accounts/order", put(accounts::reorder_accounts))
         .route(
@@ -393,10 +382,6 @@ pub fn api_router(state: CoreState) -> Router<CoreState> {
             get(providers::get_provider_contracts),
         )
         .route(
-            "/model-alias-bindings",
-            put(model_aliases::put_model_alias_bindings),
-        )
-        .route(
             "/provider-contracts/{scope_kind}/{scope_id}/catalog/refresh",
             post(providers::refresh_contract_catalog),
         )
@@ -480,13 +465,22 @@ where
     }
 }
 
-struct V3ApiError {
+#[derive(Debug, Clone)]
+pub(crate) struct V3ApiError {
     status: StatusCode,
     body: V3Error,
 }
 
 impl V3ApiError {
-    fn unauthorized() -> Self {
+    pub(crate) fn envelope(&self) -> &V3Error {
+        &self.body
+    }
+
+    pub(crate) fn operation_reason(&self) -> &str {
+        &self.body.code
+    }
+
+    pub(crate) fn unauthorized() -> Self {
         Self {
             status: StatusCode::UNAUTHORIZED,
             body: V3Error::unauthorized(),
@@ -519,17 +513,28 @@ impl V3ApiError {
         }
     }
 
-    fn revision_conflict(state: &CoreState) -> Self {
+    pub(crate) fn revision_conflict(state: &CoreState) -> Self {
         Self {
             status: StatusCode::CONFLICT,
             body: V3Error::revision_conflict(state.settings_revision(), state.process_generation()),
         }
     }
 
-    fn invalid_request_at(state: &CoreState, message: impl Into<String>) -> Self {
+    pub(crate) fn invalid_request_at(state: &CoreState, message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::BAD_REQUEST,
             body: V3Error::invalid_request_at(
+                message,
+                state.settings_revision(),
+                state.process_generation(),
+            ),
+        }
+    }
+
+    fn builtin_provider_immutable(state: &CoreState, message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            body: V3Error::builtin_provider_immutable(
                 message,
                 state.settings_revision(),
                 state.process_generation(),
@@ -541,7 +546,7 @@ impl V3ApiError {
         Self::not_found_at(state, "account not found")
     }
 
-    fn not_found_at(state: &CoreState, message: impl Into<String>) -> Self {
+    pub(crate) fn not_found_at(state: &CoreState, message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::NOT_FOUND,
             body: V3Error::not_found(
@@ -552,7 +557,7 @@ impl V3ApiError {
         }
     }
 
-    fn outbound_failed(state: &CoreState, message: impl Into<String>) -> Self {
+    pub(crate) fn outbound_failed(state: &CoreState, message: impl Into<String>) -> Self {
         Self::outbound_failed_at(
             state.settings_revision(),
             state.process_generation(),
@@ -576,7 +581,19 @@ impl V3ApiError {
         }
     }
 
-    fn conflict_at(state: &CoreState, message: impl Into<String>) -> Self {
+    pub(crate) fn throttled_at(state: &CoreState, message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            body: V3Error {
+                code: ERROR_THROTTLED.into(),
+                message: message.into(),
+                current_revision: Some(state.settings_revision()),
+                process_generation: Some(state.process_generation()),
+            },
+        }
+    }
+
+    pub(crate) fn conflict_at(state: &CoreState, message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::CONFLICT,
             body: V3Error::conflict(
@@ -587,7 +604,21 @@ impl V3ApiError {
         }
     }
 
-    fn precondition_failed_at(state: &CoreState, message: impl Into<String>) -> Self {
+    pub(crate) fn operation_payload_mismatch(
+        state: &CoreState,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            status: StatusCode::CONFLICT,
+            body: V3Error::operation_payload_mismatch(
+                message,
+                state.settings_revision(),
+                state.process_generation(),
+            ),
+        }
+    }
+
+    pub(crate) fn precondition_failed_at(state: &CoreState, message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::PRECONDITION_FAILED,
             body: V3Error::precondition_failed(
@@ -653,11 +684,18 @@ impl V3ApiError {
         }
     }
 
-    fn internal(message: impl std::fmt::Display) -> Self {
+    pub(crate) fn internal(message: impl std::fmt::Display) -> Self {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             body: V3Error::internal(message.to_string()),
         }
+    }
+
+    pub(crate) fn internal_at(state: &CoreState, message: impl std::fmt::Display) -> Self {
+        let mut error = Self::internal(message);
+        error.body.current_revision = Some(state.settings_revision());
+        error.body.process_generation = Some(state.process_generation());
+        error
     }
 }
 
@@ -667,7 +705,11 @@ impl IntoResponse for V3ApiError {
     }
 }
 
-async fn require_v3_session(State(state): State<CoreState>, req: Request, next: Next) -> Response {
+pub(crate) async fn require_v3_session(
+    State(state): State<CoreState>,
+    req: Request,
+    next: Next,
+) -> Response {
     let authorized = {
         let current = state.dashboard_session_token.lock();
         dashboard_session::is_authorized(
@@ -683,13 +725,9 @@ async fn require_v3_session(State(state): State<CoreState>, req: Request, next: 
     }
 }
 
-async fn get_contract(State(state): State<CoreState>) -> Json<ControlRevision> {
-    Json(ControlRevision::from_state(&state))
-}
-
 /// Shared mutation-body parser: missing `expectedRevision` is a dedicated
 /// 400; anything else that is not valid JSON for `T` is `invalidJson`.
-fn parse_mutation_json<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, V3ApiError> {
+pub(crate) fn parse_mutation_json<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, V3ApiError> {
     let value: Value = serde_json::from_slice(bytes).map_err(|_| V3ApiError::invalid_json())?;
     let Some(object) = value.as_object() else {
         return Err(V3ApiError::invalid_json());
@@ -703,7 +741,7 @@ fn parse_mutation_json<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, V3ApiErro
 /// Operational-body parser. Unknown fields and malformed JSON are
 /// `invalidJson`. Unlike [`parse_mutation_json`], this does not require
 /// `expectedRevision`.
-fn parse_json<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, V3ApiError> {
+pub(crate) fn parse_json<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, V3ApiError> {
     let value: Value = serde_json::from_slice(bytes).map_err(|_| V3ApiError::invalid_json())?;
     if !value.is_object() {
         return Err(V3ApiError::invalid_json());
@@ -711,26 +749,13 @@ fn parse_json<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, V3ApiError> {
     serde_json::from_value(value).map_err(|_| V3ApiError::invalid_json())
 }
 
-fn check_expectation(
+pub(crate) fn check_expectation(
     state: &CoreState,
     expectation: &MutationExpectation,
 ) -> Result<(), V3ApiError> {
     if expectation.expected_revision != state.settings_revision()
         || expectation.process_generation != state.process_generation()
     {
-        Err(V3ApiError::revision_conflict(state))
-    } else {
-        Ok(())
-    }
-}
-
-fn check_pricing_expectation(
-    state: &CoreState,
-    expectation: &MutationExpectation,
-    expected_pricing_revision: &str,
-) -> Result<(), V3ApiError> {
-    check_expectation(state, expectation)?;
-    if expected_pricing_revision != state.pricing_snapshot().revision {
         Err(V3ApiError::revision_conflict(state))
     } else {
         Ok(())

@@ -1,63 +1,26 @@
 use super::*;
 use crate::alias::{self, ResolvedModel, RuntimeCatalogs};
 use crate::crypto::{KeyCipher, StaticKeyCipher};
-use crate::custom::CustomAccountRuntime;
-use crate::gateway::protocol::{ApiFormat, parse_client_request};
-use crate::gateway::provider_adapter::install_goat_loopback_route_for_test;
-use crate::goat::GoatAccountRuntime;
-use crate::models::{
-    Account, AccountCustomConfig, AccountModelCapability, AccountSetupStep, AccountType, AppConfig,
+use crate::gateway::protocol::{
+    ApiFormat, is_known_model, materialize_parsed_request, parse_client_request,
 };
+use crate::models::{Account, AccountSetupStep, AccountType, AppConfig, UpstreamChannel};
 use crate::provider::{
-    COMMAND_CODE_GOAT_DEEPSEEK_V4_FLASH_ALIAS, COMMAND_CODE_GOAT_DEEPSEEK_V4_FLASH_UPSTREAM,
-    COMMAND_CODE_PROVIDER_ID, CPA_ACCOUNT_ID, CPA_PROVIDER_ID, CUSTOM_PROVIDER_ID,
-    ConnectionVerificationStatus, CredentialKind, OPENCODE_PROVIDER_ID,
-    OPENCODE_ZEN_FREE_PROVIDER_ID, ProviderAdapterKind, QuotaScope, UpstreamProtocolKind,
-    ZEN_FREE_ACCOUNT_ID, ZEN_FREE_ACCOUNT_NAME,
+    CUSTOM_PROVIDER_ID, CredentialKind, KIMI_PROVIDER_ID, MINIMAX_PROVIDER_ID,
+    OPENCODE_PROVIDER_ID, OPENCODE_ZEN_FREE_PROVIDER_ID, QuotaScope, UpstreamProtocolKind,
 };
+use crate::routing_snapshot::{ExecutionCredential, RoutingSnapshot};
+use bytes::Bytes;
 use chrono::Utc;
+use ocg_domain::connection::{LegacyConnectionKind, connection_id_for_legacy};
+use ocg_domain::credential::ModelScope;
+use ocg_domain::destination::{
+    AdapterKind, AuthScheme, CatalogModel, Destination, LegacyDestinationRef, ModelResolution,
+    destination_id_for_builtin, destination_id_for_custom_account,
+    destination_id_for_platform_account, sealed_capabilities,
+};
 use serde_json::json;
 use std::sync::Arc;
-
-const NO_IDS: &[String] = &[];
-
-fn catalogs<'a>(
-    zen_free: &'a [String],
-    custom: &'a [String],
-    command_code: &'a [String],
-) -> RuntimeCatalogs<'a> {
-    RuntimeCatalogs {
-        go: NO_IDS,
-        zen_free,
-        custom,
-        command_code,
-        minimax: NO_IDS,
-        kimi: NO_IDS,
-        cpa: NO_IDS,
-        ollama: NO_IDS,
-        ollama_pinned: NO_IDS,
-        user_aliases: &[],
-        extra: &[],
-    }
-}
-
-fn resolve_with_custom(requested: &str, custom_model_ids: &[String]) -> ResolvedModel {
-    alias::resolve_with_runtime_catalogs(requested, catalogs(NO_IDS, custom_model_ids, NO_IDS))
-        .unwrap()
-}
-
-fn resolve_with_catalogs(
-    requested: &str,
-    zen_free_models: &[String],
-    custom_model_ids: &[String],
-    goat_model_ids: &[String],
-) -> ResolvedModel {
-    alias::resolve_with_runtime_catalogs(
-        requested,
-        catalogs(zen_free_models, custom_model_ids, goat_model_ids),
-    )
-    .unwrap()
-}
 
 fn chat_body(model: &str) -> Bytes {
     Bytes::from(
@@ -107,541 +70,8 @@ fn account(
     }
 }
 
-fn go_account(id: &str) -> Account {
-    account(
-        id,
-        OPENCODE_PROVIDER_ID,
-        CredentialKind::ApiKey,
-        QuotaScope::Key,
-    )
-}
-
-fn zen_account() -> Account {
-    let mut item = account(
-        ZEN_FREE_ACCOUNT_ID,
-        OPENCODE_ZEN_FREE_PROVIDER_ID,
-        CredentialKind::None,
-        QuotaScope::EgressIp,
-    );
-    item.name = ZEN_FREE_ACCOUNT_NAME.into();
-    item
-}
-
-fn cpa_account() -> Account {
-    account(
-        CPA_ACCOUNT_ID,
-        CPA_PROVIDER_ID,
-        CredentialKind::ApiKey,
-        QuotaScope::Key,
-    )
-}
-
-fn goat_runtime(id: &str, _models: &[&str]) -> GoatAccountRuntime {
-    GoatAccountRuntime {
-        account_id: id.into(),
-        enabled: true,
-        verification_status: ConnectionVerificationStatus::Verified,
-        setup_ready: true,
-        has_key: true,
-    }
-}
-
-fn goat_runtimes(
-    id: &str,
-    models: &[&str],
-) -> std::collections::HashMap<String, GoatAccountRuntime> {
-    let mut runtimes = std::collections::HashMap::new();
-    runtimes.insert(id.to_string(), goat_runtime(id, models));
-    runtimes
-}
-
-fn goat_account(id: &str) -> Account {
-    account(
-        id,
-        COMMAND_CODE_PROVIDER_ID,
-        CredentialKind::ApiKey,
-        QuotaScope::Key,
-    )
-}
-
-fn static_contracts() -> crate::provider_contracts::EffectiveContractSet {
-    contracts_for(&[])
-}
-
-fn goat_contracts(models: &[&str]) -> crate::provider_contracts::EffectiveContractSet {
-    let now = Utc::now();
-    let scope = crate::provider_contracts::ContractScope::provider(COMMAND_CODE_PROVIDER_ID);
-    let mut persisted = crate::provider_contracts::PersistedContracts::default();
-    persisted.scopes.insert(
-        scope.clone(),
-        crate::provider_contracts::PersistedScopeRow {
-            scope,
-            catalog_models: models.iter().map(|model| (*model).to_string()).collect(),
-            catalog_refreshed_at: Some(now),
-            catalog_source: crate::provider_contracts::CATALOG_SOURCE_COMMAND_CODE_MODELS.into(),
-            catalog_source_url: crate::provider::COMMAND_CODE_GOAT_BASE_URL.into(),
-            revision: 1,
-            updated_at: now,
-        },
-    );
-    persisted.overrides.insert(
-        crate::provider_contracts::ContractScope::provider(COMMAND_CODE_PROVIDER_ID),
-        models
-            .iter()
-            .map(
-                |model| crate::provider_contracts::PersistedModelProtocolOverride {
-                    scope: crate::provider_contracts::ContractScope::provider(
-                        COMMAND_CODE_PROVIDER_ID,
-                    ),
-                    model_id: (*model).to_string(),
-                    protocol: if ocg_domain::protocol::command_code_is_anthropic_model(model) {
-                        crate::provider::UpstreamProtocolKind::Messages
-                    } else {
-                        crate::provider::UpstreamProtocolKind::ChatCompletions
-                    },
-                    state: crate::provider_contracts::ProtocolOverrideState::ForceOn,
-                    updated_at: now,
-                },
-            )
-            .collect(),
-    );
-    crate::provider_contracts::build_effective_contracts(
-        &crate::zen_models::ZenFreeModelCatalog::default(),
-        &[],
-        persisted,
-    )
-}
-
-fn contracts_for(
-    runtimes: &[CustomAccountRuntime],
-) -> crate::provider_contracts::EffectiveContractSet {
-    crate::provider_contracts::build_effective_contracts(
-        &crate::zen_models::ZenFreeModelCatalog::default(),
-        runtimes,
-        crate::provider_contracts::PersistedContracts::default(),
-    )
-}
-
-fn routes_for(
-    model: &str,
-    accounts: &[Account],
-    config: &AppConfig,
-    free_available: bool,
-) -> MaterializedRouteSet {
-    routes_for_with_contracts(model, accounts, config, free_available, &static_contracts())
-}
-
-fn routes_for_with_contracts(
-    model: &str,
-    accounts: &[Account],
-    config: &AppConfig,
-    free_available: bool,
-    contracts: &crate::provider_contracts::EffectiveContractSet,
-) -> MaterializedRouteSet {
-    let body = chat_body(model);
-    let parsed = parse_client_request(ApiFormat::ChatCompletions, body.clone()).unwrap();
-    let resolved = alias::resolve(model).unwrap();
-    materialize_account_routes(
-        accounts,
-        config,
-        &parsed,
-        &resolved,
-        &parsed.requested_model,
-        model,
-        &body,
-        free_available,
-        &std::collections::HashMap::new(),
-        &std::collections::HashMap::new(),
-        None,
-        contracts,
-        &[],
-    )
-    .unwrap()
-}
-
 #[test]
-fn go_alias_materializes_opencode_go_candidates() {
-    let config = AppConfig::default();
-    let set = routes_for(
-        "glm-5.2",
-        &[go_account("go-1"), zen_account()],
-        &config,
-        true,
-    );
-    assert_eq!(set.routes.len(), 1);
-    assert_eq!(set.routes[0].routing.account.id, "go-1");
-    assert_eq!(set.routes[0].plan.model, "glm-5.2");
-    assert_eq!(set.routes[0].plan.client_model, "glm-5.2");
-    assert_eq!(set.routes[0].plan.channel, UpstreamChannel::Go);
-    assert!(!set.free_only);
-    let identity = native_log_identity(&set.routes[0].plan);
-    assert_eq!(identity.requested_model, "glm-5.2");
-    assert_eq!(identity.resolved_alias.as_deref(), Some("glm-5.2"));
-    assert_eq!(identity.upstream_model, "glm-5.2");
-}
-
-#[test]
-fn unknown_cpa_raw_model_defaults_to_chat_and_uses_local_base() {
-    let model = "vendor/cpa-new-model";
-    let cpa_models = vec![model.to_string()];
-    let resolved = alias::resolve_with_runtime_catalogs(
-        model,
-        alias::RuntimeCatalogs {
-            cpa: &cpa_models,
-            ..alias::RuntimeCatalogs::default()
-        },
-    )
-    .unwrap();
-    let body = chat_body(model);
-    let parsed = parse_client_request(ApiFormat::ChatCompletions, body.clone()).unwrap();
-    let set = materialize_account_routes(
-        &[cpa_account()],
-        &AppConfig::default(),
-        &parsed,
-        &resolved,
-        model,
-        model,
-        &body,
-        true,
-        &std::collections::HashMap::new(),
-        &std::collections::HashMap::new(),
-        Some(crate::cpa::DEFAULT_CPA_BASE_URL),
-        &static_contracts(),
-        &[],
-    )
-    .unwrap();
-    assert_eq!(set.routes.len(), 1);
-    assert_eq!(set.routes[0].plan.upstream, ApiFormat::ChatCompletions);
-    assert_eq!(
-        set.routes[0].plan.upstream_base_override.as_deref(),
-        Some(crate::cpa::DEFAULT_CPA_BASE_URL)
-    );
-}
-
-#[test]
-fn mixed_case_go_alias_preserves_requested_casing() {
-    let config = AppConfig::default();
-    let set = routes_for("MiniMax-M3", &[go_account("go-1")], &config, true);
-    assert_eq!(set.routes[0].plan.model, "MiniMax-M3");
-    assert_eq!(set.routes[0].plan.client_model, "MiniMax-M3");
-    assert_eq!(set.routes[0].plan.upstream, ApiFormat::Messages);
-    let identity = native_log_identity(&set.routes[0].plan);
-    assert_eq!(identity.requested_model, "MiniMax-M3");
-    assert_eq!(identity.resolved_alias.as_deref(), Some("minimax-m3"));
-    assert_eq!(identity.upstream_model, "MiniMax-M3");
-}
-
-#[test]
-fn zen_free_alias_materializes_anonymous_channel() {
-    let config = AppConfig::default();
-    let set = routes_for(
-        "mimo-v2.5-free",
-        &[go_account("go-1"), zen_account()],
-        &config,
-        true,
-    );
-    assert!(set.free_only);
-    assert_eq!(set.routes.len(), 1);
-    assert_eq!(set.routes[0].routing.account.id, ZEN_FREE_ACCOUNT_ID);
-    assert_eq!(set.routes[0].plan.channel, UpstreamChannel::Free);
-    assert_eq!(set.routes[0].plan.model, "mimo-v2.5-free");
-    assert!(set.routes[0].plan.upstream_base_override.is_some());
-}
-
-#[test]
-fn shared_alias_builds_go_and_free_candidates_in_account_order() {
-    let config = AppConfig::default();
-    let set = routes_for(
-        "mimo-v2.5",
-        &[go_account("go-1"), zen_account()],
-        &config,
-        true,
-    );
-    assert_eq!(set.routes.len(), 2);
-    assert_eq!(set.routes[0].routing.account.id, "go-1");
-    assert_eq!(set.routes[0].plan.channel, UpstreamChannel::Go);
-    assert_eq!(set.routes[1].routing.account.id, ZEN_FREE_ACCOUNT_ID);
-    assert_eq!(set.routes[1].plan.channel, UpstreamChannel::Free);
-    assert_eq!(set.routes[1].plan.model, "mimo-v2.5-free");
-    assert_eq!(set.routes[1].plan.client_model, "mimo-v2.5");
-    assert!(set.routes[1].plan.original_model.is_none());
-    assert!(!set.routes[1].plan.allow_go_fallback);
-    let free_identity = native_log_identity(&set.routes[1].plan);
-    assert_eq!(free_identity.requested_model, "mimo-v2.5");
-    assert_eq!(free_identity.resolved_alias.as_deref(), Some("mimo-v2.5"));
-    assert_eq!(free_identity.upstream_model, "mimo-v2.5-free");
-}
-
-#[test]
-fn pinned_raw_stays_pinned_to_its_provider() {
-    let config = AppConfig::default();
-    let body = chat_body("vendor.gadget-v1");
-    let parsed = parse_client_request(ApiFormat::ChatCompletions, body.clone()).unwrap();
-    let resolved = ResolvedModel::PinnedRaw {
-        requested: "vendor.gadget-v1".into(),
-        mapping: crate::alias::ProviderMapping {
-            provider_id: OPENCODE_PROVIDER_ID.to_string(),
-
-            upstream_model: "deepseek-v4-flash".into(),
-            routeable: true,
-        },
-    };
-    let set = materialize_account_routes(
-        &[go_account("go-1"), zen_account()],
-        &config,
-        &parsed,
-        &resolved,
-        "vendor.gadget-v1",
-        "vendor.gadget-v1",
-        &body,
-        true,
-        &std::collections::HashMap::new(),
-        &std::collections::HashMap::new(),
-        None,
-        &static_contracts(),
-        &[],
-    )
-    .unwrap();
-    assert_eq!(set.routes.len(), 1);
-    assert_eq!(set.routes[0].routing.account.id, "go-1");
-    assert_eq!(set.routes[0].plan.channel, UpstreamChannel::Go);
-    assert_eq!(set.routes[0].plan.model, "deepseek-v4-flash");
-    assert_eq!(set.routes[0].plan.client_model, "vendor.gadget-v1");
-    assert!(!set.routes[0].plan.allow_go_fallback);
-    assert!(set.routes[0].plan.original_model.is_none());
-    let identity = native_log_identity(&set.routes[0].plan);
-    assert_eq!(identity.requested_model, "vendor.gadget-v1");
-    assert_eq!(
-        identity.resolved_alias.as_deref(),
-        Some("deepseek-v4-flash")
-    );
-    assert_eq!(identity.upstream_model, "deepseek-v4-flash");
-}
-
-#[test]
-fn mapping_plans_follow_registry_order_while_candidates_keep_account_order() {
-    let config = AppConfig::default();
-    let body = chat_body("widget");
-    let parsed = parse_client_request(ApiFormat::ChatCompletions, body.clone()).unwrap();
-    let resolved = ResolvedModel::Alias {
-        requested: "widget".into(),
-        alias: "widget".into(),
-        mappings: vec![
-            crate::alias::ProviderMapping {
-                provider_id: OPENCODE_ZEN_FREE_PROVIDER_ID.to_string(),
-
-                upstream_model: "mimo-v2.5-free".into(),
-                routeable: true,
-            },
-            crate::alias::ProviderMapping {
-                provider_id: OPENCODE_PROVIDER_ID.to_string(),
-
-                upstream_model: "glm-5.2".into(),
-                routeable: true,
-            },
-        ],
-    };
-    let set = materialize_account_routes(
-        &[go_account("go-1"), zen_account()],
-        &config,
-        &parsed,
-        &resolved,
-        "widget",
-        "widget",
-        &body,
-        true,
-        &std::collections::HashMap::new(),
-        &std::collections::HashMap::new(),
-        None,
-        &static_contracts(),
-        &[],
-    )
-    .unwrap();
-    assert_eq!(set.routes.len(), 2);
-    assert_eq!(set.routes[0].routing.account.id, "go-1");
-    assert_eq!(set.routes[0].plan.channel, UpstreamChannel::Go);
-    assert_eq!(set.routes[0].plan.model, "glm-5.2");
-    assert_eq!(set.routes[1].routing.account.id, ZEN_FREE_ACCOUNT_ID);
-    assert_eq!(set.routes[1].plan.channel, UpstreamChannel::Free);
-    assert_eq!(set.routes[1].plan.model, "mimo-v2.5-free");
-}
-
-#[test]
-fn pinned_raw_unverified_goat_is_fail_closed_through_adapter() {
-    let config = AppConfig::default();
-    let body = chat_body(COMMAND_CODE_GOAT_DEEPSEEK_V4_FLASH_UPSTREAM);
-    let parsed = parse_client_request(ApiFormat::ChatCompletions, body.clone()).unwrap();
-    let resolved = ResolvedModel::PinnedRaw {
-        requested: COMMAND_CODE_GOAT_DEEPSEEK_V4_FLASH_UPSTREAM.into(),
-        mapping: crate::alias::ProviderMapping {
-            provider_id: COMMAND_CODE_PROVIDER_ID.to_string(),
-
-            upstream_model: COMMAND_CODE_GOAT_DEEPSEEK_V4_FLASH_UPSTREAM.into(),
-            routeable: true,
-        },
-    };
-    let set = materialize_account_routes(
-        &[goat_account("goat-1"), go_account("go-1")],
-        &config,
-        &parsed,
-        &resolved,
-        COMMAND_CODE_GOAT_DEEPSEEK_V4_FLASH_UPSTREAM,
-        COMMAND_CODE_GOAT_DEEPSEEK_V4_FLASH_UPSTREAM,
-        &body,
-        true,
-        &std::collections::HashMap::new(),
-        &std::collections::HashMap::new(),
-        None,
-        &goat_contracts(&[COMMAND_CODE_GOAT_DEEPSEEK_V4_FLASH_UPSTREAM]),
-        &[],
-    )
-    .unwrap();
-    assert!(set.routes.is_empty());
-    assert!(set.incompatibility.as_deref().is_some_and(|message| {
-        message.contains("not verified")
-            || message.contains("disabled")
-            || message.contains("unsupported")
-    }));
-}
-
-#[test]
-fn goat_without_loopback_is_fail_closed() {
-    let config = AppConfig::default();
-    let set = routes_for(
-        "glm-5.2",
-        &[goat_account("goat-1"), go_account("go-1")],
-        &config,
-        true,
-    );
-    assert_eq!(set.routes.len(), 1);
-    assert_eq!(set.routes[0].routing.account.id, "go-1");
-}
-
-#[test]
-fn goat_alias_does_not_steal_go_requests_even_with_loopback() {
-    let config = AppConfig::default();
-    let goat = goat_account("goat-loop-alias");
-    let _guard =
-        install_goat_loopback_route_for_test(goat.id.clone(), "http://127.0.0.1:9").unwrap();
-    let set = routes_for(
-        COMMAND_CODE_GOAT_DEEPSEEK_V4_FLASH_ALIAS,
-        &[goat, go_account("go-1")],
-        &config,
-        true,
-    );
-    assert_eq!(set.routes.len(), 1);
-    assert_eq!(set.routes[0].routing.account.id, "go-1");
-    assert_eq!(
-        set.routes[0].plan.model,
-        COMMAND_CODE_GOAT_DEEPSEEK_V4_FLASH_ALIAS
-    );
-    assert_eq!(set.routes[0].plan.upstream, ApiFormat::ChatCompletions);
-}
-
-#[test]
-fn goat_slash_raw_pins_through_loopback_as_chat() {
-    let config = AppConfig::default();
-    let goat = goat_account("goat-loop-raw");
-    let _guard =
-        install_goat_loopback_route_for_test(goat.id.clone(), "http://127.0.0.1:9").unwrap();
-    let body = chat_body(COMMAND_CODE_GOAT_DEEPSEEK_V4_FLASH_UPSTREAM);
-    let parsed = parse_client_request(ApiFormat::ChatCompletions, body.clone()).unwrap();
-    let resolved = resolve_with_catalogs(
-        COMMAND_CODE_GOAT_DEEPSEEK_V4_FLASH_UPSTREAM,
-        &[],
-        &[],
-        &[COMMAND_CODE_GOAT_DEEPSEEK_V4_FLASH_UPSTREAM.into()],
-    );
-    let set = materialize_account_routes(
-        &[goat, go_account("go-1")],
-        &config,
-        &parsed,
-        &resolved,
-        COMMAND_CODE_GOAT_DEEPSEEK_V4_FLASH_UPSTREAM,
-        COMMAND_CODE_GOAT_DEEPSEEK_V4_FLASH_UPSTREAM,
-        &body,
-        true,
-        &std::collections::HashMap::new(),
-        &goat_runtimes(
-            "goat-loop-raw",
-            &[COMMAND_CODE_GOAT_DEEPSEEK_V4_FLASH_UPSTREAM],
-        ),
-        None,
-        &goat_contracts(&[COMMAND_CODE_GOAT_DEEPSEEK_V4_FLASH_UPSTREAM]),
-        &[],
-    )
-    .unwrap();
-    assert_eq!(set.routes.len(), 1);
-    assert_eq!(set.routes[0].routing.account.id, "goat-loop-raw");
-    assert_eq!(
-        set.routes[0].plan.model,
-        COMMAND_CODE_GOAT_DEEPSEEK_V4_FLASH_UPSTREAM
-    );
-    assert_eq!(set.routes[0].plan.upstream, ApiFormat::ChatCompletions);
-    assert_eq!(
-        set.routes[0].plan.client_model,
-        COMMAND_CODE_GOAT_DEEPSEEK_V4_FLASH_UPSTREAM
-    );
-}
-
-#[test]
-fn goat_anthropic_alias_uses_messages_and_converts_client_responses() {
-    let config = AppConfig::default();
-    let goat = goat_account("goat-claude");
-    let runtimes = goat_runtimes("goat-claude", &["claude-sonnet-4-6"]);
-    let body = Bytes::from(
-        serde_json::to_vec(&json!({
-            "model": "claude-sonnet-4-6",
-            "input": [{"role": "user", "content": "hi"}],
-            "store": false
-        }))
-        .unwrap(),
-    );
-    let parsed = parse_client_request(ApiFormat::Responses, body.clone()).unwrap();
-    let resolved =
-        resolve_with_catalogs("claude-sonnet-4-6", &[], &[], &["claude-sonnet-4-6".into()]);
-    let set = materialize_account_routes(
-        &[goat],
-        &config,
-        &parsed,
-        &resolved,
-        "claude-sonnet-4-6",
-        "claude-sonnet-4-6",
-        &body,
-        true,
-        &std::collections::HashMap::new(),
-        &runtimes,
-        None,
-        &goat_contracts(&["claude-sonnet-4-6"]),
-        &[],
-    )
-    .unwrap();
-    assert_eq!(set.routes.len(), 1);
-    assert_eq!(set.routes[0].plan.client, ApiFormat::Responses);
-    assert_eq!(set.routes[0].plan.upstream, ApiFormat::Messages);
-    assert_eq!(set.routes[0].plan.model, "claude-sonnet-4-6");
-}
-
-#[test]
-fn goat_slash_raw_without_loopback_is_fail_closed() {
-    let config = AppConfig::default();
-    let set = routes_for_with_contracts(
-        COMMAND_CODE_GOAT_DEEPSEEK_V4_FLASH_UPSTREAM,
-        &[goat_account("goat-1"), go_account("go-1")],
-        &config,
-        true,
-        &goat_contracts(&[COMMAND_CODE_GOAT_DEEPSEEK_V4_FLASH_UPSTREAM]),
-    );
-    assert!(set.routes.is_empty());
-    assert!(set.incompatibility.as_deref().is_some_and(|message| {
-        message.contains("not verified")
-            || message.contains("disabled")
-            || message.contains("unsupported")
-    }));
-}
-
-#[test]
-fn resolve_error_exposes_ambiguous_code() {
+fn r01_ambiguous_raw_model_id_fails_closed_without_outbound() {
     let error = protocol_error_from_resolve(crate::alias::ResolveError::Ambiguous {
         requested: "shared-raw".into(),
         mappings: vec![
@@ -659,8 +89,9 @@ fn resolve_error_exposes_ambiguous_code() {
             },
         ],
     });
+    assert_eq!(error.status, axum::http::StatusCode::BAD_REQUEST);
     assert_eq!(error.code, Some(crate::alias::AMBIGUOUS_MODEL_ID));
-    assert!(error.message.contains("alias"));
+    assert!(error.message.contains("shared-raw"), "{}", error.message);
 }
 
 #[test]
@@ -680,10 +111,10 @@ fn parse_helpers_are_reexported_for_adapters() {
 }
 
 #[test]
-fn claude_desktop_identity_keeps_client_name_and_mapped_alias() {
+fn materialize_keeps_client_name_and_mapped_upstream_alias() {
     let body = Bytes::from(
         serde_json::to_vec(&json!({
-            "model": crate::models::CLAUDE_DESKTOP_OPUS_ALIAS,
+            "model": "client-opus",
             "max_tokens": 1,
             "messages": [{"role": "user", "content": "hi"}]
         }))
@@ -699,156 +130,328 @@ fn claude_desktop_identity_keeps_client_name_and_mapped_alias() {
             channel: UpstreamChannel::Go,
             upstream_base_override: None,
             original_model: None,
-            allow_go_fallback: false,
             forced_upstream: None,
             custom_route: None,
+            effort_aliases: &[],
         },
     )
     .unwrap();
     let identity = native_log_identity(&plan);
-    assert_eq!(
-        identity.requested_model,
-        crate::models::CLAUDE_DESKTOP_OPUS_ALIAS
-    );
+    assert_eq!(identity.requested_model, "client-opus");
     assert_eq!(identity.resolved_alias.as_deref(), Some("glm-5.2"));
     assert_eq!(identity.upstream_model, "glm-5.2");
 }
 
-fn custom_account(id: &str) -> Account {
-    account(
-        id,
-        CUSTOM_PROVIDER_ID,
-        CredentialKind::ApiKey,
-        QuotaScope::Key,
-    )
+fn mapping(provider_id: &str, model: &str) -> crate::alias::ProviderMapping {
+    crate::alias::ProviderMapping {
+        provider_id: provider_id.to_string(),
+        upstream_model: model.into(),
+        routeable: true,
+    }
 }
 
-fn custom_runtime(
-    account_id: &str,
-    model_id: &str,
-    protocol: UpstreamProtocolKind,
-) -> CustomAccountRuntime {
-    CustomAccountRuntime {
-        account_id: account_id.into(),
+fn test_destination(adapter: AdapterKind, legacy: LegacyDestinationRef) -> Destination {
+    let id = match &legacy {
+        LegacyDestinationRef::Builtin(id) | LegacyDestinationRef::Dynamic(id) => {
+            destination_id_for_builtin(id)
+        }
+        LegacyDestinationRef::CustomAccount(id) => destination_id_for_custom_account(id),
+        LegacyDestinationRef::PlatformParent(id) => destination_id_for_platform_account(id),
+    };
+    let model_resolution = match &legacy {
+        LegacyDestinationRef::Builtin(_) => ModelResolution::AdapterDefined,
+        LegacyDestinationRef::Dynamic(_) => ModelResolution::PublicAndUpstream,
+        LegacyDestinationRef::CustomAccount(_) | LegacyDestinationRef::PlatformParent(_) => {
+            ModelResolution::PublicOnly
+        }
+    };
+    Destination {
+        id,
+        legacy,
+        adapter,
+        name: "dest".into(),
+        brand_family: None,
+        base_url: None,
+        protocols: Vec::new(),
+        protocol_routes: Vec::new(),
+        auth_scheme: AuthScheme::Bearer,
+        model_resolution,
+        catalog: Vec::new(),
+        capabilities: sealed_capabilities(adapter),
+        plan: None,
+        max_credentials: None,
+        observer_credential_id: None,
         enabled: true,
-        verification_status: ConnectionVerificationStatus::Verified,
-        setup_ready: true,
-        has_key: true,
-        config: AccountCustomConfig {
-            account_id: account_id.into(),
-            endpoint_url: match protocol {
-                UpstreamProtocolKind::ChatCompletions => "http://127.0.0.1:9/v1/chat/completions",
-                UpstreamProtocolKind::Responses => "http://127.0.0.1:9/v1/responses",
-                UpstreamProtocolKind::Messages => "http://127.0.0.1:9/v1/messages",
-            }
-            .into(),
-            upstream_protocol: protocol,
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
-        },
-        capabilities: vec![AccountModelCapability {
-            account_id: account_id.into(),
-            public_model: model_id.into(),
-            upstream_model: model_id.into(),
-            protocol,
-            verified_at: None,
-            source: "manual".into(),
-        }],
     }
 }
 
 #[test]
-fn materialize_dispatches_builtin_and_custom_through_adapter_kinds() {
-    assert_eq!(
-        mapping_adapter_kind(&crate::alias::ProviderMapping {
-            provider_id: OPENCODE_PROVIDER_ID.to_string(),
-
-            upstream_model: "glm-5.2".into(),
-            routeable: true
-        }),
-        Some(ProviderAdapterKind::OpenCodeGo)
+fn http_targets_keep_public_separators_and_exact_upstream_identity() {
+    use ocg_domain::destination::CatalogModel;
+    let mut destination = test_destination(
+        AdapterKind::Http,
+        LegacyDestinationRef::Dynamic("lab".into()),
     );
-    assert_eq!(
-        mapping_adapter_kind(&crate::alias::ProviderMapping {
-            provider_id: OPENCODE_ZEN_FREE_PROVIDER_ID.to_string(),
-
-            upstream_model: "mimo-v2.5-free".into(),
-            routeable: true
-        }),
-        Some(ProviderAdapterKind::ZenFree)
-    );
-    assert_eq!(
-        mapping_adapter_kind(&crate::alias::ProviderMapping {
-            provider_id: CUSTOM_PROVIDER_ID.to_string(),
-
-            upstream_model: "local".into(),
-            routeable: true
-        }),
-        Some(ProviderAdapterKind::ConfigurableHttp)
-    );
-    assert!(!mapping_is_configurable_http(
-        &crate::alias::ProviderMapping {
-            provider_id: COMMAND_CODE_PROVIDER_ID.to_string(),
-
-            upstream_model: COMMAND_CODE_GOAT_DEEPSEEK_V4_FLASH_UPSTREAM.into(),
-            routeable: false
+    destination.catalog = [
+        ("lab_model", "vendor/lab_model"),
+        ("lab model", "vendor/lab model"),
+        ("lab/model", "vendor/lab/model"),
+        ("lab-model", "vendor/lab-model"),
+    ]
+    .into_iter()
+    .map(|(public, upstream)| CatalogModel {
+        public_model: public.into(),
+        upstream_model: upstream.into(),
+        protocols: vec![UpstreamProtocolKind::ChatCompletions],
+        preferred: Some(UpstreamProtocolKind::ChatCompletions),
+        enabled: true,
+        upstream_override: None,
+    })
+    .collect();
+    for resolution in [
+        ModelResolution::PublicOnly,
+        ModelResolution::PublicAndUpstream,
+    ] {
+        destination.model_resolution = resolution;
+        for (selected_index, selected) in destination.catalog.iter().enumerate() {
+            let provider = if resolution == ModelResolution::PublicOnly {
+                CUSTOM_PROVIDER_ID
+            } else {
+                &destination.id
+            };
+            let resolved = ResolvedModel::PinnedRaw {
+                requested: selected.public_model.clone(),
+                mapping: mapping(provider, &selected.upstream_model),
+            };
+            for requested in [
+                selected.public_model.clone(),
+                selected.public_model.to_uppercase(),
+            ] {
+                for (index, candidate) in destination.catalog.iter().enumerate() {
+                    assert_eq!(
+                        resolved_contains_model(&resolved, &destination, candidate, &requested),
+                        index == selected_index,
+                        "{resolution:?}: {requested} matched {}",
+                        candidate.public_model
+                    );
+                }
+            }
+            if resolution == ModelResolution::PublicAndUpstream {
+                for (index, candidate) in destination.catalog.iter().enumerate() {
+                    assert_eq!(
+                        resolved_contains_model(
+                            &resolved,
+                            &destination,
+                            candidate,
+                            &selected.upstream_model
+                        ),
+                        index == selected_index,
+                        "canonical upstream {} matched {}",
+                        selected.upstream_model,
+                        candidate.upstream_model
+                    );
+                }
+            }
         }
-    ));
+    }
 }
 
 #[test]
-fn custom_candidate_diagnostic_passthrough_keeps_client_protocol() {
-    let resolved = resolve_with_custom("local-custom", &["local-custom".into()]);
-    assert_eq!(
-        diagnostic_forced_upstream(&resolved, ApiFormat::Responses),
-        Some(ApiFormat::Responses)
-    );
-    assert_eq!(
-        diagnostic_forced_upstream(&resolved, ApiFormat::Messages),
-        Some(ApiFormat::Messages)
-    );
-    let mixed = resolve_with_custom("hy3", &["hy3".into()]);
-    assert_eq!(
-        diagnostic_forced_upstream(&mixed, ApiFormat::Responses),
-        Some(ApiFormat::Responses)
-    );
-    let builtin = alias::resolve("hy3").unwrap();
-    assert_eq!(
-        diagnostic_forced_upstream(&builtin, ApiFormat::Responses),
-        None
-    );
-    let goat = resolve_with_catalogs("claude-sonnet-4-6", &[], &[], &["claude-sonnet-4-6".into()]);
-    assert_eq!(
-        diagnostic_forced_upstream(&goat, ApiFormat::Responses),
-        Some(ApiFormat::Responses)
-    );
-    assert_eq!(
-        diagnostic_forced_upstream(&goat, ApiFormat::Messages),
-        Some(ApiFormat::Messages)
-    );
-    let zen = resolve_with_catalogs(
-        "brand-new-promo",
-        &["brand-new-promo-free".into()],
-        &[],
-        &[],
-    );
-    assert_eq!(
-        diagnostic_forced_upstream(&zen, ApiFormat::ChatCompletions),
-        Some(ApiFormat::ChatCompletions)
-    );
-    assert_eq!(
-        diagnostic_forced_upstream(&zen, ApiFormat::Messages),
-        Some(ApiFormat::ChatCompletions)
-    );
+fn custom_catalog_mapping_is_not_a_dynamic_provider_id() {
+    let custom_mapping = mapping(CUSTOM_PROVIDER_ID, "local-custom");
+    let go_mapping = mapping(crate::provider::OPENCODE_PROVIDER_ID, "glm-5.2");
+    let dynamic_mapping = mapping("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", "dyn-model");
+    assert!(mapping_is_custom_http_catalog(&custom_mapping));
+    assert!(!mapping_is_custom_http_catalog(&dynamic_mapping));
+    assert!(!mapping_is_custom_http_catalog(&go_mapping));
 }
 
 #[test]
-fn custom_native_responses_structured_format_does_not_guess_chat() {
-    let body = Bytes::from(
+fn live_planner_rejects_disabled_credential_and_binding() {
+    let (mut snapshot, resolved) = cn_catalog_snapshot(
+        AdapterKind::Minimax,
+        MINIMAX_PROVIDER_ID,
+        "minimax-off",
+        "MiniMax-New",
+        &[UpstreamProtocolKind::ChatCompletions],
+        UpstreamProtocolKind::ChatCompletions,
+    );
+    snapshot.credentials[0].enabled = false;
+    let parsed =
+        parse_client_request(ApiFormat::ChatCompletions, chat_body("MiniMax-New")).unwrap();
+    let config = AppConfig::default();
+    let disabled = materialize_execution_routes(
+        &snapshot,
+        &config,
+        &parsed,
+        &resolved,
+        "MiniMax-New",
+        "MiniMax-New",
+        None,
+    )
+    .unwrap();
+    assert!(disabled.routes.is_empty());
+    assert_eq!(
+        disabled.rejections[0].code,
+        RouteRejectionCode::CredentialDisabled
+    );
+
+    snapshot.credentials[0].enabled = true;
+    snapshot.credentials[0].binding_enabled = false;
+    let unbound = materialize_execution_routes(
+        &snapshot,
+        &config,
+        &parsed,
+        &resolved,
+        "MiniMax-New",
+        "MiniMax-New",
+        None,
+    )
+    .unwrap();
+    assert!(unbound.routes.is_empty());
+    assert_eq!(
+        unbound.rejections[0].code,
+        RouteRejectionCode::BindingDisabled
+    );
+}
+
+fn cn_catalog_snapshot(
+    adapter: AdapterKind,
+    provider_id: &str,
+    account_id: &str,
+    model: &str,
+    protocols: &[UpstreamProtocolKind],
+    preferred: UpstreamProtocolKind,
+) -> (RoutingSnapshot, ResolvedModel) {
+    let mut destination =
+        test_destination(adapter, LegacyDestinationRef::Builtin(provider_id.into()));
+    destination.catalog = vec![CatalogModel {
+        public_model: model.into(),
+        upstream_model: model.into(),
+        protocols: protocols.to_vec(),
+        preferred: Some(preferred),
+        enabled: true,
+        upstream_override: None,
+    }];
+    let account = account(
+        account_id,
+        provider_id,
+        CredentialKind::ApiKey,
+        QuotaScope::Key,
+    );
+    let mut credential = ExecutionCredential::from(&account);
+    credential.destination_id = destination.id.clone();
+    let connection = connection_id_for_legacy(LegacyConnectionKind::BuiltinProvider, provider_id);
+    credential.authorization_connection_id = connection.to_string();
+    credential.binding_id = format!("binding-{account_id}");
+    credential.grants.allowed_endpoint_ids = protocols
+        .iter()
+        .copied()
+        .map(|protocol| {
+            ocg_domain::connection::endpoint_id_for(
+                &connection,
+                ocg_domain::connection::EndpointOperation::from(protocol),
+            )
+            .to_string()
+        })
+        .collect();
+    let model_id = destination.catalog[0].public_model.clone();
+    let resolved = match adapter {
+        AdapterKind::Minimax => alias::resolve_with_runtime_catalogs(
+            model,
+            RuntimeCatalogs {
+                minimax: std::slice::from_ref(&model_id),
+                ..RuntimeCatalogs::default()
+            },
+        ),
+        AdapterKind::Kimi => alias::resolve_with_runtime_catalogs(
+            model,
+            RuntimeCatalogs {
+                kimi: std::slice::from_ref(&model_id),
+                ..RuntimeCatalogs::default()
+            },
+        ),
+        _ => panic!("cn catalog fixture is MiniMax/Kimi only"),
+    }
+    .unwrap();
+    (
+        RoutingSnapshot {
+            projection: crate::destination_projection::DestinationProjection {
+                destinations: vec![destination],
+                credentials: Vec::new(),
+            },
+            credentials: vec![credential],
+            ollama_pinned: Vec::new(),
+        },
+        resolved,
+    )
+}
+
+fn materialize_cn_catalog(
+    snapshot: &RoutingSnapshot,
+    resolved: &ResolvedModel,
+    client: ApiFormat,
+    model: &str,
+    body: Bytes,
+) -> ExecutionRouteSet {
+    let parsed = parse_client_request(client, body).unwrap();
+    materialize_execution_routes(
+        snapshot,
+        &AppConfig::default(),
+        &parsed,
+        resolved,
+        model,
+        model,
+        None,
+    )
+    .unwrap()
+}
+
+#[test]
+fn catalog_cn_preferred_protocol_precedes_same_client() {
+    assert!(!is_known_model("MiniMax-New"));
+    assert!(!is_known_model("kimi-for-coding"));
+
+    let (minimax, resolved) = cn_catalog_snapshot(
+        AdapterKind::Minimax,
+        MINIMAX_PROVIDER_ID,
+        "minimax-fresh",
+        "MiniMax-New",
+        &[
+            UpstreamProtocolKind::ChatCompletions,
+            UpstreamProtocolKind::Messages,
+            UpstreamProtocolKind::Responses,
+        ],
+        UpstreamProtocolKind::Messages,
+    );
+    let chat = materialize_cn_catalog(
+        &minimax,
+        &resolved,
+        ApiFormat::ChatCompletions,
+        "MiniMax-New",
+        chat_body("MiniMax-New"),
+    );
+    assert_eq!(chat.routes.len(), 1, "{:?}", chat.rejections);
+    assert!(
+        chat.rejections.is_empty(),
+        "a successful preferred plan records no alternate attempt: {:?}",
+        chat.rejections
+    );
+    assert_eq!(chat.routes[0].plan.client, ApiFormat::ChatCompletions);
+    assert_eq!(
+        chat.routes[0].plan.upstream,
+        ApiFormat::Messages,
+        "enabled preferred Messages wins over the Chat client"
+    );
+    let converted: serde_json::Value = serde_json::from_slice(&chat.routes[0].plan.body).unwrap();
+    assert_eq!(converted["messages"][0]["role"], "user");
+
+    let responses_body = Bytes::from(
         serde_json::to_vec(&json!({
-            "model": "local-custom",
+            "model": "MiniMax-New",
             "input": "hi",
             "store": false,
+            "vendor_extension": {"trace_id": "trace_responses"},
             "text": {
                 "format": {
                     "type": "json_schema",
@@ -859,260 +462,682 @@ fn custom_native_responses_structured_format_does_not_guess_chat() {
         }))
         .unwrap(),
     );
-    let parsed = parse_client_request(ApiFormat::Responses, body.clone()).unwrap();
-    let resolved = resolve_with_custom("local-custom", &["local-custom".into()]);
-    let account = custom_account("custom-1");
-    let runtime = custom_runtime("custom-1", "local-custom", UpstreamProtocolKind::Responses);
-    let mut runtimes = std::collections::HashMap::new();
-    let contracts = contracts_for(std::slice::from_ref(&runtime));
-    runtimes.insert(account.id.clone(), runtime);
-    let set = materialize_account_routes(
-        &[account],
-        &AppConfig::default(),
-        &parsed,
+    let responses = materialize_cn_catalog(
+        &minimax,
         &resolved,
-        &parsed.requested_model,
-        "local-custom",
-        &body,
-        false,
-        &runtimes,
-        &std::collections::HashMap::new(),
-        None,
-        &contracts,
-        &[],
-    )
-    .expect("native Responses structured output must not be rejected via Chat conversion");
-    assert_eq!(set.routes.len(), 1);
-    assert_eq!(set.routes[0].plan.upstream, ApiFormat::Responses);
-    assert_eq!(set.routes[0].plan.client, ApiFormat::Responses);
-    let upstream: serde_json::Value = serde_json::from_slice(&set.routes[0].plan.body).unwrap();
+        ApiFormat::Responses,
+        "MiniMax-New",
+        responses_body,
+    );
+    assert_eq!(responses.routes.len(), 1, "{:?}", responses.rejections);
+    assert!(
+        responses.rejections.is_empty(),
+        "feature fallback stays local: {:?}",
+        responses.rejections
+    );
+    assert_eq!(
+        responses.routes[0].plan.upstream,
+        ApiFormat::Responses,
+        "preferred Messages cannot keep Responses json_schema, so the client protocol is used"
+    );
+    let upstream: serde_json::Value =
+        serde_json::from_slice(&responses.routes[0].plan.body).unwrap();
     assert_eq!(upstream["text"]["format"]["type"], "json_schema");
+    assert_eq!(
+        upstream["vendor_extension"]["trace_id"], "trace_responses",
+        "the same-protocol fallback keeps unknown native fields"
+    );
+
+    let (kimi, kimi_resolved) = cn_catalog_snapshot(
+        AdapterKind::Kimi,
+        KIMI_PROVIDER_ID,
+        "kimi-fresh",
+        "kimi-for-coding",
+        &[
+            UpstreamProtocolKind::ChatCompletions,
+            UpstreamProtocolKind::Messages,
+        ],
+        UpstreamProtocolKind::ChatCompletions,
+    );
+    let kimi_chat = materialize_cn_catalog(
+        &kimi,
+        &kimi_resolved,
+        ApiFormat::ChatCompletions,
+        "kimi-for-coding",
+        chat_body("kimi-for-coding"),
+    );
+    assert_eq!(kimi_chat.routes.len(), 1, "{:?}", kimi_chat.rejections);
+    assert_eq!(
+        kimi_chat.routes[0].plan.upstream,
+        ApiFormat::ChatCompletions
+    );
 }
 
 #[test]
-fn custom_native_messages_structured_format_does_not_guess_chat() {
+fn only_actual_candidate_conversion_failures_are_client_errors() {
+    let (mut snapshot, resolved) = cn_catalog_snapshot(
+        AdapterKind::Minimax,
+        MINIMAX_PROVIDER_ID,
+        "minimax-json",
+        "MiniMax-New",
+        &[UpstreamProtocolKind::Messages],
+        UpstreamProtocolKind::Messages,
+    );
+    let body = Bytes::from(serde_json::to_vec(&json!({
+        "model": "MiniMax-New", "messages": [{"role":"user", "content":"hi"}],
+        "response_format": {"type":"json_schema", "json_schema":{"name":"answer", "schema":{"type":"object"}}}
+    })).unwrap());
+    let parsed = parse_client_request(ApiFormat::ChatCompletions, body).unwrap();
+    let config = AppConfig::default();
+    let result = materialize_execution_routes(
+        &snapshot,
+        &config,
+        &parsed,
+        &resolved,
+        "MiniMax-New",
+        "MiniMax-New",
+        None,
+    );
+    let error = result
+        .err()
+        .expect("unsupported conversion must remain a client error");
+    assert_eq!(error.status, axum::http::StatusCode::BAD_REQUEST);
+    snapshot.credentials[0].key_cipher.clear();
+    let unavailable = materialize_execution_routes(
+        &snapshot,
+        &config,
+        &parsed,
+        &resolved,
+        "MiniMax-New",
+        "MiniMax-New",
+        None,
+    )
+    .unwrap();
+    assert!(unavailable.routes.is_empty());
+    assert_eq!(
+        unavailable.rejections[0].code,
+        RouteRejectionCode::CandidateMaterializationFailed
+    );
+}
+
+fn http_separator_snapshot(scope: ModelScope) -> (RoutingSnapshot, ResolvedModel) {
+    let account = account(
+        "http-separators",
+        CUSTOM_PROVIDER_ID,
+        CredentialKind::ApiKey,
+        QuotaScope::Key,
+    );
+    let mut destination = test_destination(
+        AdapterKind::Http,
+        LegacyDestinationRef::CustomAccount(account.id.clone()),
+    );
+    destination.base_url = Some("https://lab.example/v1/chat/completions".into());
+    destination.protocols = vec![UpstreamProtocolKind::ChatCompletions];
+    destination.catalog = ["vendor/model", "vendor-model", "vendor_model"]
+        .into_iter()
+        .enumerate()
+        .map(|(index, public)| CatalogModel {
+            public_model: public.into(),
+            upstream_model: format!("upstream-{index}"),
+            protocols: vec![UpstreamProtocolKind::ChatCompletions],
+            preferred: Some(UpstreamProtocolKind::ChatCompletions),
+            enabled: true,
+            upstream_override: None,
+        })
+        .collect();
+    let connection = connection_id_for_legacy(LegacyConnectionKind::CustomAccount, &account.id);
+    let mut credential = ExecutionCredential::from(&account);
+    credential.destination_id = destination.id.clone();
+    credential.authorization_connection_id = connection.to_string();
+    credential.binding_id = "binding-http-separators".into();
+    credential.scope = scope;
+    credential.grants.allowed_endpoint_ids = ocg_domain::credential::assigned_endpoints_for_routes(
+        &connection,
+        &ocg_domain::destination::http_configured_routes(&destination),
+    )
+    .into_iter()
+    .map(|endpoint| endpoint.id)
+    .collect();
+    credential.grants.allowed_origins = vec!["https://lab.example:443".into()];
+    let resolved = ResolvedModel::PinnedRaw {
+        requested: "vendor/model".into(),
+        mapping: mapping(CUSTOM_PROVIDER_ID, "upstream-0"),
+    };
+    (
+        RoutingSnapshot {
+            projection: crate::destination_projection::DestinationProjection {
+                destinations: vec![destination],
+                credentials: Vec::new(),
+            },
+            credentials: vec![credential],
+            ollama_pinned: Vec::new(),
+        },
+        resolved,
+    )
+}
+
+#[test]
+fn model_scope_keeps_separator_identity_through_live_authorization() {
+    use crate::gateway::forwarder::{LiveSendSelection, verify_execution_authorization};
+    let (snapshot, _) = http_separator_snapshot(ModelScope::Only {
+        models: vec!["vendor/model".into()],
+    });
+    let config = AppConfig::default();
+    let wall = Utc::now();
+    for requested in ["vendor/model", "Vendor/Model"] {
+        let resolved = ResolvedModel::PinnedRaw {
+            requested: requested.into(),
+            mapping: mapping(CUSTOM_PROVIDER_ID, "upstream-0"),
+        };
+        let parsed =
+            parse_client_request(ApiFormat::ChatCompletions, chat_body(requested)).unwrap();
+        let set = materialize_execution_routes(
+            &snapshot, &config, &parsed, &resolved, requested, requested, None,
+        )
+        .unwrap();
+        assert_eq!(set.routes.len(), 1, "{requested}: {:?}", set.rejections);
+        assert_eq!(set.routes[0].target.model.public_model, "vendor/model");
+        let selection = LiveSendSelection::from_execution(&set.routes[0], requested, requested);
+        verify_execution_authorization(&snapshot, &selection, &set.routes[0].spec, wall, true)
+            .unwrap_or_else(|error| panic!("{requested} live auth: {error:?}"));
+    }
+    for requested in ["vendor-model", "vendor_model"] {
+        let resolved = ResolvedModel::PinnedRaw {
+            requested: requested.into(),
+            mapping: mapping(CUSTOM_PROVIDER_ID, "upstream-1"),
+        };
+        let parsed =
+            parse_client_request(ApiFormat::ChatCompletions, chat_body(requested)).unwrap();
+        let set = materialize_execution_routes(
+            &snapshot, &config, &parsed, &resolved, requested, requested, None,
+        )
+        .unwrap();
+        assert!(
+            set.routes.is_empty(),
+            "{requested} must stay outside the allow-list"
+        );
+        assert!(
+            set.rejections
+                .iter()
+                .any(|rejection| rejection.code == RouteRejectionCode::ModelScopeDenied),
+            "{requested}: {:?}",
+            set.rejections
+        );
+    }
+
+    let (mut open, _) = http_separator_snapshot(ModelScope::All);
+    let requested = "vendor-model";
+    let resolved = ResolvedModel::PinnedRaw {
+        requested: requested.into(),
+        mapping: mapping(CUSTOM_PROVIDER_ID, "upstream-1"),
+    };
+    let parsed = parse_client_request(ApiFormat::ChatCompletions, chat_body(requested)).unwrap();
+    let set = materialize_execution_routes(
+        &open, &config, &parsed, &resolved, requested, requested, None,
+    )
+    .unwrap();
+    assert_eq!(set.routes.len(), 1, "{:?}", set.rejections);
+    assert_eq!(set.routes[0].target.model.public_model, "vendor-model");
+    open.credentials[0].scope = ModelScope::Only {
+        models: vec!["vendor/model".into()],
+    };
+    let selection = LiveSendSelection::from_execution(&set.routes[0], requested, requested);
+    assert!(
+        verify_execution_authorization(&open, &selection, &set.routes[0].spec, wall, true).is_err(),
+        "live authorization must not widen vendor/model to vendor-model"
+    );
+}
+
+#[test]
+fn granted_messages_endpoint_is_selected_for_a_chat_request() {
+    use crate::gateway::forwarder::{LiveSendSelection, verify_execution_authorization};
+    let (mut snapshot, resolved) = cn_catalog_snapshot(
+        AdapterKind::Minimax,
+        MINIMAX_PROVIDER_ID,
+        "minimax-messages-only",
+        "MiniMax-New",
+        &[
+            UpstreamProtocolKind::ChatCompletions,
+            UpstreamProtocolKind::Messages,
+        ],
+        UpstreamProtocolKind::ChatCompletions,
+    );
+    let connection =
+        connection_id_for_legacy(LegacyConnectionKind::BuiltinProvider, MINIMAX_PROVIDER_ID);
+    let messages = ocg_domain::connection::endpoint_id_for(
+        &connection,
+        ocg_domain::connection::EndpointOperation::MessageCreate,
+    )
+    .to_string();
+    snapshot.credentials[0].grants.allowed_endpoint_ids = vec![messages.clone()];
+    let parsed =
+        parse_client_request(ApiFormat::ChatCompletions, chat_body("MiniMax-New")).unwrap();
+    let set = materialize_execution_routes(
+        &snapshot,
+        &AppConfig::default(),
+        &parsed,
+        &resolved,
+        "MiniMax-New",
+        "MiniMax-New",
+        None,
+    )
+    .unwrap();
+    assert_eq!(set.routes.len(), 1, "{:?}", set.rejections);
+    assert_eq!(set.routes[0].plan.upstream, ApiFormat::Messages);
+    assert_eq!(set.routes[0].target.endpoint_id, messages);
+    let selection = LiveSendSelection::from_execution(&set.routes[0], "MiniMax-New", "MiniMax-New");
+    verify_execution_authorization(&snapshot, &selection, &set.routes[0].spec, Utc::now(), true)
+        .unwrap_or_else(|error| panic!("granted messages route must pass live auth: {error:?}"));
+}
+
+fn builtin_endpoint(provider_id: &str, protocol: UpstreamProtocolKind) -> String {
+    let connection = connection_id_for_legacy(LegacyConnectionKind::BuiltinProvider, provider_id);
+    ocg_domain::connection::endpoint_id_for(
+        &connection,
+        ocg_domain::connection::EndpointOperation::from(protocol),
+    )
+    .to_string()
+}
+
+#[test]
+fn ungranted_preferred_protocol_is_not_executed() {
+    let (mut snapshot, resolved) = cn_catalog_snapshot(
+        AdapterKind::Minimax,
+        MINIMAX_PROVIDER_ID,
+        "minimax-chat-grant",
+        "MiniMax-New",
+        &[
+            UpstreamProtocolKind::ChatCompletions,
+            UpstreamProtocolKind::Responses,
+        ],
+        UpstreamProtocolKind::Responses,
+    );
+    let chat = builtin_endpoint(MINIMAX_PROVIDER_ID, UpstreamProtocolKind::ChatCompletions);
+    let responses = builtin_endpoint(MINIMAX_PROVIDER_ID, UpstreamProtocolKind::Responses);
+    snapshot.credentials[0].grants.allowed_endpoint_ids = vec![chat.clone()];
+    let parsed =
+        parse_client_request(ApiFormat::ChatCompletions, chat_body("MiniMax-New")).unwrap();
+    let set = materialize_execution_routes(
+        &snapshot,
+        &AppConfig::default(),
+        &parsed,
+        &resolved,
+        "MiniMax-New",
+        "MiniMax-New",
+        None,
+    )
+    .unwrap();
+    assert_eq!(set.routes.len(), 1, "{:?}", set.rejections);
+    assert!(set.rejections.is_empty(), "{:?}", set.rejections);
+    assert_eq!(set.routes[0].plan.upstream, ApiFormat::ChatCompletions);
+    assert_eq!(set.routes[0].target.endpoint_id, chat);
+    assert_ne!(set.routes[0].target.endpoint_id, responses);
+}
+
+#[test]
+fn preferred_loss_falls_back_to_same_client_and_keeps_native_fields() {
+    let (snapshot, resolved) = cn_catalog_snapshot(
+        AdapterKind::Minimax,
+        MINIMAX_PROVIDER_ID,
+        "minimax-schema",
+        "MiniMax-New",
+        &[
+            UpstreamProtocolKind::Messages,
+            UpstreamProtocolKind::ChatCompletions,
+        ],
+        UpstreamProtocolKind::Messages,
+    );
     let body = Bytes::from(
         serde_json::to_vec(&json!({
-            "model": "local-custom",
-            "max_tokens": 16,
-            "messages": [{"role": "user", "content": "hi"}],
-            "output_config": {
-                "format": {"type": "json_schema", "schema": {"type": "object"}}
+            "model": "MiniMax-New",
+            "messages": [
+                {"role": "developer", "content": "dev"},
+                {"role": "user", "content": "hi"}
+            ],
+            "vendor_extension": {"trace_id": "trace_chat"},
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {"name": "answer", "schema": {"type": "object"}}
             }
         }))
         .unwrap(),
     );
-    let parsed = parse_client_request(ApiFormat::Messages, body.clone()).unwrap();
-    let resolved = resolve_with_custom("local-custom", &["local-custom".into()]);
-    let account = custom_account("custom-1");
-    let runtime = custom_runtime("custom-1", "local-custom", UpstreamProtocolKind::Messages);
-    let mut runtimes = std::collections::HashMap::new();
-    let contracts = contracts_for(std::slice::from_ref(&runtime));
-    runtimes.insert(account.id.clone(), runtime);
-    let set = materialize_account_routes(
-        &[account],
+    let parsed = parse_client_request(ApiFormat::ChatCompletions, body).unwrap();
+    let set = materialize_execution_routes(
+        &snapshot,
         &AppConfig::default(),
         &parsed,
         &resolved,
-        &parsed.requested_model,
-        "local-custom",
-        &body,
-        false,
-        &runtimes,
-        &std::collections::HashMap::new(),
+        "MiniMax-New",
+        "MiniMax-New",
         None,
-        &contracts,
-        &[],
     )
-    .expect("native Messages structured output must not be rejected via Chat conversion");
-    assert_eq!(set.routes.len(), 1);
-    assert_eq!(set.routes[0].plan.upstream, ApiFormat::Messages);
+    .unwrap();
+    assert_eq!(set.routes.len(), 1, "{:?}", set.rejections);
+    assert!(
+        set.rejections.is_empty(),
+        "local fallback must not record a probe or a failed candidate: {:?}",
+        set.rejections
+    );
+    assert_eq!(set.routes[0].plan.client, ApiFormat::ChatCompletions);
+    assert_eq!(set.routes[0].plan.upstream, ApiFormat::ChatCompletions);
+    assert_eq!(
+        set.routes[0].target.endpoint_id,
+        builtin_endpoint(MINIMAX_PROVIDER_ID, UpstreamProtocolKind::ChatCompletions)
+    );
     let upstream: serde_json::Value = serde_json::from_slice(&set.routes[0].plan.body).unwrap();
-    assert_eq!(upstream["output_config"]["format"]["type"], "json_schema");
+    assert_eq!(upstream["response_format"]["type"], "json_schema");
+    assert_eq!(upstream["vendor_extension"]["trace_id"], "trace_chat");
+    assert_eq!(upstream["messages"][0]["role"], "developer");
+    assert_eq!(upstream["messages"][0]["content"], "dev");
 }
 
 #[test]
-fn custom_single_protocol_converts_other_client_wire_formats() {
-    fn route_upstream(client: ApiFormat, body: Bytes) -> ApiFormat {
-        let parsed = if client == ApiFormat::Gemini {
-            parse_gemini("local-custom".into(), false, body.clone()).unwrap()
-        } else {
-            parse_client_request(client, body.clone()).unwrap()
-        };
-        let resolved = resolve_with_custom("local-custom", &["local-custom".into()]);
-        let account = custom_account("custom-single");
-        let runtime = custom_runtime(
-            "custom-single",
-            "local-custom",
+fn unpreservable_protocols_exclude_one_candidate_and_keep_another() {
+    let (mut snapshot, resolved) = cn_catalog_snapshot(
+        AdapterKind::Minimax,
+        MINIMAX_PROVIDER_ID,
+        "minimax-lossy",
+        "MiniMax-New",
+        &[
             UpstreamProtocolKind::Messages,
-        );
-        let contracts = contracts_for(std::slice::from_ref(&runtime));
-        let mut runtimes = std::collections::HashMap::new();
-        runtimes.insert(account.id.clone(), runtime);
-        let set = materialize_account_routes(
-            &[account],
-            &AppConfig::default(),
-            &parsed,
-            &resolved,
-            &parsed.requested_model,
-            "local-custom",
-            &body,
-            false,
-            &runtimes,
-            &std::collections::HashMap::new(),
-            None,
-            &contracts,
-            &[],
-        )
-        .expect("single-protocol account must convert supported client formats");
-        assert_eq!(set.routes.len(), 1);
-        set.routes[0].plan.upstream
-    }
-
-    let chat = route_upstream(ApiFormat::ChatCompletions, chat_body("local-custom"));
-    assert_eq!(chat, ApiFormat::Messages);
-    let responses = route_upstream(
-        ApiFormat::Responses,
-        Bytes::from(
-            serde_json::to_vec(&json!({
-                "model": "local-custom",
-                "input": "hi",
-                "store": false,
-                "max_output_tokens": 4
-            }))
-            .unwrap(),
-        ),
+            UpstreamProtocolKind::Responses,
+            UpstreamProtocolKind::ChatCompletions,
+        ],
+        UpstreamProtocolKind::Messages,
     );
-    assert_eq!(responses, ApiFormat::Messages);
-    let messages = route_upstream(
-        ApiFormat::Messages,
-        Bytes::from(
-            serde_json::to_vec(&json!({
-                "model": "local-custom",
-                "max_tokens": 4,
-                "messages": [{"role": "user", "content": "hi"}]
-            }))
-            .unwrap(),
-        ),
+    snapshot.credentials[0].grants.allowed_endpoint_ids = vec![
+        builtin_endpoint(MINIMAX_PROVIDER_ID, UpstreamProtocolKind::Messages),
+        builtin_endpoint(MINIMAX_PROVIDER_ID, UpstreamProtocolKind::Responses),
+    ];
+    let native = account(
+        "minimax-native",
+        MINIMAX_PROVIDER_ID,
+        CredentialKind::ApiKey,
+        QuotaScope::Key,
     );
-    assert_eq!(messages, ApiFormat::Messages);
-    let gemini = route_upstream(
-        ApiFormat::Gemini,
-        Bytes::from(
-            serde_json::to_vec(&json!({
-                "contents": [{"role": "user", "parts": [{"text": "hi"}]}],
-                "generationConfig": {"maxOutputTokens": 4}
-            }))
-            .unwrap(),
-        ),
-    );
-    assert_eq!(gemini, ApiFormat::Messages);
-}
-
-#[test]
-fn custom_without_scope_contract_does_not_produce_a_candidate() {
-    let body = chat_body("local-custom");
-    let parsed = parse_client_request(ApiFormat::ChatCompletions, body.clone()).unwrap();
-    let resolved = resolve_with_custom("local-custom", &["local-custom".into()]);
-    let account = custom_account("custom-missing-scope");
-    let runtime = custom_runtime(
-        "custom-missing-scope",
-        "local-custom",
+    let mut native_credential = ExecutionCredential::from(&native);
+    native_credential.destination_id = snapshot.credentials[0].destination_id.clone();
+    native_credential.authorization_connection_id =
+        snapshot.credentials[0].authorization_connection_id.clone();
+    native_credential.binding_id = "binding-minimax-native".into();
+    native_credential.grants.allowed_endpoint_ids = vec![builtin_endpoint(
+        MINIMAX_PROVIDER_ID,
         UpstreamProtocolKind::ChatCompletions,
+    )];
+    snapshot.credentials.push(native_credential);
+    let body = Bytes::from(
+        serde_json::to_vec(&json!({
+            "model": "MiniMax-New",
+            "messages": [{"role": "user", "content": "hi"}],
+            "vendor_extension": {"trace_id": "trace_native"},
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {"name": "answer", "schema": {"type": "object"}}
+            }
+        }))
+        .unwrap(),
     );
-    let mut runtimes = std::collections::HashMap::new();
-    runtimes.insert(account.id.clone(), runtime);
-    let set = materialize_account_routes(
-        &[account],
+    let parsed = parse_client_request(ApiFormat::ChatCompletions, body).unwrap();
+    let set = materialize_execution_routes(
+        &snapshot,
         &AppConfig::default(),
         &parsed,
         &resolved,
-        &parsed.requested_model,
-        "local-custom",
-        &body,
-        false,
-        &runtimes,
-        &std::collections::HashMap::new(),
+        "MiniMax-New",
+        "MiniMax-New",
         None,
-        &static_contracts(),
-        &[],
     )
-    .expect(
-        "missing custom contract must fail closed without a protocol error for mixed resolution",
+    .unwrap();
+    assert_eq!(set.routes.len(), 1, "{:?}", set.rejections);
+    assert_eq!(set.routes[0].routing.account.id, "minimax-native");
+    assert_eq!(set.routes[0].plan.upstream, ApiFormat::ChatCompletions);
+    let upstream: serde_json::Value = serde_json::from_slice(&set.routes[0].plan.body).unwrap();
+    assert_eq!(upstream["response_format"]["type"], "json_schema");
+    assert_eq!(upstream["vendor_extension"]["trace_id"], "trace_native");
+    assert_eq!(set.rejections.len(), 1, "{:?}", set.rejections);
+    assert_eq!(
+        set.rejections[0].account_id.as_deref(),
+        Some("minimax-lossy")
+    );
+    assert_eq!(
+        set.rejections[0].code,
+        RouteRejectionCode::CandidateMaterializationFailed
     );
     assert!(
-        set.routes.is_empty(),
-        "no production Custom candidate without ContractScope::CustomEndpoint"
+        set.rejections[0].detail.contains("cannot be preserved"),
+        "{}",
+        set.rejections[0].detail
     );
-    assert!(set.incompatibility.as_deref().is_some_and(|message| {
-        message.contains("no effective contract") || message.contains("custom_endpoint")
-    }));
+}
+
+fn messages_history_body(signature: Option<&str>) -> Bytes {
+    let mut messages = vec![json!({"role": "user", "content": "hi"})];
+    if let Some(signature) = signature {
+        messages.push(json!({
+            "role": "assistant",
+            "content": [
+                {"type": "thinking", "thinking": "t", "signature": signature},
+                {"type": "text", "text": "ok"}
+            ]
+        }));
+    }
+    Bytes::from(
+        serde_json::to_vec(&json!({
+            "model": "MiniMax-New",
+            "max_tokens": 32,
+            "messages": messages
+        }))
+        .unwrap(),
+    )
+}
+
+fn minimax_messages_snapshot(account_id: &str) -> (RoutingSnapshot, ResolvedModel) {
+    cn_catalog_snapshot(
+        AdapterKind::Minimax,
+        MINIMAX_PROVIDER_ID,
+        account_id,
+        "MiniMax-New",
+        &[UpstreamProtocolKind::Messages],
+        UpstreamProtocolKind::Messages,
+    )
 }
 
 #[test]
-fn probed_opencode_protocol_is_selected_after_contract_evidence() {
-    let body = chat_body("grok-4.5");
-    let parsed = parse_client_request(ApiFormat::ChatCompletions, body.clone()).unwrap();
-    let resolved = alias::resolve("grok-4.5").unwrap();
-    let account = go_account("go-probe");
-    let before = materialize_account_routes(
-        std::slice::from_ref(&account),
-        &AppConfig::default(),
-        &parsed,
+fn production_route_domain_is_stable_for_the_same_observed_route() {
+    let (snapshot, resolved) = minimax_messages_snapshot("minimax-domain");
+    let first = materialize_cn_catalog(
+        &snapshot,
         &resolved,
-        &parsed.requested_model,
-        "grok-4.5",
-        &body,
-        false,
-        &std::collections::HashMap::new(),
-        &std::collections::HashMap::new(),
-        None,
-        &static_contracts(),
-        &[],
-    )
-    .unwrap();
-    assert_eq!(before.routes.len(), 1);
-    assert_eq!(before.routes[0].plan.upstream, ApiFormat::Responses);
+        ApiFormat::Messages,
+        "MiniMax-New",
+        messages_history_body(None),
+    );
+    let second = materialize_cn_catalog(
+        &snapshot,
+        &resolved,
+        ApiFormat::Messages,
+        "MiniMax-New",
+        messages_history_body(None),
+    );
+    assert_eq!(first.routes.len(), 1, "{:?}", first.rejections);
+    let domain = first.routes[0]
+        .plan
+        .replay_domain
+        .expect("production materialize sets a route domain");
+    assert_eq!(
+        domain.hex(),
+        second.routes[0].plan.replay_domain.unwrap().hex()
+    );
+    assert_eq!(domain.hex().len(), 64);
+}
 
-    let now = Utc::now();
-    let mut persisted = crate::provider_contracts::PersistedContracts::default();
-    let scope = crate::provider_contracts::ContractScope::provider(OPENCODE_PROVIDER_ID);
-    persisted.evidence.insert(
-        scope.clone(),
-        vec![crate::provider_contracts::PersistedModelProtocol {
-            scope,
-            model_id: "grok-4.5".into(),
-            protocol: UpstreamProtocolKind::ChatCompletions,
-            source: crate::provider_contracts::ContractEvidenceSource::ProbeConfirmed,
-            verified_at: Some(now),
-            observed_at: Some(now),
-            last_probe_result: Some(crate::provider_contracts::ProbeResultKind::Success),
-            last_probe_at: Some(now),
-            last_probe_error: None,
-        }],
+#[test]
+fn native_history_restores_only_for_the_matching_credential() {
+    let (mut snapshot, resolved) = minimax_messages_snapshot("minimax-a");
+    snapshot.credentials[0].credential_id = "cred-a".into();
+    snapshot.credentials[0].credential_version = 1;
+    let mut other = snapshot.credentials[0].clone();
+    other.id = "minimax-b".into();
+    other.credential_id = "cred-b".into();
+    other.credential_version = 2;
+    other.binding_id = "binding-minimax-b".into();
+    let mut only_b = snapshot.clone();
+    only_b.credentials = vec![other.clone()];
+    let learned = materialize_cn_catalog(
+        &only_b,
+        &resolved,
+        ApiFormat::Messages,
+        "MiniMax-New",
+        messages_history_body(None),
     );
-    let contracts = crate::provider_contracts::build_effective_contracts(
-        &crate::zen_models::ZenFreeModelCatalog::default(),
-        &[],
-        persisted,
-    );
-    let after = materialize_account_routes(
-        &[account],
+    let domain = learned.routes[0].plan.replay_domain.unwrap();
+    let marked = ocg_gateway::protocol::bind_replay_opaque(domain, "sig-bytes").unwrap();
+    snapshot.credentials.push(other);
+    let parsed =
+        parse_client_request(ApiFormat::Messages, messages_history_body(Some(&marked))).unwrap();
+    let set = materialize_execution_routes(
+        &snapshot,
         &AppConfig::default(),
         &parsed,
         &resolved,
-        &parsed.requested_model,
-        "grok-4.5",
-        &body,
-        false,
-        &std::collections::HashMap::new(),
-        &std::collections::HashMap::new(),
+        "MiniMax-New",
+        "MiniMax-New",
         None,
-        &contracts,
-        &[],
     )
     .unwrap();
-    assert_eq!(after.routes.len(), 1);
-    assert_eq!(after.routes[0].plan.upstream, ApiFormat::ChatCompletions);
-    assert_eq!(after.routes[0].routing.account.id, "go-probe");
+    assert_eq!(set.routes.len(), 1, "{:?}", set.rejections);
+    assert_eq!(set.routes[0].routing.account.id, "minimax-b");
+    assert_eq!(
+        set.routes[0].plan.replay_domain.unwrap().hex(),
+        domain.hex()
+    );
+    let upstream: serde_json::Value = serde_json::from_slice(&set.routes[0].plan.body).unwrap();
+    assert_eq!(
+        upstream["messages"][1]["content"][0]["signature"], "sig-bytes",
+        "matching history is restored to the original opaque bytes"
+    );
+    assert!(
+        !upstream.to_string().contains("ocg-replay-v1"),
+        "the upstream body is not sent with the local marker"
+    );
+    assert_eq!(set.rejections.len(), 1, "{:?}", set.rejections);
+    assert_eq!(set.rejections[0].account_id.as_deref(), Some("minimax-a"));
+    assert!(
+        set.rejections[0].detail.contains("does not match"),
+        "{}",
+        set.rejections[0].detail
+    );
+}
+
+#[test]
+fn unmarked_or_foreign_native_history_is_rejected_before_send() {
+    let (snapshot, resolved) = minimax_messages_snapshot("minimax-unmarked");
+    let unmarked =
+        parse_client_request(ApiFormat::Messages, messages_history_body(Some("raw-sig"))).unwrap();
+    let error = expect_pre_send_rejection(materialize_execution_routes(
+        &snapshot,
+        &AppConfig::default(),
+        &unmarked,
+        &resolved,
+        "MiniMax-New",
+        "MiniMax-New",
+        None,
+    ));
+    assert!(error.contains("no route domain"), "{error}");
+
+    let foreign = ocg_gateway::protocol::ReplayDomain::parse(&"ab".repeat(32)).unwrap();
+    let marked = ocg_gateway::protocol::bind_replay_opaque(foreign, "sig-bytes").unwrap();
+    let mismatched =
+        parse_client_request(ApiFormat::Messages, messages_history_body(Some(&marked))).unwrap();
+    let error = expect_pre_send_rejection(materialize_execution_routes(
+        &snapshot,
+        &AppConfig::default(),
+        &mismatched,
+        &resolved,
+        "MiniMax-New",
+        "MiniMax-New",
+        None,
+    ));
+    assert!(error.contains("does not match"), "{error}");
+}
+
+#[test]
+fn exhausted_protocols_keep_transport_and_preservation_rejections() {
+    let (snapshot, resolved) = cn_catalog_snapshot(
+        AdapterKind::Kimi,
+        KIMI_PROVIDER_ID,
+        "kimi-mixed",
+        "kimi-for-coding",
+        &[
+            UpstreamProtocolKind::Responses,
+            UpstreamProtocolKind::Messages,
+        ],
+        UpstreamProtocolKind::Responses,
+    );
+    let body = Bytes::from(
+        serde_json::to_vec(&json!({
+            "model": "kimi-for-coding",
+            "max_tokens": 32,
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": "t", "signature": "raw-sig"},
+                    {"type": "text", "text": "ok"}
+                ]}
+            ]
+        }))
+        .unwrap(),
+    );
+    let parsed = parse_client_request(ApiFormat::Messages, body).unwrap();
+    let set = materialize_execution_routes(
+        &snapshot,
+        &AppConfig::default(),
+        &parsed,
+        &resolved,
+        "kimi-for-coding",
+        "kimi-for-coding",
+        None,
+    )
+    .expect("a mixed exhaustion remains a route set with no send");
+    assert!(set.routes.is_empty(), "{:?}", set.rejections);
+    assert_eq!(set.rejections.len(), 2, "{:?}", set.rejections);
+    let transport = set
+        .rejections
+        .iter()
+        .find(|rejection| rejection.code == RouteRejectionCode::ProductionRouteUnsupported)
+        .expect("unresolvable transport");
+    let preserved = set
+        .rejections
+        .iter()
+        .find(|rejection| rejection.code == RouteRejectionCode::CandidateMaterializationFailed)
+        .expect("native history preservation");
+    assert_eq!(transport.account_id.as_deref(), Some("kimi-mixed"));
+    assert_eq!(preserved.account_id.as_deref(), Some("kimi-mixed"));
+    assert!(
+        transport.detail.contains("no official upstream path"),
+        "{}",
+        transport.detail
+    );
+    assert!(
+        preserved.detail.contains("no route domain"),
+        "{}",
+        preserved.detail
+    );
+    let detail = set
+        .incompatibility
+        .expect("mixed exhaustion publishes an aggregate detail");
+    assert!(detail.contains(transport.detail.as_str()), "{detail}");
+    assert!(detail.contains(preserved.detail.as_str()), "{detail}");
+}
+
+fn expect_pre_send_rejection(result: Result<ExecutionRouteSet, super::ProtocolError>) -> String {
+    match result {
+        Err(error) => error.message,
+        Ok(set) => panic!(
+            "expected a pre-send rejection, got {} routes and {} rejections",
+            set.routes.len(),
+            set.rejections.len()
+        ),
+    }
 }

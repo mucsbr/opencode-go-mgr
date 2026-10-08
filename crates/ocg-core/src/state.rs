@@ -1,23 +1,15 @@
-use crate::application_connectors::{
-    ApplicationConnectorAction, ApplicationConnectorCapabilities, ApplicationConnectorCommit,
-    ApplicationConnectorCommitResult, ApplicationConnectorError, ApplicationConnectorErrorKind,
-    ApplicationConnectorHost, ApplicationConnectorHostOperation, ApplicationConnectorHostRequest,
-    ApplicationConnectorHostResult, ApplicationConnectorId, ApplicationConnectorInspection,
-    ApplicationConnectorPreview, ApplicationConnectorResult, ApplicationConnectorSecret,
-};
 use crate::crypto::KeyCipher;
 use crate::db::Database;
 use crate::desktop::DesktopCapabilities;
 use crate::gateway_runtime::GatewayRebindHost;
-use crate::kernel::pricing::{PricingEstimate, PricingSnapshot};
+use crate::kernel::pricing::{PricingLimits, PricingSnapshot};
 use crate::models::{
     AppConfig, normalize_client_root_url, normalize_opencode_invite_url, normalize_proxy_url,
 };
-use crate::pricing::{embedded_seed, ensure_current_adjustment_policy, ensure_seed_model_coverage};
+use crate::quota_recovery::QuotaEpisode;
 use crate::routing_runtime::RoutingRuntime;
-use ocg_domain::ids::PRIMARY_KEY_ID;
 use parking_lot::{Mutex, RwLock};
-use std::collections::BTreeMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -34,33 +26,56 @@ pub use crate::gateway_runtime::GatewayHandle;
 
 const CLIENT_ROOT_URL_ENV: &str = "OCG_CLIENT_ROOT_URL";
 
-// Note: Mutex lock ordering is (1) settings_update, (2) db, (3) config,
+// Note: Mutex lock ordering is (1) settings_update, (2) db, (2b) quota_probes,
+// (3) config,
 // (4) http_client, (5) gateway, (6) pricing, (7) zen_free_models,
-// (8) cpa_models, (9) provider_contracts, (10) dynamic_providers, (11) routing,
-// (12) credential_snapshot.
+// (7b) modelsdev_catalog / modelsdev_last_attempt,
+// (8) cpa_models, (9) unpublished_public_models, (10) provider_contracts,
+// (11) dynamic_providers, (12) routing, (13) credential_snapshot.
+// The models.dev locks are leaf locks: readers clone the Arc and drop the
+// guard before taking db, and the refresh task releases db before writing
+// modelsdev_catalog, so the two are never held together.
 // The CPA runtime status mutex is never held while acquiring another sync lock.
 // `activate_zen_free_model_catalog` acquires db → http_client →
 // zen_free_models → provider_contracts, then drops those before
 // `routing.reset()`. `reload_provider_contracts_locked` may already hold db
 // and then takes zen_free_models (read, dropped) before provider_contracts
-// (write). The desktop update-status mutex and the async pricing_refresh
-// guard are never held while acquiring another sync lock. The credential
+// (write). The desktop update-status mutex is never held while acquiring
+// another sync lock. The credential
 // snapshot write lock is always taken last (after db/config reads) and never
 // held while acquiring another lock; auth-path readers take only the
 // snapshot read lock. Never acquire in reverse order; always drop one before
 // acquiring another where possible. Do not hold the routing lock across DB
 // or network I/O. `gateway_clock` is immutable after construction and
 // lock-free to sample; the executor samples wall/mono before the db lock.
+// `gateway_preparation` extends the ordering: when it is nested with other
+// locks it is always the innermost, and its guard is always dropped before
+// any other lock is acquired. The read fast path takes it alone — ordinary
+// request preparation clones the published `Arc` and drops the read guard
+// immediately, never holding `settings_update` at all. Only a writer
+// (settings_update → db → … → gateway_preparation) or the revision-drift
+// rebuild path takes the gate.
 // Async gates: `settings_host_effects` (settings persist → listener rebind →
 // compensation) is acquired before `gateway_lifecycle` when a settings write
 // also rebinds. Never hold a parking_lot lock across those awaits.
 // Account, key, and usage-sync writers take `settings_update` only.
 pub struct CoreStateInner {
+    pub(crate) debug_capture: crate::gateway::debug_capture::DebugCapture,
     pub db: Mutex<Database>,
     pub config: Mutex<AppConfig>,
     client_root_url_override: Option<String>,
     gateway_port_override: OnceLock<u16>,
     pub settings_update: Mutex<()>,
+    /// Atomically published request-preparation aggregate. Ordinary Gateway
+    /// preparation clones one `Arc` here under a short read lock instead of
+    /// taking `settings_update`. Writers republish after installing their
+    /// in-memory state; see `publish_gateway_preparation`.
+    ///
+    /// When nested with other locks this is always the LAST one acquired
+    /// (a writer holds `settings_update` and `db` before publishing), and
+    /// every reader drops its guard before acquiring anything else. The
+    /// read fast path takes it alone.
+    gateway_preparation: RwLock<Arc<GatewayPreparationSnapshot>>,
     /// Serializes settings persist → listener rebind → compensation. This async
     /// gate may span listener bind awaits; the synchronous `settings_update`
     /// mutex may not. Account, key, and usage-sync writers do not take it.
@@ -76,6 +91,10 @@ pub struct CoreStateInner {
     /// `set_config` (primary refresh).
     pub credential_snapshot: RwLock<crate::gateway_keys::CredentialSnapshot>,
     pub gateway: Mutex<Option<GatewayHandle>>,
+    /// Current listener failure, independent of historical dashboard logs.
+    gateway_last_error: Mutex<Option<String>>,
+    /// The currently accepted desktop update owns one receipt through finish.
+    desktop_update_operation: Mutex<Option<crate::user_operation::UserOperation>>,
     /// Serializes complete listener replacement transitions. This async gate
     /// may span listener shutdown awaits; the synchronous `gateway` mutex may
     /// not.
@@ -88,17 +107,30 @@ pub struct CoreStateInner {
     dashboard_public_listeners: AtomicU64,
     /// Process-level auto-start, Dock, and desktop-update hooks. Unset in CLI/Docker.
     desktop: DesktopCapabilities,
-    /// Process-level local application connector Host hook. Unset in CLI/Docker.
-    application_connector_capabilities: ApplicationConnectorCapabilities,
     pub dashboard_dir: Mutex<Option<PathBuf>>,
     http_client: Mutex<Arc<crate::http_client::ForwardRouteSet>>,
     pricing: RwLock<Arc<PricingSnapshot>>,
-    pub pricing_refresh: tokio::sync::Mutex<()>,
     zen_free_models: RwLock<Arc<crate::kernel::zen::ZenFreeModelCatalog>>,
+    pub(crate) modelsdev_catalog: RwLock<Arc<crate::modelsdev::ModelsDevCatalog>>,
     cpa_models: RwLock<Arc<Vec<String>>>,
+    unpublished_public_models: RwLock<Arc<HashSet<String>>>,
     pub zen_free_models_refresh: tokio::sync::Mutex<()>,
+    /// Serializes the lazy background models.dev catalog refresh. Arc so the
+    /// detached refresh task can hold an owned guard without borrowing state.
+    pub modelsdev_refresh: Arc<tokio::sync::Mutex<()>>,
+    /// Last models.dev refresh attempt; throttles retries after failures.
+    pub(crate) modelsdev_last_attempt: Mutex<Option<chrono::DateTime<chrono::Utc>>>,
     pub provider_models_refresh: tokio::sync::Mutex<()>,
-    pub provider_usage_refresh: tokio::sync::Mutex<()>,
+    pub(crate) provider_usage_refresh: crate::usage_sync::ProviderUsageRefreshGate,
+    pub(crate) balance_refresh:
+        crate::usage_sync::SingleFlight<Result<(), crate::dashboard_v3::V3ApiError>>,
+    /// Leaf lock, acquired only after settings_update and db; never over I/O.
+    pub(crate) management_page_cache: Mutex<crate::dashboard_v4::pages::PageReadCache>,
+    pub(crate) management_auto_refresh: Mutex<crate::dashboard_v4::pages::AutomaticRefreshCache>,
+    pub(crate) management_page_refresh: crate::usage_sync::SingleFlight<
+        Result<crate::dashboard_v4::pages::RefreshOutcome, crate::dashboard_v3::V3ApiError>,
+    >,
+    pub(crate) billing_cache: Mutex<crate::dashboard_v4::billing_cache::BillingReadCache>,
     /// Serializes typed operations against the one local CPA integration.
     /// Network calls may hold this async gate but never the SQLite mutex.
     pub cpa_operations: tokio::sync::Mutex<()>,
@@ -109,10 +141,15 @@ pub struct CoreStateInner {
     provider_contracts: RwLock<Arc<crate::provider_contracts::EffectiveContractSet>>,
     dynamic_providers: RwLock<Arc<Vec<crate::dynamic::DynamicProviderRuntime>>>,
     pub routing: RoutingRuntime,
+    /// Ephemeral resource admission. Never held while acquiring the database lock.
+    pub(crate) recovery: Arc<crate::gateway::recovery::RecoveryRuntime>,
     pub browser: crate::browser::BrowserRuntime,
     /// Official Go usage sync gates (concurrency, dedupe, clock/jitter seams).
     /// The background loop is started from gateway startup, not construction.
     pub usage_sync: crate::usage_sync::UsageSyncRuntime,
+    /// In-process per-Key quota trial leases. Never persisted. Taken after
+    /// `db` and never held across network I/O.
+    pub(crate) quota_probes: Mutex<HashMap<String, QuotaEpisode>>,
     /// Host-private dual clock for Gateway selection (wall + monotonic).
     /// Distinct from `usage_sync`'s calendar clock and not stored on request
     /// snapshots. Sampled through [`Self::sample_gateway_clock`].
@@ -132,53 +169,216 @@ pub(crate) struct ImportedNodeRuntime {
     credentials: crate::gateway_keys::CredentialSnapshot,
 }
 
-fn sealed_proxy_model_ids(
-    contracts: &crate::provider_contracts::EffectiveContractSet,
-    cpa_models: &[String],
-) -> Vec<String> {
-    [
-        crate::kernel::ids::MINIMAX_PROVIDER_ID,
-        crate::kernel::ids::KIMI_PROVIDER_ID,
-    ]
-    .into_iter()
-    .filter_map(|provider_id| contracts.provider_offering(provider_id))
-    .flat_map(|contract| contract.catalog.models.iter().cloned())
-    .chain(cpa_models.iter().cloned())
-    .collect()
+/// Immutable, atomically published view of everything one Gateway request
+/// preparation needs from configuration-derived state.
+///
+/// This replaces the old `settings_update` gate that every request acquired to
+/// keep several independent reads (routing projection, config, and the
+/// contracts-backed route set) from disagreeing with each other. Holding one published
+/// value gives the same agreement without serializing ordinary traffic against
+/// dashboard writes: a writer mutates the database and installs its in-memory
+/// state under `settings_update`, then swaps a single `Arc`.
+///
+/// The credential *authentication* table is deliberately not part of this
+/// aggregate; it keeps its own short-lock map (see `credential_snapshot`) so
+/// revocation and rotation stay independent of preparation.
+///
+/// `revision` is the `settings_revision` this view was published at. A reader
+/// that observes a newer revision has found a writer that installed in-memory
+/// state without republishing, so it rebuilds through the gate instead of
+/// serving a stale aggregate. That keeps an incomplete publish matrix a
+/// performance regression rather than a correctness bug.
+pub(crate) struct GatewayPreparationSnapshot {
+    revision: u64,
+    routing: crate::routing_snapshot::RoutingSnapshot,
+    config: AppConfig,
+    routes: Arc<crate::http_client::ForwardRouteSet>,
 }
 
-fn normalize_connector_values(
-    input: BTreeMap<String, String>,
-) -> ApplicationConnectorResult<BTreeMap<String, String>> {
-    let mut output = BTreeMap::new();
-    for (key, value) in input {
-        let (key, value) = (key.trim(), value.trim());
-        if key.is_empty()
-            || key.len() > 128
-            || value.len() > 4096
-            || key.contains(['\r', '\n', '='])
-        {
-            return Err(ApplicationConnectorError::new(
-                ApplicationConnectorErrorKind::InvalidRequest,
-                "invalid model selection",
-            ));
+impl GatewayPreparationSnapshot {
+    /// The `settings_revision` this generation was published at. A reader whose
+    /// own revision differs has found drift and must rebuild.
+    pub(crate) fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    /// Frozen routing projection and execution credentials for this generation.
+    pub(crate) fn routing(&self) -> &crate::routing_snapshot::RoutingSnapshot {
+        &self.routing
+    }
+
+    pub(crate) fn config(&self) -> &AppConfig {
+        &self.config
+    }
+
+    pub(crate) fn routes(&self) -> Arc<crate::http_client::ForwardRouteSet> {
+        self.routes.clone()
+    }
+}
+
+/// Routing, config, and route set assembled for one preparation generation.
+struct GatewayPreparationView {
+    routing: crate::routing_snapshot::RoutingSnapshot,
+    config: AppConfig,
+    routes: Arc<crate::http_client::ForwardRouteSet>,
+}
+
+/// In-memory placeholder when no historical pricing snapshot is stored.
+/// It is never inserted and never used to price a request.
+fn inert_pricing_snapshot() -> PricingSnapshot {
+    PricingSnapshot {
+        revision: String::new(),
+        activated_at: String::new(),
+        document_updated_at: String::new(),
+        source_url: String::new(),
+        content_hash: String::new(),
+        limits: PricingLimits {
+            window_5h: 0.0,
+            window_week: 0.0,
+            window_month: 0.0,
+        },
+        models: Vec::new(),
+        adjustment_policy_version: String::new(),
+    }
+}
+
+/// One exact upstream model id the executor can send, used by Settings
+/// `proxy_supported_models` and list-mode route-set construction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProxyModelCandidate {
+    pub id: String,
+    pub preferred_protocol: String,
+    pub zen_free: bool,
+}
+
+#[cfg(test)]
+pub(crate) fn build_proxy_model_candidates(
+    contracts: &crate::provider_contracts::EffectiveContractSet,
+    custom_runtimes: &[crate::custom::CustomAccountRuntime],
+    dynamic_providers: &[crate::dynamic::DynamicProviderRuntime],
+    cpa_models: &[String],
+) -> Vec<ProxyModelCandidate> {
+    use crate::kernel::ids::normalize_model_name;
+    use crate::provider::ProviderAdapterKind;
+    use std::collections::BTreeMap;
+
+    let mut by_key: BTreeMap<String, ProxyModelCandidate> = BTreeMap::new();
+    let mut insert = |id: &str, preferred_protocol: &str, zen_free: bool| {
+        let id = id.trim();
+        if id.is_empty() {
+            return;
         }
-        if !value.is_empty() {
-            output.insert(key.into(), value.into());
+        let key = normalize_model_name(id);
+        let entry = by_key.entry(key).or_insert_with(|| ProxyModelCandidate {
+            id: id.to_string(),
+            preferred_protocol: preferred_protocol.to_string(),
+            zen_free,
+        });
+        if zen_free {
+            entry.zen_free = true;
+        }
+    };
+
+    for contract in contracts.providers.values() {
+        let zen_free = contract.adapter_kind == ProviderAdapterKind::ZenFree;
+        for model in contract.models.values() {
+            if !model.has_enabled_protocol() {
+                continue;
+            }
+            let protocol = if model
+                .protocols
+                .get(model.preferred_protocol.as_str())
+                .is_some_and(|row| row.enabled)
+            {
+                model.preferred_protocol.as_str()
+            } else {
+                model
+                    .enabled_protocols()
+                    .first()
+                    .map(|protocol| protocol.as_str())
+                    .unwrap_or(model.preferred_protocol.as_str())
+            };
+            insert(&model.model_id, protocol, zen_free);
         }
     }
-    Ok(output)
+
+    for runtime in custom_runtimes.iter().filter(|runtime| runtime.eligible()) {
+        for capability in &runtime.capabilities {
+            insert(
+                &capability.upstream_model,
+                capability.protocol.as_str(),
+                false,
+            );
+        }
+    }
+
+    for provider in dynamic_providers {
+        for mapping in &provider.mappings {
+            let protocol = provider.effective_route(mapping).protocol;
+            insert(&mapping.upstream_model, protocol.as_str(), false);
+        }
+    }
+
+    for id in cpa_models {
+        insert(id, "chat_completions", false);
+    }
+
+    by_key.into_values().collect()
 }
 
-fn connector_internal(error: anyhow::Error) -> ApplicationConnectorError {
-    ApplicationConnectorError::new(ApplicationConnectorErrorKind::Internal, error.to_string())
+fn proxy_candidate_ids(candidates: &[ProxyModelCandidate]) -> Vec<String> {
+    candidates
+        .iter()
+        .map(|candidate| candidate.id.clone())
+        .collect()
 }
 
-fn connector_invalid_host() -> ApplicationConnectorError {
-    ApplicationConnectorError::new(
-        ApplicationConnectorErrorKind::Internal,
-        "application connector Host returned an invalid response",
-    )
+pub(crate) fn persisted_proxy_model_candidates(
+    projection: &crate::destination_projection::DestinationProjection,
+) -> Vec<ProxyModelCandidate> {
+    let mut candidates = std::collections::BTreeMap::<String, ProxyModelCandidate>::new();
+    for destination in projection
+        .destinations
+        .iter()
+        .filter(|destination| destination.enabled)
+    {
+        for model in destination
+            .catalog
+            .iter()
+            .filter(|model| model.enabled && !model.protocols.is_empty())
+        {
+            let preferred = model
+                .preferred
+                .filter(|protocol| model.protocols.contains(protocol))
+                .unwrap_or(model.protocols[0]);
+            candidates
+                .entry(crate::kernel::ids::model_identity_key(
+                    &model.upstream_model,
+                ))
+                .and_modify(|candidate| {
+                    if model.upstream_model < candidate.id {
+                        candidate.id = model.upstream_model.clone();
+                        candidate.preferred_protocol = preferred.as_str().to_string();
+                    }
+                    candidate.zen_free |=
+                        destination.adapter == ocg_domain::destination::AdapterKind::Zen;
+                })
+                .or_insert_with(|| ProxyModelCandidate {
+                    id: model.upstream_model.clone(),
+                    preferred_protocol: preferred.as_str().to_string(),
+                    zen_free: destination.adapter == ocg_domain::destination::AdapterKind::Zen,
+                });
+        }
+    }
+    candidates.into_values().collect()
+}
+
+fn build_proxy_route_set(
+    config: &crate::models::AppConfig,
+    projection: &crate::destination_projection::DestinationProjection,
+) -> crate::Result<crate::http_client::ForwardRouteSet> {
+    let candidates = persisted_proxy_model_candidates(projection);
+    crate::http_client::build_route_set_from_known_models(config, &proxy_candidate_ids(&candidates))
 }
 
 /// Host-effect failures from [`CoreStateInner::apply_host_settings`].
@@ -194,10 +394,55 @@ pub enum HostSettingsError {
     GatewayBind(anyhow::Error),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HostSettingsEffects {
+    None,
+    Partial,
+    Compensated,
+}
+
+#[derive(Debug)]
+pub(crate) struct HostSettingsFailure {
+    pub error: HostSettingsError,
+    pub effects: HostSettingsEffects,
+}
+
+impl From<HostSettingsError> for HostSettingsFailure {
+    fn from(error: HostSettingsError) -> Self {
+        Self {
+            error,
+            effects: HostSettingsEffects::None,
+        }
+    }
+}
+
+fn configuration_changes_restored(
+    previous: &AppConfig,
+    committed: &AppConfig,
+    current: &AppConfig,
+) -> bool {
+    let (
+        Ok(serde_json::Value::Object(previous)),
+        Ok(serde_json::Value::Object(committed)),
+        Ok(serde_json::Value::Object(current)),
+    ) = (
+        serde_json::to_value(previous),
+        serde_json::to_value(committed),
+        serde_json::to_value(current),
+    )
+    else {
+        return false;
+    };
+    committed
+        .iter()
+        .filter(|(field, value)| previous.get(*field) != Some(*value))
+        .all(|(field, _)| current.get(field) == previous.get(field))
+}
+
 impl HostSettingsError {
-    pub const AUTO_START_UNAVAILABLE: &'static str = "auto-start is unavailable in this runtime";
+    pub const AUTO_START_UNAVAILABLE: &'static str = crate::desktop::AUTO_START_UNAVAILABLE;
     pub const DOCK_VISIBILITY_UNAVAILABLE: &'static str =
-        "Dock visibility is unavailable in this runtime";
+        crate::desktop::DOCK_VISIBILITY_UNAVAILABLE;
 }
 
 impl fmt::Display for HostSettingsError {
@@ -286,10 +531,10 @@ impl CoreStateInner {
             let level = if browser_recovery.issues.is_empty() {
                 "info"
             } else {
-                eprintln!("warning: {summary}: {}", browser_recovery.issues.join("; "));
+                tracing::warn!("{summary}: {}", browser_recovery.issues.join("; "));
                 "warn"
             };
-            let _ = db.log_gateway(level, "browser", &summary);
+            crate::process_log::diagnostic(level, "browser", &summary);
         }
         let (config, needs_persist) = load_config(&db)?;
         config.validate().map_err(anyhow::Error::msg)?;
@@ -299,78 +544,100 @@ impl CoreStateInner {
         }
         let credential_snapshot =
             crate::gateway_keys::build_credential_snapshot(&db, &config.gateway_key)?;
-        let pricing = match db.latest_pricing_snapshot()? {
-            Some(snapshot) => {
-                let previous_revision = snapshot.revision.clone();
-                let snapshot = ensure_current_adjustment_policy(snapshot);
-                let snapshot = ensure_seed_model_coverage(snapshot);
-                if snapshot.revision != previous_revision {
-                    db.insert_pricing_snapshot(&snapshot)?;
-                }
-                snapshot
-            }
-            None => {
-                let snapshot = embedded_seed();
-                db.insert_pricing_snapshot(&snapshot)?;
-                snapshot
-            }
-        };
+        let pricing = db
+            .latest_pricing_snapshot()?
+            .unwrap_or_else(inert_pricing_snapshot);
         let zen_free_models = db.zen_free_model_catalog()?.unwrap_or_default();
+        let modelsdev_catalog = crate::modelsdev::load(&db)?;
         let cpa_models = db
             .cpa_model_catalog()?
-            .map(|catalog| crate::db::CpaCatalogModel::ids(&catalog.models))
+            .map(|catalog| crate::db::CpaCatalogModel::enabled_ids(&catalog.models))
             .unwrap_or_default();
+        let unpublished_public_models = db
+            .list_unpublished_public_models()?
+            .into_iter()
+            .collect::<HashSet<_>>();
         let custom_runtimes = db.list_custom_account_runtimes()?;
         let dynamic_providers = db.list_dynamic_providers()?;
-        let provider_contracts = crate::provider_contracts::build_effective_contracts(
+        let mut provider_contracts = crate::provider_contracts::build_effective_contracts(
             &zen_free_models,
             &custom_runtimes,
             db.load_persisted_contracts()?,
         );
-        let provider_models = sealed_proxy_model_ids(&provider_contracts, &cpa_models);
-        let http_client = crate::http_client::build_route_set_with_provider_models(
-            &config,
-            &zen_free_models,
-            &provider_models,
-        )?;
+        provider_contracts
+            .apply_destination_configuration(&crate::destination_projection::load_runtime(&db)?);
+        let http_client =
+            build_proxy_route_set(&config, &crate::destination_projection::load_runtime(&db)?)?;
+        let policy_snapshot = crate::gateway::policy::load_runtime_snapshot(&db)?;
+        let settings_revision = (uuid::Uuid::new_v4().as_u128() as u64) & 0x0000_FFFF_FFFF_FFFF;
+        let pricing = Arc::new(pricing);
+        let http_client = Arc::new(http_client);
+        // Publish the first aggregate from the same committed rows every other
+        // field was loaded from, so request preparation never has to take
+        // `settings_update` before the first writer runs.
+        let gateway_preparation = GatewayPreparationSnapshot {
+            revision: settings_revision,
+            routing: crate::routing_snapshot::RoutingSnapshot::load(&db)?,
+            config: config.clone(),
+            routes: http_client.clone(),
+        };
         Ok(Self {
+            debug_capture: crate::gateway::debug_capture::DebugCapture::from_env(&data_dir),
             db: Mutex::new(db),
             config: Mutex::new(config),
             client_root_url_override,
             gateway_port_override: OnceLock::new(),
             settings_update: Mutex::new(()),
+            gateway_preparation: RwLock::new(Arc::new(gateway_preparation)),
             settings_host_effects: tokio::sync::Mutex::new(()),
             // Use a per-runtime random epoch so a browser tab left open across a
             // process restart cannot accidentally match the new runtime's first
             // revision. The low 48 bits leave ample room for monotonic increments.
-            settings_revision: AtomicU64::new(
-                (uuid::Uuid::new_v4().as_u128() as u64) & 0x0000_FFFF_FFFF_FFFF,
-            ),
+            settings_revision: AtomicU64::new(settings_revision),
             process_generation: (uuid::Uuid::new_v4().as_u128() as u64) & 0x0000_FFFF_FFFF_FFFF,
             credential_snapshot: RwLock::new(credential_snapshot),
             gateway: Mutex::new(None),
+            gateway_last_error: Mutex::new(None),
+            desktop_update_operation: Mutex::new(None),
             gateway_lifecycle: tokio::sync::Mutex::new(()),
             dashboard_session_token: Mutex::new(uuid::Uuid::new_v4().simple().to_string()),
             dashboard_local_mode: AtomicBool::new(false),
             dashboard_public_listeners: AtomicU64::new(0),
             desktop: DesktopCapabilities::new(),
-            application_connector_capabilities: ApplicationConnectorCapabilities::new(),
             dashboard_dir: Mutex::new(None),
-            http_client: Mutex::new(Arc::new(http_client)),
-            pricing: RwLock::new(Arc::new(pricing)),
-            pricing_refresh: tokio::sync::Mutex::new(()),
+            http_client: Mutex::new(http_client),
+            pricing: RwLock::new(pricing),
             zen_free_models: RwLock::new(Arc::new(zen_free_models)),
+            modelsdev_catalog: RwLock::new(Arc::new(modelsdev_catalog)),
             cpa_models: RwLock::new(Arc::new(cpa_models)),
+            unpublished_public_models: RwLock::new(Arc::new(unpublished_public_models)),
             zen_free_models_refresh: tokio::sync::Mutex::new(()),
+            modelsdev_refresh: Arc::new(tokio::sync::Mutex::new(())),
+            modelsdev_last_attempt: Mutex::new(None),
             provider_models_refresh: tokio::sync::Mutex::new(()),
-            provider_usage_refresh: tokio::sync::Mutex::new(()),
+            provider_usage_refresh: crate::usage_sync::ProviderUsageRefreshGate::new(
+                crate::usage_sync::PROVIDER_REFRESH_CONCURRENCY,
+            ),
+            balance_refresh: crate::usage_sync::SingleFlight::default(),
+            management_page_cache: Mutex::new(crate::dashboard_v4::pages::PageReadCache::default()),
+            management_auto_refresh: Mutex::new(
+                crate::dashboard_v4::pages::AutomaticRefreshCache::default(),
+            ),
+            management_page_refresh: crate::usage_sync::SingleFlight::default(),
+            billing_cache: Mutex::new(
+                crate::dashboard_v4::billing_cache::BillingReadCache::default(),
+            ),
             cpa_operations: tokio::sync::Mutex::new(()),
             cpa_runtime: crate::cpa_runtime::CpaRuntimeCapabilities::new(),
             provider_contracts: RwLock::new(Arc::new(provider_contracts)),
             dynamic_providers: RwLock::new(Arc::new(dynamic_providers)),
             routing: RoutingRuntime::new(),
+            recovery: Arc::new(crate::gateway::recovery::RecoveryRuntime::with_snapshot(
+                policy_snapshot,
+            )),
             browser: crate::browser::BrowserRuntime::new(),
             usage_sync: crate::usage_sync::UsageSyncRuntime::new(),
+            quota_probes: Mutex::new(HashMap::new()),
             gateway_clock,
             data_dir,
             cipher,
@@ -384,6 +651,27 @@ impl CoreStateInner {
         &self,
     ) -> (chrono::DateTime<chrono::Utc>, std::time::Instant) {
         (self.gateway_clock.now_wall(), self.gateway_clock.now_mono())
+    }
+
+    pub(crate) fn is_quota_probing(
+        &self,
+        credential_id: &str,
+        credential_version: u64,
+        key_cipher: &str,
+        epoch: u64,
+    ) -> bool {
+        self.quota_probes
+            .lock()
+            .get(credential_id)
+            .is_some_and(|episode| {
+                crate::routing_snapshot::quota_episode_matches(
+                    episode,
+                    credential_id,
+                    credential_version,
+                    key_cipher,
+                    epoch,
+                )
+            })
     }
 
     pub fn config(&self) -> AppConfig {
@@ -449,6 +737,85 @@ impl CoreStateInner {
         self.http_client.lock().clone()
     }
 
+    /// One consistent request-preparation view, without holding
+    /// `settings_update`.
+    ///
+    /// Fast path: the published aggregate is current, so this is a read lock, an
+    /// `Arc` clone, and an atomic revision compare. Slow path: a writer bumped
+    /// `settings_revision` without republishing, so rebuild under the gate —
+    /// `settings_update` then `db`, per the lock ordering — and publish. The
+    /// slow path is what makes an incomplete publish matrix a latency
+    /// regression instead of a stale-routing bug.
+    pub(crate) fn gateway_preparation(&self) -> crate::Result<Arc<GatewayPreparationSnapshot>> {
+        {
+            let published = self.gateway_preparation.read().clone();
+            if published.revision() == self.settings_revision.load(Ordering::Acquire) {
+                return Ok(published);
+            }
+        }
+        // Take the gate before the aggregate write lock; never the reverse.
+        let _settings_update = self.settings_update.lock();
+        {
+            let published = self.gateway_preparation.read().clone();
+            if published.revision() == self.settings_revision.load(Ordering::Acquire) {
+                return Ok(published);
+            }
+        }
+        let next = self.build_gateway_preparation(&self.db.lock())?;
+        let published = Arc::new(next);
+        *self.gateway_preparation.write() = published.clone();
+        Ok(published)
+    }
+
+    /// Assemble the aggregate from one consistent read. The caller must already
+    /// hold `settings_update` (or otherwise exclude concurrent writers) and must
+    /// pass the same database view the in-memory state was installed from, so
+    /// the published generation cannot mix new rows with old config.
+    fn assemble_gateway_preparation(
+        &self,
+        db: &Database,
+    ) -> crate::Result<GatewayPreparationSnapshot> {
+        let view = self.read_gateway_preparation_view(db)?;
+        Ok(GatewayPreparationSnapshot {
+            revision: self.settings_revision.load(Ordering::Acquire),
+            routing: view.routing,
+            config: view.config,
+            routes: view.routes,
+        })
+    }
+
+    /// Read the preparation aggregate in the documented order
+    /// (db -> config -> http_client).
+    fn read_gateway_preparation_view(
+        &self,
+        db: &Database,
+    ) -> crate::Result<GatewayPreparationView> {
+        Ok(GatewayPreparationView {
+            routing: crate::routing_snapshot::RoutingSnapshot::load(db)?,
+            config: self.config(),
+            routes: self.forward_route_set(),
+        })
+    }
+
+    fn build_gateway_preparation(
+        &self,
+        db: &Database,
+    ) -> crate::Result<GatewayPreparationSnapshot> {
+        self.assemble_gateway_preparation(db)
+    }
+
+    /// Republish the aggregate with a single `Arc` swap. Call this after any
+    /// writer installs in-memory state or commits rows that change the
+    /// request-preparation view, while still holding `settings_update`.
+    pub(crate) fn publish_gateway_preparation(&self, db: &Database) -> crate::Result<()> {
+        // Assemble before taking the write guard: assembling reads `config` and
+        // `http_client`, both of which sit above `gateway_preparation` in the
+        // ordering.
+        let next = self.assemble_gateway_preparation(db)?;
+        *self.gateway_preparation.write() = Arc::new(next);
+        Ok(())
+    }
+
     pub fn pricing_snapshot(&self) -> Arc<PricingSnapshot> {
         self.pricing.read().clone()
     }
@@ -457,8 +824,43 @@ impl CoreStateInner {
         self.zen_free_models.read().clone()
     }
 
+    pub(crate) fn modelsdev_catalog(&self) -> Arc<crate::modelsdev::ModelsDevCatalog> {
+        self.modelsdev_catalog.read().clone()
+    }
+
     pub fn cpa_model_catalog(&self) -> Arc<Vec<String>> {
         self.cpa_models.read().clone()
+    }
+
+    pub fn unpublished_public_models(&self) -> Arc<HashSet<String>> {
+        self.unpublished_public_models.read().clone()
+    }
+
+    pub fn unpublished_public_model_list(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.unpublished_public_models().iter().cloned().collect();
+        names.sort();
+        names
+    }
+
+    /// Hide or restore one public name on `GET /v1/models`. Routing is unchanged.
+    /// `public_model` must already be a normalized key.
+    pub fn set_public_model_published(
+        &self,
+        public_model: &str,
+        published: bool,
+    ) -> crate::Result<Vec<String>> {
+        let db = self.db.lock();
+        if published {
+            db.remove_unpublished_public_model(public_model)?;
+        } else {
+            db.upsert_unpublished_public_model(public_model)?;
+        }
+        let unpublished = db.list_unpublished_public_models()?;
+        *self.unpublished_public_models.write() = Arc::new(unpublished.iter().cloned().collect());
+        // Publication is part of the model's catalog view, which request
+        // preparation resolves aliases against.
+        self.publish_gateway_preparation(&db)?;
+        Ok(unpublished)
     }
 
     pub fn activate_cpa_model_catalog(
@@ -467,45 +869,98 @@ impl CoreStateInner {
         source_url: &str,
         refreshed_at: chrono::DateTime<chrono::Utc>,
     ) -> crate::Result<()> {
-        let ids = crate::db::CpaCatalogModel::ids(&models);
-        let zen = self.zen_free_model_catalog();
-        let contracts = self.provider_contracts();
-        let provider_models = sealed_proxy_model_ids(&contracts, &ids);
-        let route_set = crate::http_client::build_route_set_with_provider_models(
-            &self.config(),
-            &zen,
-            &provider_models,
-        )?;
+        let ids = crate::db::CpaCatalogModel::enabled_ids(&models);
+        let mut projection = crate::destination_projection::load_runtime(&self.db.lock())?;
+        if let Some(destination) = projection
+            .destinations
+            .iter_mut()
+            .find(|destination| destination.adapter == ocg_domain::destination::AdapterKind::Cpa)
+        {
+            destination.catalog = crate::db::destination_store::cpa_catalog(&models);
+        }
+        let route_set = build_proxy_route_set(&self.config(), &projection)?;
         {
             let db = self.db.lock();
-            let mut http_client = self.http_client.lock();
-            let mut active = self.cpa_models.write();
-            db.replace_cpa_model_catalog(&models, source_url, refreshed_at)?;
-            *http_client = Arc::new(route_set);
-            *active = Arc::new(ids);
+            {
+                let mut http_client = self.http_client.lock();
+                let mut active = self.cpa_models.write();
+                db.replace_cpa_model_catalog(&models, source_url, refreshed_at)?;
+                *http_client = Arc::new(route_set);
+                *active = Arc::new(ids);
+            }
+            // Publish only after the pointer guards are released: the publish
+            // reads `config` and `http_client`, which sit *below* the catalog
+            // locks in the documented ordering, so taking them while those
+            // guards are held would invert it and deadlock against a concurrent
+            // `set_config`. `db` is still held, so a drift rebuild cannot
+            // interleave, and a fast-path reader keeps the previous — still
+            // self-consistent — generation until the swap lands.
+            self.publish_gateway_preparation(&db)?;
         }
         self.routing.reset();
         Ok(())
     }
 
+    /// Replace the routed CPA catalog subset. Unknown IDs are rejected; an
+    /// empty selection publishes no CPA models.
+    pub fn set_cpa_model_routing(&self, enabled_ids: &[String]) -> crate::Result<()> {
+        let catalog = {
+            let db = self.db.lock();
+            db.cpa_model_catalog()?
+        };
+        let Some(catalog) = catalog else {
+            anyhow::bail!("CPA model catalog has not been refreshed");
+        };
+        let known: std::collections::HashSet<&str> = catalog
+            .models
+            .iter()
+            .map(|model| model.id.as_str())
+            .collect();
+        let enabled_ids: Vec<String> = enabled_ids.iter().map(|id| id.trim().to_string()).collect();
+        for id in &enabled_ids {
+            anyhow::ensure!(
+                known.contains(id.as_str()),
+                "enabledIds must be models from the saved CPA catalog"
+            );
+        }
+        let selected: std::collections::HashSet<&str> =
+            enabled_ids.iter().map(String::as_str).collect();
+        let models = catalog
+            .models
+            .into_iter()
+            .map(|mut model| {
+                model.enabled = selected.contains(model.id.as_str());
+                model
+            })
+            .collect();
+        self.activate_cpa_model_catalog(
+            models,
+            &catalog.source_url,
+            catalog.refreshed_at.unwrap_or_else(chrono::Utc::now),
+        )
+    }
+
     /// Atomically remove OCG-owned CPA configuration, singleton account, and
     /// catalog snapshot. CPA auth files and OAuth state remain external.
     pub fn disconnect_cpa_integration(&self) -> crate::Result<()> {
-        let zen = self.zen_free_model_catalog();
-        let contracts = self.provider_contracts();
-        let provider_models = sealed_proxy_model_ids(&contracts, &[]);
-        let route_set = crate::http_client::build_route_set_with_provider_models(
-            &self.config(),
-            &zen,
-            &provider_models,
-        )?;
+        let mut projection = crate::destination_projection::load_runtime(&self.db.lock())?;
+        projection
+            .destinations
+            .retain(|destination| destination.adapter != ocg_domain::destination::AdapterKind::Cpa);
+        let route_set = build_proxy_route_set(&self.config(), &projection)?;
         {
             let db = self.db.lock();
-            let mut http_client = self.http_client.lock();
-            let mut active = self.cpa_models.write();
-            db.delete_cpa_integration()?;
-            *http_client = Arc::new(route_set);
-            *active = Arc::new(Vec::new());
+            {
+                let mut http_client = self.http_client.lock();
+                let mut active = self.cpa_models.write();
+                db.delete_cpa_integration()?;
+                *http_client = Arc::new(route_set);
+                *active = Arc::new(Vec::new());
+            }
+            // Publish after the catalog pointer guards are released; see
+            // `activate_cpa_model_catalog` for why the publish cannot run under
+            // them.
+            self.publish_gateway_preparation(&db)?;
         }
         self.routing.reset();
         Ok(())
@@ -515,34 +970,40 @@ impl CoreStateInner {
         &self,
         catalog: crate::kernel::zen::ZenFreeModelCatalog,
     ) -> crate::Result<()> {
-        let previous_models = self
-            .provider_contracts()
-            .scope(&crate::provider_contracts::ContractScope::provider(
-                crate::kernel::ids::OPENCODE_ZEN_FREE_PROVIDER_ID,
-            ))
-            .map(|contract| contract.catalog.models.clone())
-            .unwrap_or_default();
-        let contracts_snapshot = self.provider_contracts();
-        let cpa_models = self.cpa_model_catalog();
-        let provider_models = sealed_proxy_model_ids(&contracts_snapshot, &cpa_models);
-        let route_set = crate::http_client::build_route_set_with_provider_models(
-            &self.config(),
-            &catalog,
-            &provider_models,
-        )?;
+        let config = self.config();
         {
             let db = self.db.lock();
-            let mut http_client = self.http_client.lock();
-            let mut active = self.zen_free_models.write();
-            let mut contracts = self.provider_contracts.write();
-            db.set_zen_free_model_catalog_with_default_off(&catalog, &previous_models)?;
-            *active = Arc::new(catalog);
-            *contracts = Arc::new(crate::provider_contracts::build_effective_contracts(
-                &active,
-                &db.list_custom_account_runtimes()?,
-                db.load_persisted_contracts()?,
-            ));
-            *http_client = Arc::new(route_set);
+            // The setter participates in this transaction. Build from its exact
+            // uncommitted rows so a failed client/catalog preflight rolls back
+            // both the directory and its canonical routing controls.
+            let tx = db.conn.unchecked_transaction()?;
+            db.set_zen_free_model_catalog_preserving_settings(&catalog)?;
+            let projection = crate::destination_projection::load_runtime(&db)?;
+            let custom = db.list_custom_account_runtimes()?;
+            let persisted = db.load_persisted_contracts()?;
+            let mut new_contracts =
+                crate::provider_contracts::build_effective_contracts(&catalog, &custom, persisted);
+            new_contracts.apply_destination_configuration(&projection);
+            let route_set = build_proxy_route_set(&config, &projection)?;
+            tx.commit()?;
+            // Keep the DB lock until every pointer has been installed. Request
+            // capture cannot observe committed catalog rows with an old route set.
+            {
+                let mut http_client = self.http_client.lock();
+                let mut active = self.zen_free_models.write();
+                let mut contracts = self.provider_contracts.write();
+                *http_client = Arc::new(route_set);
+                *active = Arc::new(catalog);
+                *contracts = Arc::new(new_contracts);
+            }
+            // Publish only after the catalog pointer guards are released. The
+            // publish reads `config` and `http_client`, which rank below these
+            // catalog locks, so publishing under them inverts the documented
+            // ordering and deadlocks against a concurrent contract reload that
+            // takes `config` first. `db` is still held, so the drift rebuild
+            // cannot interleave and a fast-path reader keeps the previous
+            // self-consistent generation until the swap lands.
+            self.publish_gateway_preparation(&db)?;
         }
         self.routing.reset();
         Ok(())
@@ -559,7 +1020,13 @@ impl CoreStateInner {
 
     pub fn reload_dynamic_providers_locked(&self, db: &Database) -> crate::Result<()> {
         let loaded = db.list_dynamic_providers()?;
+        let route_set = build_proxy_route_set(
+            &self.config(),
+            &crate::destination_projection::load_runtime(db)?,
+        )?;
+        *self.http_client.lock() = Arc::new(route_set);
         *self.dynamic_providers.write() = Arc::new(loaded);
+        self.publish_gateway_preparation(db)?;
         Ok(())
     }
 
@@ -572,6 +1039,36 @@ impl CoreStateInner {
         self.reload_provider_contracts_locked(&db)
     }
 
+    /// Notify the action owner after its SQLite commit and revision install,
+    /// before fallible publication. The callback only captures receipt facts;
+    /// it must not reenter the database or configuration locks.
+    pub(crate) fn commit_configuration_update_recorded<T>(
+        &self,
+        mutation: impl FnOnce(&Database) -> crate::Result<T>,
+        on_committed: impl FnOnce(u64),
+    ) -> crate::Result<T> {
+        let db = self.db.lock();
+        let tx = db.conn.unchecked_transaction()?;
+        let result = mutation(&db)?;
+        crate::db::routing_cards::reconcile_on(&db.conn)?;
+        let runtime = self.prepare_imported_node_runtime(&db)?;
+        tx.commit()?;
+        self.install_imported_node_runtime(runtime);
+        on_committed(self.settings_revision());
+        // One atomic swap publishes the whole generation: routing rows, config,
+        // contracts-backed route set, and pricing can no longer disagree.
+        self.publish_gateway_preparation(&db)?;
+        self.publish_temporary_policy(&db)?;
+        Ok(result)
+    }
+
+    pub(crate) fn publish_temporary_policy(&self, db: &Database) -> crate::Result<()> {
+        let previous = self.recovery.policy_snapshot();
+        let compiled = crate::gateway::policy::compile_published(db, &previous)?;
+        self.recovery.install_snapshot(compiled);
+        Ok(())
+    }
+
     /// Build every fallible runtime snapshot from an uncommitted V2 node
     /// migration. The caller must hold the database transaction open while
     /// passing the same connection view here.
@@ -579,6 +1076,7 @@ impl CoreStateInner {
         &self,
         db: &Database,
     ) -> crate::Result<ImportedNodeRuntime> {
+        crate::routing_snapshot::RoutingSnapshot::load(db)?;
         let (config, needs_persist) = load_config(db)?;
         config.validate().map_err(anyhow::Error::msg)?;
         // Sanitized config JSON can differ in field order and legacy defaults
@@ -587,20 +1085,20 @@ impl CoreStateInner {
         // startup may rewrite the byte representation later.
         let _ = needs_persist;
         let zen = db.zen_free_model_catalog()?.unwrap_or_default();
-        let contracts = crate::provider_contracts::build_effective_contracts(
+        let custom = db.list_custom_account_runtimes()?;
+        let mut contracts = crate::provider_contracts::build_effective_contracts(
             &zen,
-            &db.list_custom_account_runtimes()?,
+            &custom,
             db.load_persisted_contracts()?,
         );
-        let cpa_models = self.cpa_model_catalog();
-        let provider_models = sealed_proxy_model_ids(&contracts, &cpa_models);
-        let route_set = crate::http_client::build_route_set_with_provider_models(
-            &config,
-            &zen,
-            &provider_models,
-        )?;
-        let credentials = crate::gateway_keys::build_credential_snapshot(db, &config.gateway_key)?;
+        // One validated projection read on the open transaction serves both
+        // consumers; loading it twice would repeat the same queries while
+        // settings_update and db are held.
+        let projection = crate::destination_projection::load_runtime(db)?;
+        contracts.apply_destination_configuration(&projection);
         let dynamic_providers = db.list_dynamic_providers()?;
+        let route_set = build_proxy_route_set(&config, &projection)?;
+        let credentials = crate::gateway_keys::build_credential_snapshot(db, &config.gateway_key)?;
         Ok(ImportedNodeRuntime {
             config,
             http_client: route_set,
@@ -624,64 +1122,89 @@ impl CoreStateInner {
         self.settings_revision.fetch_add(1, Ordering::AcqRel);
     }
 
-    /// Install a dynamic Provider snapshot built before the matching SQLite
-    /// commit. Assignment and the revision bump cannot fail.
+    /// Install a dynamic Provider snapshot. The fallible route set is built
+    /// from the incoming snapshot before the in-memory assignment.
     pub(crate) fn install_dynamic_providers_snapshot(
         &self,
         providers: Vec<crate::dynamic::DynamicProviderRuntime>,
-    ) {
+    ) -> crate::Result<()> {
+        let route_set = build_proxy_route_set(
+            &self.config(),
+            &crate::destination_projection::load_runtime(&self.db.lock())?,
+        )?;
+        *self.http_client.lock() = Arc::new(route_set);
         *self.dynamic_providers.write() = Arc::new(providers);
         self.routing.reset();
         self.settings_revision.fetch_add(1, Ordering::AcqRel);
+        self.publish_gateway_preparation(&self.db.lock())?;
+        Ok(())
+    }
+
+    /// A committed catalog removal must restrict admission even if unrelated
+    /// persisted data prevents a full reload. Caller holds settings_update.
+    pub(crate) fn restrict_provider_catalog_after_reload_failure(
+        &self,
+        row: &crate::provider_contracts::PersistedScopeRow,
+    ) {
+        {
+            let mut active = self.provider_contracts.write();
+            let set = Arc::make_mut(&mut active);
+            if let Some(contract) = set.providers.get_mut(row.scope.id()) {
+                contract
+                    .models
+                    .retain(|_, model| row.catalog_models.contains(&model.model_id));
+                contract.catalog.models.clone_from(&row.catalog_models);
+                contract.revision = row.revision;
+            }
+        }
+
+        // The durable removal must also make a stale proxy-list membership
+        // inert. Rebuild from the authoritative saved destination catalog.
+        // If the same corrupt persistence that broke the reload also prevents
+        // reading that configuration, install the
+        // conservative empty-known-model route set: whitelist falls back to
+        // direct and blacklist falls back to proxy for every stale entry.
+        let config = self.config();
+        let rebuilt = crate::destination_projection::load_runtime(&self.db.lock())
+            .and_then(|projection| build_proxy_route_set(&config, &projection))
+            .or_else(|_| crate::http_client::build_route_set_from_known_models(&config, &[]));
+        if let Ok(route_set) = rebuilt {
+            *self.http_client.lock() = Arc::new(route_set);
+        }
+        // This path exists precisely because persisted data may be unreadable,
+        // so republication is best-effort: a failure leaves the previous
+        // aggregate in place and the revision drift makes the next reader
+        // surface the same error the old gate-held read would have returned.
+        if let Err(error) = self.publish_gateway_preparation(&self.db.lock()) {
+            tracing::warn!(
+                "failed to republish the request preparation view after a catalog restriction: {error}"
+            );
+        }
     }
 
     pub fn reload_provider_contracts_locked(&self, db: &Database) -> crate::Result<()> {
         let zen = self.zen_free_model_catalog();
-        let set = crate::provider_contracts::build_effective_contracts(
+        let custom = db.list_custom_account_runtimes()?;
+        let mut set = crate::provider_contracts::build_effective_contracts(
             &zen,
-            &db.list_custom_account_runtimes()?,
+            &custom,
             db.load_persisted_contracts()?,
         );
-        let cpa_models = self.cpa_model_catalog();
-        let provider_models = sealed_proxy_model_ids(&set, &cpa_models);
-        let route_set = crate::http_client::build_route_set_with_provider_models(
+        set.apply_destination_configuration(&crate::destination_projection::load_runtime(db)?);
+        let route_set = build_proxy_route_set(
             &self.config(),
-            &zen,
-            &provider_models,
+            &crate::destination_projection::load_runtime(db)?,
         )?;
         *self.http_client.lock() = Arc::new(route_set);
         *self.provider_contracts.write() = Arc::new(set);
+        self.publish_gateway_preparation(db)?;
         Ok(())
     }
 
+    /// Callers still pass a snapshot here. It is discarded; loaded history stays as read.
     pub fn activate_pricing_snapshot(&self, snapshot: PricingSnapshot) -> crate::Result<()> {
-        // Keep database persistence and the in-memory active pointer behind the
-        // documented db -> pricing lock order, so readers never observe a
-        // partially activated revision.
-        let db = self.db.lock();
-        let mut active = self.pricing.write();
-        db.insert_pricing_snapshot(&snapshot)?;
-        *active = Arc::new(snapshot);
+        let _ = snapshot;
         Ok(())
-    }
-
-    pub fn estimate_cost(
-        &self,
-        model: &str,
-        prompt: i64,
-        completion: i64,
-        cached: i64,
-        cache_creation: i64,
-        service_tier: Option<&str>,
-    ) -> PricingEstimate {
-        self.pricing_snapshot().estimate(
-            model,
-            prompt,
-            completion,
-            cached,
-            cache_creation,
-            service_tier,
-        )
     }
 
     pub fn active_gateway_port(&self) -> u16 {
@@ -742,138 +1265,6 @@ impl CoreStateInner {
         self.desktop.set_auto_start_sync(sync);
     }
 
-    pub fn set_application_connector_host(
-        &self,
-        host: ApplicationConnectorHost,
-        executable: PathBuf,
-    ) {
-        self.application_connector_capabilities
-            .set_host(host, executable);
-    }
-
-    pub fn application_connector_supported(&self) -> bool {
-        self.application_connector_capabilities.supported()
-    }
-
-    pub fn application_connectors(
-        &self,
-    ) -> ApplicationConnectorResult<Vec<ApplicationConnectorInspection>> {
-        match self.call_connector(
-            ApplicationConnectorHostOperation::List,
-            ApplicationConnectorId::ClaudeCode,
-            ApplicationConnectorAction::Restore,
-            None,
-            BTreeMap::new(),
-            None,
-        )? {
-            ApplicationConnectorHostResult::Inspections(value) => Ok(value),
-            _ => Err(connector_invalid_host()),
-        }
-    }
-
-    pub fn preview_application_connector(
-        &self,
-        id: ApplicationConnectorId,
-        action: ApplicationConnectorAction,
-        key_id: Option<&str>,
-        model_values: BTreeMap<String, String>,
-    ) -> ApplicationConnectorResult<ApplicationConnectorPreview> {
-        match self.call_connector(
-            ApplicationConnectorHostOperation::Preview,
-            id,
-            action,
-            key_id,
-            model_values,
-            None,
-        )? {
-            ApplicationConnectorHostResult::Preview(value) => Ok(value),
-            _ => Err(connector_invalid_host()),
-        }
-    }
-
-    pub fn commit_application_connector(
-        &self,
-        commit: ApplicationConnectorCommit,
-    ) -> ApplicationConnectorResult<ApplicationConnectorCommitResult> {
-        match self.call_connector(
-            ApplicationConnectorHostOperation::Commit,
-            commit.id,
-            commit.action,
-            commit.key_id.as_deref(),
-            commit.model_values,
-            Some(commit.preview_fingerprint),
-        )? {
-            ApplicationConnectorHostResult::Committed(value) => Ok(value),
-            _ => Err(connector_invalid_host()),
-        }
-    }
-
-    fn call_connector(
-        &self,
-        operation: ApplicationConnectorHostOperation,
-        id: ApplicationConnectorId,
-        action: ApplicationConnectorAction,
-        key_id: Option<&str>,
-        model_values: BTreeMap<String, String>,
-        preview_fingerprint: Option<String>,
-    ) -> ApplicationConnectorResult<ApplicationConnectorHostResult> {
-        let model_values = normalize_connector_values(model_values)?;
-        let (key_id, secret) =
-            if action == ApplicationConnectorAction::Connect && !id.uses_native_credentials() {
-                let id = key_id.ok_or_else(|| {
-                    ApplicationConnectorError::new(
-                        ApplicationConnectorErrorKind::InvalidRequest,
-                        "an enabled access key is required",
-                    )
-                })?;
-                (
-                    Some(id.to_owned()),
-                    Some(ApplicationConnectorSecret::new(self.connector_key(id)?)),
-                )
-            } else {
-                (None, None)
-            };
-        self.application_connector_capabilities
-            .call(ApplicationConnectorHostRequest {
-                operation,
-                id,
-                action,
-                key_id,
-                secret,
-                model_values,
-                gateway_url: format!("http://127.0.0.1:{}", self.active_gateway_port()),
-                data_dir: self.data_dir(),
-                desktop_executable: self.application_connector_capabilities.executable(),
-                preview_fingerprint,
-            })
-    }
-
-    fn connector_key(&self, id: &str) -> ApplicationConnectorResult<String> {
-        let db = self.db.lock();
-        if id == PRIMARY_KEY_ID {
-            return db
-                .primary_access_key_value()
-                .map_err(connector_internal)?
-                .filter(|value| !value.is_empty())
-                .ok_or_else(|| {
-                    ApplicationConnectorError::new(
-                        ApplicationConnectorErrorKind::NotFound,
-                        "requested access key is unavailable",
-                    )
-                });
-        }
-        db.get_sub_gateway_key(id)
-            .map_err(connector_internal)?
-            .filter(|key| key.authenticates())
-            .map(|key| key.key)
-            .ok_or_else(|| {
-                ApplicationConnectorError::new(
-                    ApplicationConnectorErrorKind::NotFound,
-                    "requested access key is unavailable",
-                )
-            })
-    }
-
     pub fn auto_start_supported(&self) -> bool {
         self.desktop.auto_start_supported()
     }
@@ -902,6 +1293,22 @@ impl CoreStateInner {
         self.desktop.desktop_update_supported()
     }
 
+    pub fn set_byok_application_host(&self, host: crate::byok_application::ByokApplicationHost) {
+        self.desktop.set_byok_application_host(host);
+    }
+
+    pub fn byok_application_host(&self) -> Option<crate::byok_application::ByokApplicationHost> {
+        self.desktop.byok_application_host()
+    }
+
+    pub fn set_dsh_application_host(&self, host: crate::dsh_application::DshApplicationHost) {
+        self.desktop.set_dsh_application_host(host);
+    }
+
+    pub fn dsh_application_host(&self) -> Option<crate::dsh_application::DshApplicationHost> {
+        self.desktop.dsh_application_host()
+    }
+
     pub fn desktop_update_status(&self) -> DesktopUpdateStatus {
         self.desktop.desktop_update_status()
     }
@@ -911,6 +1318,81 @@ impl CoreStateInner {
         expected_version: String,
     ) -> Result<(), DesktopUpdateStartError> {
         self.desktop.start_desktop_update(expected_version)
+    }
+
+    pub(crate) fn start_desktop_update_recorded(
+        self: &Arc<Self>,
+        expected_version: String,
+        mut operation: crate::user_operation::UserOperation,
+    ) -> Result<(), DesktopUpdateStartError> {
+        use crate::log_types::OperationOutcome;
+        let status = self.desktop_update_status();
+        let mut slot = self.desktop_update_operation.lock();
+        let rejection = if !status.install_supported {
+            Some(DesktopUpdateStartError::Unsupported)
+        } else if slot.is_some()
+            || matches!(
+                status.phase,
+                DesktopUpdatePhase::Checking
+                    | DesktopUpdatePhase::Downloading
+                    | DesktopUpdatePhase::Installing
+            )
+        {
+            Some(DesktopUpdateStartError::Busy)
+        } else {
+            None
+        };
+        if let Some(error) = rejection {
+            drop(slot);
+            operation.complete(
+                OperationOutcome::Rejected,
+                Some(match &error {
+                    DesktopUpdateStartError::Unsupported => "updateUnsupported",
+                    _ => "updateBusy",
+                }),
+                Default::default(),
+            );
+            return Err(error);
+        }
+        // Record and hand over before invoking the starter: its background
+        // job may finish immediately. The weak handle cannot retain CoreState
+        // through its own pending-operation slot.
+        operation.accepted(Default::default());
+        *slot = Some(operation);
+        drop(slot);
+        let result = self.start_desktop_update(expected_version);
+        if let Err(error) = &result {
+            let (outcome, reason) = match error {
+                DesktopUpdateStartError::Unsupported => {
+                    (OperationOutcome::Rejected, "updateUnsupported")
+                }
+                DesktopUpdateStartError::Busy => (OperationOutcome::Rejected, "updateBusy"),
+                DesktopUpdateStartError::Starter(_) => {
+                    (OperationOutcome::Failed, "updateStartFailed")
+                }
+            };
+            self.finish_desktop_update_operation(outcome, reason);
+        }
+        result
+    }
+
+    fn finish_desktop_update_operation(
+        &self,
+        outcome: crate::log_types::OperationOutcome,
+        reason: &'static str,
+    ) {
+        let operation = self.desktop_update_operation.lock().take();
+        if let Some(operation) = operation {
+            operation.complete(outcome, Some(reason), Default::default());
+        }
+    }
+
+    /// Called only after the native installer has actually returned success.
+    pub fn set_desktop_update_completed(&self) {
+        self.finish_desktop_update_operation(
+            crate::log_types::OperationOutcome::Success,
+            "installed",
+        );
     }
 
     pub fn set_desktop_update_progress(&self, downloaded: u64, total: Option<u64>) -> bool {
@@ -923,10 +1405,18 @@ impl CoreStateInner {
 
     pub fn set_desktop_update_failed(&self, error: impl Into<String>) {
         self.desktop.set_desktop_update_failed(error);
+        self.finish_desktop_update_operation(
+            crate::log_types::OperationOutcome::Failed,
+            "updateFailed",
+        );
     }
 
     pub fn set_desktop_update_idle(&self) {
         self.desktop.set_desktop_update_idle();
+        self.finish_desktop_update_operation(
+            crate::log_types::OperationOutcome::Rejected,
+            "cancelled",
+        );
     }
 
     fn prepare_config(
@@ -944,33 +1434,43 @@ impl CoreStateInner {
                 config.gateway_port = persisted.gateway_port;
             }
         }
-        config.claude_desktop_models.normalize();
         config.opencode_invite_url = normalize_opencode_invite_url(&config.opencode_invite_url)
             .map_err(anyhow::Error::msg)?;
         config.proxy_url = normalize_proxy_url(config.proxy_mode, &config.proxy_url)
             .map_err(anyhow::Error::msg)?;
         // validate() enforces the non-blank primary key on every write path.
         config.validate().map_err(anyhow::Error::msg)?;
-        let zen_catalog = self.zen_free_model_catalog();
-        let contracts = self.provider_contracts();
-        let cpa_models = self.cpa_model_catalog();
-        let provider_models = sealed_proxy_model_ids(&contracts, &cpa_models);
-        let http_client = crate::http_client::build_route_set_with_provider_models(
+        let http_client = build_proxy_route_set(
             &config,
-            &zen_catalog,
-            &provider_models,
+            &crate::destination_projection::load_runtime(&self.db.lock())?,
         )?;
         Ok((config, http_client))
     }
 
     pub fn set_config(&self, config: AppConfig) -> crate::Result<()> {
+        self.set_config_recorded(config, |_| {})
+    }
+
+    /// Same persist and publish as [`set_config`]. `on_committed` runs after the
+    /// config row and in-memory generation are installed, before
+    /// `publish_gateway_preparation`. The callback holds no extra locks; it must
+    /// not reenter the database, settings, or configuration locks. The database
+    /// lock is still held.
+    pub fn set_config_recorded(
+        &self,
+        config: AppConfig,
+        on_committed: impl FnOnce(u64),
+    ) -> crate::Result<()> {
         let (config, http_client) = self.prepare_config(config)?;
         let config_json = serde_json::to_string(&config)?;
-        {
-            let db = self.db.lock();
-            db.set_config(&config_json)?;
-        }
-        self.apply_persisted_config(config, http_client);
+        let db = self.db.lock();
+        db.set_config(&config_json)?;
+        // Keep the DB lock across the install and the publish so a concurrent
+        // reader cannot see the new config with a stale route set or aggregate.
+        let revision = self.apply_persisted_config(config, http_client);
+        on_committed(revision);
+        self.publish_gateway_preparation(&db)?;
+        drop(db);
         Ok(())
     }
 
@@ -987,18 +1487,37 @@ impl CoreStateInner {
         previous: &AppConfig,
         next: AppConfig,
     ) -> Result<(), HostSettingsError> {
+        self.apply_host_settings_recorded(previous, next)
+            .map_err(|failure| failure.error)
+    }
+
+    pub(crate) fn apply_host_settings_recorded(
+        &self,
+        previous: &AppConfig,
+        next: AppConfig,
+    ) -> Result<(), HostSettingsFailure> {
         let next_auto_start = next.auto_start;
         let next_show_dock_icon = next.show_dock_icon;
         let auto_start_supported = self.auto_start_supported();
         let dock_visibility_supported = self.dock_visibility_supported();
         if !auto_start_supported && next_auto_start != previous.auto_start {
-            return Err(HostSettingsError::AutoStartUnsupported);
+            return Err(HostSettingsError::AutoStartUnsupported.into());
         }
         if !dock_visibility_supported && next_show_dock_icon != previous.show_dock_icon {
-            return Err(HostSettingsError::DockVisibilityUnsupported);
+            return Err(HostSettingsError::DockVisibilityUnsupported.into());
         }
 
-        self.set_config(next).map_err(HostSettingsError::Persist)?;
+        let mut committed = false;
+        if let Err(error) = self.set_config_recorded(next, |_| committed = true) {
+            return Err(HostSettingsFailure {
+                error: HostSettingsError::Persist(error),
+                effects: if committed {
+                    HostSettingsEffects::Partial
+                } else {
+                    HostSettingsEffects::None
+                },
+            });
+        }
         let runtime_sync = (|| -> crate::Result<()> {
             if auto_start_supported {
                 self.sync_auto_start(next_auto_start)?;
@@ -1016,6 +1535,9 @@ impl CoreStateInner {
             let dock_rollback_error = dock_visibility_supported
                 .then(|| self.sync_dock_visibility(previous.show_dock_icon).err())
                 .flatten();
+            let restored = config_rollback_error.is_none()
+                && auto_start_rollback_error.is_none()
+                && dock_rollback_error.is_none();
             let mut message = format!("failed to synchronize desktop settings: {sync_error}");
             if let Some(error) = config_rollback_error {
                 message.push_str(&format!("; failed to restore settings: {error}"));
@@ -1026,7 +1548,14 @@ impl CoreStateInner {
             if let Some(error) = dock_rollback_error {
                 message.push_str(&format!("; failed to restore Dock visibility: {error}"));
             }
-            return Err(HostSettingsError::Sync(message));
+            return Err(HostSettingsFailure {
+                error: HostSettingsError::Sync(message),
+                effects: if restored {
+                    HostSettingsEffects::Compensated
+                } else {
+                    HostSettingsEffects::Partial
+                },
+            });
         }
         Ok(())
     }
@@ -1072,6 +1601,23 @@ impl CoreStateInner {
         committed_revision: u64,
         wait_for_previous: bool,
     ) -> Result<(), HostSettingsError> {
+        self.rebind_listener_after_settings_commit_recorded(
+            previous,
+            committed,
+            committed_revision,
+            wait_for_previous,
+        )
+        .await
+        .map_err(|failure| failure.error)
+    }
+
+    pub(crate) async fn rebind_listener_after_settings_commit_recorded(
+        self: &Arc<Self>,
+        previous: AppConfig,
+        committed: AppConfig,
+        committed_revision: u64,
+        wait_for_previous: bool,
+    ) -> Result<(), HostSettingsFailure> {
         if let Err(error) = self
             .rebind_gateway_listener_if_port_changed(
                 previous.gateway_port,
@@ -1080,14 +1626,31 @@ impl CoreStateInner {
             )
             .await
         {
-            if let Err(rollback_error) =
-                self.compensate_failed_listener_rebind(&committed, previous, committed_revision)
+            let restored = match self.compensate_failed_listener_rebind(
+                &committed,
+                previous.clone(),
+                committed_revision,
+            ) {
+                Ok(restored) => restored,
+                Err(rollback_error) => {
+                    return Err(HostSettingsFailure {
+                        error: HostSettingsError::GatewayBind(anyhow::anyhow!(
+                            "{error}; failed to restore the configured Gateway port: {rollback_error}"
+                        )),
+                        effects: HostSettingsEffects::Partial,
+                    });
+                }
+            };
+            // Compensation restores the port only. Other fields committed by
+            // this action may remain; unrelated later writes are excluded.
+            let effects = if restored
+                && configuration_changes_restored(&previous, &committed, &self.config())
             {
-                return Err(HostSettingsError::GatewayBind(anyhow::anyhow!(
-                    "{error}; failed to restore the configured Gateway port: {rollback_error}"
-                )));
-            }
-            return Err(error);
+                HostSettingsEffects::Compensated
+            } else {
+                HostSettingsEffects::Partial
+            };
+            return Err(HostSettingsFailure { error, effects });
         }
         Ok(())
     }
@@ -1159,7 +1722,7 @@ impl CoreStateInner {
         &self,
         config: AppConfig,
         http_client: crate::http_client::ForwardRouteSet,
-    ) {
+    ) -> u64 {
         let should_reset_routing = {
             let mut current_config = self.config.lock();
             let mut current_client = self.http_client.lock();
@@ -1196,10 +1759,10 @@ impl CoreStateInner {
             if let Some(existing) = snapshot.get(&config.gateway_key)
                 && existing.id != crate::gateway_keys::PRIMARY_KEY_ID
             {
-                eprintln!(
-                    "warning: primary key value collides with sub key `{}`; \
+                tracing::warn!(
+                    "primary key value collides with sub key `{}`; \
                          the API-layer gate should have rejected this write",
-                    existing.name
+                    existing.id
                 );
             }
             let stale_value = snapshot
@@ -1217,10 +1780,11 @@ impl CoreStateInner {
                 },
             );
         }
-        self.settings_revision.fetch_add(1, Ordering::AcqRel);
+        let revision = self.settings_revision.fetch_add(1, Ordering::AcqRel) + 1;
         if should_reset_routing {
             self.routing.reset();
         }
+        revision
     }
 
     /// Resolves an authenticating credential by presented value; used by the
@@ -1246,14 +1810,28 @@ impl CoreStateInner {
         self.data_dir.clone()
     }
 
-    /// Persist one low-frequency lifecycle/control-plane event without making
-    /// observability a prerequisite for the operation that already succeeded.
+    /// Emit a program diagnostic without writing dashboard history.
     /// Callers must pass an already-sanitized message: never include Keys,
     /// request bodies, authorization headers, or credential-bearing URLs.
     pub fn log_runtime_event(&self, level: &str, category: &str, message: &str) {
-        if let Err(error) = self.db.lock().log_gateway(level, category, message) {
-            eprintln!("warning: failed to persist runtime event category={category}: {error}");
-        }
+        crate::process_log::diagnostic(level, category, message);
+    }
+
+    pub fn gateway_last_error(&self) -> Option<String> {
+        self.gateway_last_error.lock().clone()
+    }
+
+    pub(crate) fn record_gateway_error(&self, error: &str) {
+        *self.gateway_last_error.lock() = Some(
+            crate::redaction::redact_text(error)
+                .chars()
+                .take(512)
+                .collect(),
+        );
+    }
+
+    pub fn clear_gateway_error(&self) {
+        *self.gateway_last_error.lock() = None;
     }
 
     pub fn recover_browser_profiles_for_account(
@@ -1496,8 +2074,9 @@ impl crate::account_control::AccountControlHost for CoreStateInner {
         self.db.lock().delete_account(id)
     }
 
-    fn log_gateway(&self, level: &str, category: &str, message: &str) -> anyhow::Result<()> {
-        Database::log_gateway(&self.db.lock(), level, category, message)
+    fn log_program_event(&self, level: &str, category: &str, message: &str) -> anyhow::Result<()> {
+        crate::process_log::diagnostic(level, category, message);
+        Ok(())
     }
 
     fn stop_browser_account(
@@ -1509,6 +2088,34 @@ impl crate::account_control::AccountControlHost for CoreStateInner {
 }
 
 impl crate::usage_sync::UsageSyncStore for Database {
+    fn capture_usage_identity(
+        &self,
+        account_id: &str,
+    ) -> anyhow::Result<Option<crate::usage_sync::UsageRefreshIdentity>> {
+        let identity = crate::usage_sync::UsageRefreshIdentity::capture(self, account_id)?;
+        anyhow::ensure!(
+            identity.is_some(),
+            "inference credential is unavailable for usage refresh"
+        );
+        Ok(identity)
+    }
+    fn usage_identity_is_current(
+        &self,
+        identity: &crate::usage_sync::UsageRefreshIdentity,
+    ) -> anyhow::Result<bool> {
+        identity.is_current(self)
+    }
+    fn reconcile_authoritative_usage(
+        &self,
+        account_id: &str,
+        snapshot: &crate::go_usage::GoUsageSnapshot,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> anyhow::Result<()> {
+        crate::db::quota_recovery::reconcile_official_go_usage(
+            &self.conn, account_id, snapshot, now,
+        )
+    }
+
     fn list_accounts(&self) -> anyhow::Result<Vec<crate::models::Account>> {
         Database::list_accounts(self)
     }
@@ -1590,8 +2197,9 @@ impl crate::usage_sync::UsageSyncStore for Database {
             next_eligible_at,
         )
     }
-    fn log_gateway(&self, level: &str, category: &str, message: &str) -> anyhow::Result<()> {
-        Database::log_gateway(self, level, category, message)
+    fn log_program_event(&self, level: &str, category: &str, message: &str) -> anyhow::Result<()> {
+        crate::process_log::diagnostic(level, category, message);
+        Ok(())
     }
 }
 
@@ -1623,6 +2231,13 @@ impl crate::usage_sync::UsageSyncHost for CoreState {
     {
         let db = self.db.lock();
         f(&db)
+    }
+
+    fn note_preparation_rows_changed(&self) {
+        // Usage reconciliation is a background control-plane write, not a
+        // request. A bump is the whole contract: the next reader notices the
+        // aggregate is behind and rebuilds it under the gate.
+        self.bump_settings_revision();
     }
 
     fn with_authorized_sync_store<F, R>(
@@ -1683,7 +2298,6 @@ fn load_config(db: &Database) -> crate::Result<(AppConfig, bool)> {
     let mut needs_persist = if let Some(value) = db.get_setting("config")? {
         config = serde_json::from_str(&value)?;
         stored_gateway_key = config.gateway_key.clone();
-        config.claude_desktop_models.normalize();
         let mut compare = config.clone();
         compare.gateway_key = stored_gateway_key.clone();
         serde_json::to_string(&compare)? != value

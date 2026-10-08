@@ -9,9 +9,6 @@
       <n-form :model="config" label-placement="top" :show-feedback="false">
         <section class="settings-subsection proxy-settings" aria-labelledby="proxy-title">
           <h3 id="proxy-title">{{ t("出站代理") }}</h3>
-          <p class="field-caption routing-intro">
-            {{ proxyIntro }}
-          </p>
           <n-radio-group
             v-model:value="config.proxy_mode"
             name="proxy-mode"
@@ -57,20 +54,20 @@
             <n-form-item :label="t('名单内模型')">
               <div class="proxy-model-grid" role="group" :aria-label="t('名单内模型')">
                 <label
-                  v-for="model in config.proxy_supported_models"
+                  v-for="model in proxyModelRows"
                   :key="model.id"
                   class="proxy-model-option"
-                  :class="{ 'proxy-model-free': isZenFreeModel(model.id) }"
+                  :class="{ 'proxy-model-free': model.zenFree }"
                 >
                   <n-checkbox
-                    :checked="config.proxy_list_models.includes(model.id)"
+                    :checked="model.checked"
                     :disabled="!loaded || saving || testingProxy"
                     @update:checked="(checked: boolean) => toggleProxyListModel(model.id, checked)"
                   >
                     {{ model.id }}
                   </n-checkbox>
-                  <span class="proxy-model-hint">{{ protocolLabel(model.preferred_protocol) }}</span>
-                  <span v-if="isZenFreeModel(model.id)" class="proxy-model-free-hint">
+                  <span class="proxy-model-hint">{{ protocolLabel(model.protocol) }}</span>
+                  <span v-if="model.zenFree" class="proxy-model-free-hint">
                     {{ t("Zen free 额度按出口 IP 共享，走代理会改变额度归属") }}
                   </span>
                 </label>
@@ -108,10 +105,15 @@
                 :max="65535"
                 :precision="0"
                 :disabled="!loaded || saving || config.gateway_port_from_env"
-                :aria-label="t('Gateway 端口')"
-              />
+                :input-props="{ 'aria-label': t('Gateway 端口') }"
+              ><template #minus-icon><span aria-hidden="true">−</span><span class="sr-only">{{ t('减少{field}', { field: t('Gateway 端口') }) }}</span></template>
+              <template #add-icon><span aria-hidden="true">+</span><span class="sr-only">{{ t('增加{field}', { field: t('Gateway 端口') }) }}</span></template></n-input-number>
               <p v-if="config.gateway_port_from_env">
-                {{ t("由环境变量 OCG_GATEWAY_PORT 管理；修改环境变量并重启后生效。") }}
+                {{ t("由环境变量 OCG_GATEWAY_PORT 管理，修改后重启生效。") }}
+              </p>
+              <p v-if="portRecoveryHref" class="field-caption">
+                <a :href="portRecoveryHref">{{ t(SETTINGS_RECONNECT_KIND_KEYS["manual-recovery"]) }}</a>
+                <n-button size="tiny" quaternary @click="loadSettings">{{ t("重试") }}</n-button>
               </p>
             </div>
           </n-form-item>
@@ -137,7 +139,7 @@
               />
               <p id="client-root-help">
                 <template v-if="config.client_root_url_from_env">
-                  {{ t("由环境变量 OCG_CLIENT_ROOT_URL 管理；修改环境变量并重启后生效。") }}<br />
+                  {{ t("由环境变量 OCG_CLIENT_ROOT_URL 管理，修改后重启生效。") }}<br />
                 </template>
                 <span v-else-if="!config.client_root_url.trim()" class="sr-only">
                   {{ automaticClientRootFeedback }}
@@ -156,8 +158,8 @@
             :value="config.auto_start"
             @update:value="handleAutoStartToggle"
             :aria-label="t('随系统登录自动启动 Open Console Gateway')"
-            :disabled="!loaded || saving"
-            :loading="saving"
+            :disabled="!loaded || saving || hostSaving"
+            :loading="hostSaving"
           >
             <template #checked>{{ t("开启") }}</template>
             <template #unchecked>{{ t("关闭") }}</template>
@@ -173,60 +175,12 @@
             :value="config.show_dock_icon"
             @update:value="handleDockVisibilityToggle"
             :aria-label="t('在 Dock 中显示 Open Console Gateway')"
-            :disabled="!loaded || saving"
-            :loading="saving"
+            :disabled="!loaded || saving || hostSaving"
+            :loading="hostSaving"
           >
             <template #checked>{{ t("开启") }}</template>
             <template #unchecked>{{ t("关闭") }}</template>
           </n-switch>
-        </section>
-        <section class="settings-subsection" aria-labelledby="routing-title">
-          <h3 id="routing-title">{{ t("账号路由") }}</h3>
-          <p class="field-caption routing-intro">
-            {{ t("基础路由方案同一时刻只能选一个；对话粘性是可叠加开关，不会替换基础方案。") }}
-          </p>
-          <n-radio-group
-            v-model:value="config.routing_mode"
-            name="routing-mode"
-            class="routing-mode-group"
-            :disabled="!loaded || saving"
-          >
-            <div
-              v-for="option in routingModeOptions"
-              :key="option.value"
-              class="routing-option"
-              :class="{ 'routing-option--selected': config.routing_mode === option.value }"
-            >
-              <n-radio
-                :value="option.value"
-                :aria-label="t(option.label)"
-                :aria-describedby="`routing-option-desc-${option.value}`"
-              >
-                <span class="routing-option-title">{{ t(option.label) }}</span>
-              </n-radio>
-              <div :id="`routing-option-desc-${option.value}`">
-                <p class="field-caption">{{ t(option.behavior) }}</p>
-                <p class="field-caption">{{ t(option.pros) }}</p>
-                <p class="field-caption">{{ t(option.cons) }}</p>
-              </div>
-            </div>
-          </n-radio-group>
-          <div class="routing-sticky">
-            <div class="routing-sticky-head">
-              <span class="routing-option-title">{{ t("对话粘性") }}</span>
-              <n-switch
-                v-model:value="config.conversation_sticky"
-                :aria-label="t('对话粘性')"
-                :disabled="!loaded || saving"
-              >
-                <template #checked>{{ t("开启") }}</template>
-                <template #unchecked>{{ t("关闭") }}</template>
-              </n-switch>
-            </div>
-            <p class="field-caption">
-              {{ t("优先使用请求头 X-OCG-Conversation-Id；未提供时用 Prompt 指纹启发式（system/tools/首条 user）。无法生成会话 key 时回退基础路由。指纹可能把相似会话绑到同一账号。") }}
-            </p>
-          </div>
         </section>
         <section class="settings-subsection" aria-labelledby="request-timeout-title">
           <h3 id="request-timeout-title">{{ t("请求超时") }}</h3>
@@ -241,8 +195,8 @@
                 :input-props="{ 'aria-label': t('连接超时（秒）') }"
               >
                 <template #suffix>{{ t("秒") }}</template>
-              </n-input-number>
-              <span class="field-caption">{{ t("建立上游连接的初始超时（秒）") }}</span>
+              <template #minus-icon><span aria-hidden="true">−</span><span class="sr-only">{{ t('减少{field}', { field: t('连接超时（秒）') }) }}</span></template>
+              <template #add-icon><span aria-hidden="true">+</span><span class="sr-only">{{ t('增加{field}', { field: t('连接超时（秒）') }) }}</span></template></n-input-number>
             </div>
           </n-form-item>
           <n-form-item :label="t('非流式总超时')">
@@ -256,8 +210,8 @@
                 :input-props="{ 'aria-label': t('非流式总超时（秒）') }"
               >
                 <template #suffix>{{ t("秒") }}</template>
-              </n-input-number>
-              <span class="field-caption">{{ t("非流式请求从发起到完整响应的总超时（秒）") }}</span>
+              <template #minus-icon><span aria-hidden="true">−</span><span class="sr-only">{{ t('减少{field}', { field: t('非流式总超时（秒）') }) }}</span></template>
+              <template #add-icon><span aria-hidden="true">+</span><span class="sr-only">{{ t('增加{field}', { field: t('非流式总超时（秒）') }) }}</span></template></n-input-number>
             </div>
           </n-form-item>
           <n-form-item :label="t('流式空闲超时')">
@@ -271,13 +225,19 @@
                 :input-props="{ 'aria-label': t('流式空闲超时（秒）') }"
               >
                 <template #suffix>{{ t("秒") }}</template>
-              </n-input-number>
-              <span class="field-caption">{{ t("流式响应两次数据块之间的最大空闲时间（秒）") }}</span>
+              <template #minus-icon><span aria-hidden="true">−</span><span class="sr-only">{{ t('减少{field}', { field: t('流式空闲超时（秒）') }) }}</span></template>
+              <template #add-icon><span aria-hidden="true">+</span><span class="sr-only">{{ t('增加{field}', { field: t('流式空闲超时（秒）') }) }}</span></template></n-input-number>
             </div>
           </n-form-item>
         </section>
       </n-form>
-      <n-alert v-if="settingsLoadError" type="error" :title="t('设置加载失败，请先重试')">
+      <n-alert v-if="settingsStore.refreshError" type="warning" :title="t('设置加载失败，请重试')">
+        <div class="settings-load-error">
+          <span>{{ t("加载设置失败：{error}", { error: settingsStore.refreshError }) }}</span>
+          <n-button size="small" secondary @click="loadSettings">{{ t("重试") }}</n-button>
+        </div>
+      </n-alert>
+      <n-alert v-if="settingsLoadError" type="error" :title="t('设置加载失败，请重试')">
         <div class="settings-load-error">
           <span>{{ settingsLoadError }}</span>
           <n-button size="small" secondary @click="loadSettings">{{ t("重试") }}</n-button>
@@ -291,12 +251,13 @@
       >{{ t("保存设置") }}</n-button>
     </section>
 
+    <TemporaryUnavailabilitySection />
+
     <div class="settings-side">
       <section class="settings-card" aria-labelledby="appearance-title">
         <div class="settings-head">
           <div>
             <h2 id="appearance-title"><n-icon class="section-icon" :component="BgColorsOutlined" aria-hidden="true" /> {{ t("外观") }}</h2>
-            <p>{{ t("当前：{theme}", { theme: themeLabel }) }}</p>
           </div>
         </div>
         <div class="theme-grid" role="group" :aria-label="t('选择主题')">
@@ -374,7 +335,7 @@
                       :disabled="updateBusy"
                     >{{ t("下载并安装") }}</n-button>
                   </template>
-                  {{ t("将下载并安装 v{version}。安装时 Open Console Gateway 会短暂退出并自动重新启动，继续吗？", {
+                  {{ t("将下载并安装 v{version}，安装时 Open Console Gateway 会短暂退出并自动重启，继续吗？", {
                     version: updateResult.latest_version,
                   }) }}
                 </n-popconfirm>
@@ -405,7 +366,7 @@
                 :show-indicator="updateDownloadPercentage !== null"
               />
               <p v-if="activeUpdateStatus.phase === 'installing' || waitingForRestart">
-                {{ t("Open Console Gateway 会短暂离线并自动重新启动。") }}
+                {{ t("Open Console Gateway 会短暂离线并自动重启。") }}
               </p>
               <p v-if="activeUpdateStatus.phase === 'failed'">
                 {{ activeUpdateStatus.error || t("升级未完成，请重试。") }}
@@ -419,7 +380,7 @@
                 <template #trigger>
                   <n-button size="small" type="primary">{{ t("重试升级") }}</n-button>
                 </template>
-                {{ t("将下载并安装 v{version}。安装时 Open Console Gateway 会短暂退出并自动重新启动，继续吗？", {
+                {{ t("将下载并安装 v{version}，安装时 Open Console Gateway 会短暂退出并自动重启，继续吗？", {
                   version: updateResult?.latest_version || updateTargetVersion,
                 }) }}
               </n-popconfirm>
@@ -458,12 +419,13 @@ import {
   BgColorsOutlined,
   CloudSyncOutlined,
 } from "@vicons/antd";
-import { DashboardRequestError, dashboardApi } from "../api/dashboard";
+import { DashboardRequestError, dashboardApi, isRevisionConflict } from "../api/dashboard";
 import { useSettingsStore } from "../stores/settings.ts";
+import { useSessionStore } from "../stores/session.ts";
+import { createRevalidateGate } from "../domain/revalidate.ts";
 import type {
   AppConfig,
   ProxyMode,
-  RoutingMode,
   UpdateCheckResult,
   UpdateStatus,
 } from "../api/dashboard";
@@ -476,8 +438,9 @@ import {
   resolveConnectionUrls,
 } from "./dashboard-connection";
 import { DEFAULT_OPENCODE_INVITE_URL } from "../domain/managed-account.ts";
+import { planSettingsReconnect, SETTINGS_RECONNECT_KIND_KEYS } from "../domain/settings-reconnect.ts";
 import { mergeUnsavedSettings } from "./settings-merge";
-import { normalizeProxyUrl, validateProxyList } from "./settings-proxy";
+import { normalizeProxyUrl, proxyModelKey, validateProxyList } from "./settings-proxy";
 import {
   clearUpdateTarget,
   decideInstallRequestFailure,
@@ -486,8 +449,9 @@ import {
   readUpdateTarget,
   writeUpdateTarget,
 } from "./settings-update-state";
+import TemporaryUnavailabilitySection from "../components/TemporaryUnavailabilitySection.vue";
 
-const { themeName, resolvedTheme } = defineProps<{
+const { themeName } = defineProps<{
   themeName: ThemeName;
   resolvedTheme: ResolvedTheme;
 }>();
@@ -495,7 +459,11 @@ const emit = defineEmits<{ "update:themeName": [value: ThemeName] }>();
 
 const message = useMessage();
 const settingsStore = useSettingsStore();
+const sessionStore = useSessionStore();
+const revalidateGate = createRevalidateGate(60_000);
 const saving = ref(false);
+const hostSaving = ref(false);
+const portRecoveryHref = ref("");
 const testingProxy = ref(false);
 const proxyTestResult = ref<{
   type: "success" | "error";
@@ -518,117 +486,205 @@ let updatePollDeadline = 0;
 let updatePollGeneration = 0;
 let updateDisposed = true;
 let settingsLoadGeneration = 0;
+let settingsPageEpoch = 0;
+
+type SettingsFlowMark = {
+  epoch: number;
+  session: number | undefined;
+  authenticated: boolean | undefined;
+};
+
+function captureSettingsFlow(): SettingsFlowMark {
+  const epoch = sessionStore.sessionEpoch;
+  const authenticated = sessionStore.authenticated;
+  return {
+    epoch: settingsPageEpoch,
+    session: typeof epoch === "number" ? epoch : undefined,
+    authenticated: typeof authenticated === "boolean" ? authenticated : undefined,
+  };
+}
+
+function settingsFlowOwns(mark: SettingsFlowMark): boolean {
+  if (mark.epoch !== settingsPageEpoch) return false;
+  if (mark.authenticated === true && sessionStore.authenticated === false) return false;
+  const epoch = sessionStore.sessionEpoch;
+  if (typeof epoch === "number" && mark.session !== undefined && epoch !== mark.session) return false;
+  return true;
+}
+
+function invalidateSettingsFlows(): void {
+  settingsPageEpoch += 1;
+  settingsLoadGeneration += 1;
+  saving.value = false;
+  hostSaving.value = false;
+}
+
+let settingsPageMark = captureSettingsFlow();
 
 const UPDATE_POLL_INTERVAL_MS = 1_000;
 const UPDATE_INSTALL_TIMEOUT_MS = 15 * 60_000;
 const savedConfig = ref<AppConfig | null>(null);
 let pendingSettingsMerge: { current: AppConfig; saved: AppConfig } | null = null;
+/** Last canonical snapshot applied to the editor. A later snapshot that repeats a field must not erase a local edit of that field. */
+let acceptedCanonical: AppConfig | null = null;
+
+const CANONICAL_EDIT_KEYS = [
+  "gateway_port",
+  "proxy_mode",
+  "proxy_url",
+  "proxy_list_direction",
+  "proxy_list_models",
+  "client_root_url",
+  "auto_start",
+  "show_dock_icon",
+  "connect_timeout_secs",
+  "non_stream_timeout_secs",
+  "stream_idle_timeout_secs",
+] as const satisfies readonly (keyof AppConfig)[];
+
+function sameSettingValue(a: unknown, b: unknown): boolean {
+  if (Array.isArray(a) && Array.isArray(b)) {
+    return a.length === b.length && a.every((value, index) => value === b[index]);
+  }
+  return a === b;
+}
+
+function readableSettingsError(error: unknown): string {
+  if (error instanceof Error) return error.message;
+  if (typeof error === "string") return error;
+  return "";
+}
 
 // ponytail: keep this pre-load fallback in sync with AppConfig::default().
-const config = ref<AppConfig>({
-  revision: 0,
-  gateway_port: 9042,
-  gateway_port_from_env: false,
-  proxy_mode: "auto",
-  proxy_url: "",
-  proxy_list_direction: "whitelist",
-  proxy_list_models: [],
-  proxy_supported_models: [],
-  opencode_invite_url: DEFAULT_OPENCODE_INVITE_URL,
-  client_root_url: "",
-  client_root_url_from_env: false,
-  auto_start: false,
-  auto_start_supported: false,
-  show_dock_icon: true,
-  dock_visibility_supported: false,
-  connect_timeout_secs: 30,
-  non_stream_timeout_secs: 900,
-  stream_idle_timeout_secs: 300,
-  routing_mode: "strict-priority",
-  conversation_sticky: false,
+function defaultSettingsConfig(): AppConfig {
+  return {
+    revision: 0,
+    process_generation: 0,
+    gateway_port: 9042,
+    gateway_port_from_env: false,
+    proxy_mode: "auto",
+    proxy_url: "",
+    proxy_list_direction: "whitelist",
+    proxy_list_models: [],
+    proxy_supported_models: [],
+    opencode_invite_url: DEFAULT_OPENCODE_INVITE_URL,
+    client_root_url: "",
+    client_root_url_from_env: false,
+    auto_start: false,
+    auto_start_supported: false,
+    show_dock_icon: true,
+    dock_visibility_supported: false,
+    connect_timeout_secs: 30,
+    non_stream_timeout_secs: 900,
+    stream_idle_timeout_secs: 300,
+    routing_mode: "strict-priority",
+    conversation_sticky: false,
+  };
+}
+
+const config = ref<AppConfig>(defaultSettingsConfig());
+
+function resetSettingsEditor(): void {
+  invalidateSettingsFlows();
+  loaded.value = false;
+  savedConfig.value = null;
+  acceptedCanonical = null;
+  pendingSettingsMerge = null;
+  portRecoveryHref.value = "";
+  settingsLoadError.value = "";
+  config.value = defaultSettingsConfig();
+  revalidateGate.reset();
+}
+
+watch(() => sessionStore.authenticated, (ok) => {
+  if (!ok) resetSettingsEditor();
+  else settingsPageMark = captureSettingsFlow();
 });
 
-const routingModeOptions: Array<{
-  value: RoutingMode;
-  label: MessageKey;
-  behavior: MessageKey;
-  pros: MessageKey;
-  cons: MessageKey;
-}> = [
-  {
-    value: "strict-priority",
-    label: "严格优先级",
-    behavior: "每次新请求按账号排序选择第一个可用账号。",
-    pros: "优点：行为确定，高优先级账号恢复后立即接管。",
-    cons: "缺点：冷却恢复可能切换账号，影响按凭据隔离的 prompt cache。",
+// The store stamps a PUT receipt onto the last displayed snapshot and clears
+// canonicalConfirmed. That object is not a fetched resource. Only a committed
+// GET may advance revision, process, and normalized or capability fields.
+watch(
+  () => (settingsStore.canonicalConfirmed ? settingsStore.settings : null),
+  (canonical) => {
+    if (!canonical || !settingsFlowOwns(settingsPageMark)) return;
+    acceptSettingsSnapshot(canonical);
   },
-  {
-    value: "sticky-global",
-    label: "全局粘性",
-    behavior: "无对话绑定时优先沿用当前全局账号，不可用时再按排序切换。",
-    pros: "优点：低并发时更容易保持 prompt cache，不会因高优先级恢复而无谓抢切。",
-    cons: "缺点：所有并发对话共享一个账号，恢复后不会自动抢回流量。",
-  },
-  {
-    value: "round-robin",
-    label: "轮询",
-    behavior: "每个新请求从上次位置之后循环选择下一个可用账号。",
-    pros: "优点：多账号可用时分摊请求、额度和风险。",
-    cons: "缺点：账号切换最频繁，prompt cache 命中通常较差，且不是加权均衡。",
-  },
-];
+);
 
-const themeLabel = computed(() => {
-  const selected = t((THEME_OPTIONS.find((option) => option.value === themeName)?.label ?? "默认") as MessageKey);
-  if (themeName !== "default") return selected;
-  const resolved = t((THEME_OPTIONS.find((option) => option.value === resolvedTheme)?.label ?? "皓白") as MessageKey);
-  return t("默认 · {theme}", { theme: resolved });
-});
 const proxyModeHelp = computed(() => {
   const help: Record<ProxyMode, MessageKey> = {
     auto: "自动读取 HTTP_PROXY、HTTPS_PROXY、ALL_PROXY、NO_PROXY；Windows 也会读取系统代理，未配置时直连。",
     manual: "所有 HTTP 与 HTTPS 目标都走此代理；代理不可用时直接报错，不会静默回退直连。",
     direct: "忽略系统代理和代理环境变量，始终直接连接。",
-    list: "按模型名单分流：只有名单内模型按方向走代理或直连；“测试连接”验证的是方向默认段。",
+    list: "按模型名单分流：仅名单内模型按方向走代理或直连；“测试连接”验证方向默认段。",
   };
   return t(help[config.value.proxy_mode]);
 });
 
-const proxyIntro = computed(() => (
-  config.value.proxy_mode === "list"
-    ? t("名单模式按模型分流聊天转发；非聊天出站（账号测试、用量、价格、升级检查）走方向默认段。")
-    : t("统一用于模型转发、账号测试、用量与价格刷新等 OpenCode 出站请求。")
-));
-
 const proxyTestHelp = computed(() => (
   config.value.proxy_mode === "list"
-    ? t("测试当前表单值，不会保存设置；验证的是方向默认段，不能代表名单内模型的真实转发路径。")
+    ? t("测试当前表单值，不会保存设置；仅验证方向默认段，不代表名单内模型的真实转发路径。")
     : t("测试当前表单值，不会保存设置；收到任意 HTTP 响应即表示链路可用。")
 ));
 
 const proxyDirectionHelp = computed(() => (
   config.value.proxy_list_direction === "whitelist"
-    ? t("名单内模型走代理地址，名单外模型直连；非聊天出站（价格 / 用量 / 升级检查）将改为直连。")
-    : t("名单内模型直连，名单外模型走代理地址；非聊天出站（价格 / 用量 / 升级检查）走代理地址。")
+    ? t("名单内模型走代理，名单外模型直连；非聊天出站（价格 / 用量 / 升级检查）改为直连。")
+    : t("名单内模型直连，名单外模型走代理；非聊天出站（价格 / 用量 / 升级检查）走代理。")
 ));
 
 const proxySupportedIds = computed(() =>
   config.value.proxy_supported_models.map((model) => model.id),
 );
 
+/** Normalized keys of the registry. Replaces the per-row `some()` scans that
+ * made the checkbox grid O(M² + M·K) and re-ran on every proxy-URL keystroke
+ * (the grid shares a render function with `v-model:value="config.proxy_url"`). */
+const proxySupportedKeys = computed(
+  () => new Set(config.value.proxy_supported_models.map((model) => proxyModelKey(model.id))),
+);
+
+/** Selected ids, normalized once instead of per row. */
+const proxyListModelKeys = computed(
+  () => new Set(config.value.proxy_list_models.map((id) => proxyModelKey(id))),
+);
+
+/** Registry keys that sit on the Zen free channel (egress-IP-shared quota). Go
+ * catalog ids may end in `-free` without being on the free channel, so the hint
+ * must follow the registry flag, not the suffix. A key enters the set as soon
+ * as any registry entry with that key is Zen free — same answer the previous
+ * `some(... && model.zen_free)` scan gave, including duplicate-key registries. */
+const proxyZenFreeKeys = computed(() => {
+  const keys = new Set<string>();
+  for (const model of config.value.proxy_supported_models) {
+    if (model.zen_free) keys.add(proxyModelKey(model.id));
+  }
+  return keys;
+});
+
+/** One pre-resolved row per registry model: the checkbox grid renders only
+ * lookups, so render cost no longer scales with registry × selection size. */
+const proxyModelRows = computed(() => {
+  const selected = proxyListModelKeys.value;
+  const zenFree = proxyZenFreeKeys.value;
+  return config.value.proxy_supported_models.map((model) => {
+    const key = proxyModelKey(model.id);
+    return {
+      id: model.id,
+      protocol: model.preferred_protocol,
+      checked: selected.has(key),
+      zenFree: zenFree.has(key),
+    };
+  });
+});
+
 /** Stored ids the current registry no longer knows; inert and dropped on save. */
 const proxyUnknownModels = computed(() => (
   config.value.proxy_mode === "list"
-    ? config.value.proxy_list_models.filter((id) => !proxySupportedIds.value.includes(id))
+    ? config.value.proxy_list_models.filter((id) => !proxySupportedKeys.value.has(proxyModelKey(id)))
     : []
 ));
-
-/** On the registered Zen free channel (egress-IP-shared quota). Go catalog
- * ids may end in `-free` without being on the free channel, so the hint must
- * follow the registry flag, not the suffix. */
-function isZenFreeModel(id: string): boolean {
-  return config.value.proxy_supported_models.some((model) => model.id === id && model.zen_free);
-}
 
 function protocolLabel(protocol: string): string {
   if (protocol === "chat_completions") return "Chat";
@@ -638,13 +694,9 @@ function protocolLabel(protocol: string): string {
 }
 
 function toggleProxyListModel(id: string, checked: boolean) {
-  const models = new Set(config.value.proxy_list_models);
-  if (checked) {
-    models.add(id);
-  } else {
-    models.delete(id);
-  }
-  config.value.proxy_list_models = [...models];
+  const models = config.value.proxy_list_models.filter((model) => proxyModelKey(model) !== proxyModelKey(id));
+  if (checked) models.push(id);
+  config.value.proxy_list_models = models;
 }
 
 const proxyUrlPreview = computed<{ status?: "error"; feedback: string }>(() => {
@@ -774,34 +826,94 @@ const updateDownloadPercentage = computed(() => {
   return Math.min(100, Math.max(0, Math.round((status.downloaded / status.total) * 100)));
 });
 
+let settingsLoadInFlight: Promise<boolean> | null = null;
 async function loadSettings(): Promise<boolean> {
+  if (settingsLoadInFlight) return settingsLoadInFlight;
   const generation = ++settingsLoadGeneration;
   settingsLoadError.value = "";
+  const pending = loadSettingsOnce(generation).finally(() => {
+    if (settingsLoadInFlight === pending) settingsLoadInFlight = null;
+  });
+  settingsLoadInFlight = pending;
+  return pending;
+}
+
+async function loadSettingsOnce(generation: number): Promise<boolean> {
   try {
-    const nextConfig = await settingsStore.loadPresented();
+    await settingsStore.loadPresented();
     if (generation !== settingsLoadGeneration) return false;
-    acceptSettingsSnapshot(nextConfig);
+    // The store returns the raw body even when a newer write invalidated it.
+    // The editor adopts only the canonical snapshot that write actually committed.
+    const canonical = confirmedCanonical();
+    if (!canonical) return false;
+    acceptSettingsSnapshot(canonical);
     return true;
   } catch (e) {
     if (generation !== settingsLoadGeneration) return false;
-    settingsLoadError.value = e instanceof Error ? e.message : String(e);
-    message.error(t("加载设置失败: {error}", { error: settingsLoadError.value }));
+    settingsLoadError.value = readableSettingsError(e);
+    message.error(t("加载设置失败：{error}", { error: settingsLoadError.value }));
     return false;
   }
 }
 
+function confirmedCanonical(): AppConfig | null {
+  if (!settingsStore.canonicalConfirmed) return null;
+  return settingsStore.settings;
+}
+
+/** A confirmed snapshot that replaced the object observed before this write. */
+function freshCanonical(before: AppConfig | null): AppConfig | null {
+  const now = confirmedCanonical();
+  if (!now || now === before) return null;
+  return now;
+}
+
+function applyAckMetadata(projection: AppConfig, submitted: AppConfig): void {
+  config.value = {
+    ...config.value,
+    revision: projection.revision,
+    process_generation: projection.process_generation,
+  };
+  savedConfig.value = {
+    ...submitted,
+    revision: projection.revision,
+    process_generation: projection.process_generation,
+  };
+}
+
 async function reloadSettingsAfterConflict(
   error: unknown,
-  current = { ...config.value },
-  saved = savedConfig.value ? { ...savedConfig.value } : null,
+  mark: SettingsFlowMark,
+  before: AppConfig | null,
+  saved: AppConfig | null,
 ): Promise<boolean> {
   if (!(error instanceof DashboardRequestError) || error.status !== 409) return false;
-  pendingSettingsMerge = saved ? { current, saved } : null;
+  if (!settingsFlowOwns(mark)) return true;
+  const recovered = freshCanonical(before);
+  if (recovered) {
+    pendingSettingsMerge = saved ? { current: { ...config.value }, saved } : null;
+    acceptSettingsSnapshot(recovered);
+    if (settingsFlowOwns(mark)) {
+      message.warning(t("设置已被其他操作修改，已合并最新设置并保留本地修改，请再次保存"));
+    }
+    return true;
+  }
+  // The store already attempted the conflict reload. A second GET would hide
+  // a failed recovery and must not replay the rejected write.
+  if (isRevisionConflict(error)) {
+    if (settingsFlowOwns(mark)) {
+      message.error(t("保存失败：{error}", { error: readableSettingsError(error) }));
+    }
+    return true;
+  }
+  pendingSettingsMerge = saved ? { current: { ...config.value }, saved } : null;
   if (await loadSettings()) {
+    if (!settingsFlowOwns(mark)) return true;
     message.warning(t("设置已被其他操作修改，已合并最新设置并保留本地修改，请再次保存"));
   } else {
+    if (!settingsFlowOwns(mark)) return true;
     pendingSettingsMerge = null;
-    message.error(t("保存失败: {error}", { error: String(error) }));
+    message.error(t("保存失败：{error}", { error: readableSettingsError(error) }));
   }
   return true;
 }
@@ -813,25 +925,41 @@ async function saveSettings() {
   if (!normalizeProxyInput()) return;
   if (!normalizeProxyListInput()) return;
   if (!validateTimeouts()) return;
+  const mark = captureSettingsFlow();
   saving.value = true;
   const payload = { ...config.value };
   const saved = savedConfig.value ? { ...savedConfig.value } : null;
-  const routingChanged = !!savedConfig.value && (
-    savedConfig.value.routing_mode !== payload.routing_mode
-    || savedConfig.value.conversation_sticky !== payload.conversation_sticky
-  );
+  const previousGatewayPort = saved?.gateway_port ?? payload.gateway_port;
+  const before = settingsStore.settings;
   try {
-    const result = await settingsStore.putPresented(payload);
-    payload.revision = result.revision;
-    config.value.revision = result.revision;
-    savedConfig.value = { ...payload };
-    message.success(routingChanged ? t("设置已保存；运行时路由状态已重置") : t("设置已保存"));
+    const projection = await settingsStore.putPresented(payload);
+    if (!settingsFlowOwns(mark)) return;
+    const canonical = freshCanonical(before);
+    if (canonical) {
+      // The detached GET already committed. Merge against the submitted draft
+      // so in-flight edits survive and server normalization still lands.
+      pendingSettingsMerge = { current: { ...config.value }, saved: payload };
+      acceptSettingsSnapshot(canonical);
+    } else {
+      applyAckMetadata(projection, payload);
+    }
+    if (!settingsFlowOwns(mark)) return;
+    message.success(t("设置已保存"));
+    const plan = planSettingsReconnect({
+      href: window.location.href,
+      previousGatewayPort,
+      nextGatewayPort: payload.gateway_port,
+      dev: import.meta.env.DEV,
+    });
+    portRecoveryHref.value = plan.kind === "manual-recovery" ? plan.href : "";
   } catch (e) {
-    if (!(await reloadSettingsAfterConflict(e, payload, saved))) {
-      message.error(t("保存失败: {error}", { error: String(e) }));
+    if (!settingsFlowOwns(mark)) return;
+    if (!(await reloadSettingsAfterConflict(e, mark, before, saved))) {
+      if (!settingsFlowOwns(mark)) return;
+      message.error(t("保存失败：{error}", { error: readableSettingsError(e) }));
     }
   } finally {
-    saving.value = false;
+    if (settingsFlowOwns(mark)) saving.value = false;
   }
 }
 
@@ -860,7 +988,7 @@ function normalizeProxyListInput(): boolean {
   const supported = proxySupportedIds.value;
   const knownOnly = config.value.proxy_list_models
     .map((id) => id.trim())
-    .filter((id) => supported.includes(id));
+    .filter((id) => proxySupportedKeys.value.has(proxyModelKey(id)));
   try {
     config.value.proxy_list_models = validateProxyList(config.value.proxy_mode, knownOnly, supported);
     return true;
@@ -890,7 +1018,7 @@ async function testProxyConnection() {
     }
     proxyTestResult.value = {
       type: "success",
-      title: t("连接可用"),
+      title: t("连接成功"),
       message: t("收到 HTTP {status} 响应，耗时 {latency} ms。", {
         status: result.status,
         latency: result.latency_ms,
@@ -914,50 +1042,64 @@ async function testProxyConnection() {
   }
 }
 
-async function handleAutoStartToggle(newValue: boolean) {
-  if (!loaded.value || !savedConfig.value) return;
-  const saved = { ...savedConfig.value };
-  const current = { ...config.value, auto_start: newValue };
-  const next = { ...saved, auto_start: newValue };
-  saving.value = true;
+async function patchHostToggle(
+  field: "auto_start" | "show_dock_icon",
+  newValue: boolean,
+  failure: MessageKey,
+): Promise<void> {
+  if (!loaded.value || saving.value || hostSaving.value) return;
+  const previous = config.value[field];
+  config.value[field] = newValue;
+  const mark = captureSettingsFlow();
+  const before = settingsStore.settings;
+  hostSaving.value = true;
+  const patch = field === "auto_start"
+    ? { auto_start: newValue }
+    : { show_dock_icon: newValue };
   try {
-    const result = await settingsStore.putPresented(next);
-    next.revision = result.revision;
-    savedConfig.value = { ...next };
-    config.value.auto_start = newValue;
-    config.value.revision = result.revision;
+    await settingsStore.patchPresented(patch);
+    if (!settingsFlowOwns(mark)) return;
+    const canonical = freshCanonical(before);
+    if (canonical && savedConfig.value) {
+      pendingSettingsMerge = {
+        current: { ...config.value },
+        saved: { ...savedConfig.value, ...patch },
+      };
+      acceptSettingsSnapshot(canonical);
+    } else if (savedConfig.value) {
+      savedConfig.value = { ...savedConfig.value, ...patch };
+    }
+    if (!settingsFlowOwns(mark)) return;
     message.success(t("设置已保存"));
-  } catch (e) {
-    if (!(await reloadSettingsAfterConflict(e, current, saved))) {
-      config.value.auto_start = savedConfig.value.auto_start;
-      message.error(t("自动启动设置失败: {error}", { error: String(e) }));
+  } catch (error) {
+    if (!settingsFlowOwns(mark)) return;
+    const recovered = freshCanonical(before);
+    const canonical = confirmedCanonical();
+    if (isRevisionConflict(error) && recovered) {
+      pendingSettingsMerge = savedConfig.value
+        ? { current: { ...config.value }, saved: { ...savedConfig.value } }
+        : null;
+      acceptSettingsSnapshot(recovered);
+      message.warning(t("设置已被其他操作修改，已合并最新设置并保留本地修改，请再次保存"));
+    } else if (isRevisionConflict(error) && canonical) {
+      config.value[field] = canonical[field];
+      if (savedConfig.value) savedConfig.value = { ...savedConfig.value, [field]: canonical[field] };
+      message.warning(t("设置已被其他操作修改，已合并最新设置并保留本地修改，请再次保存"));
+    } else {
+      config.value[field] = previous;
+      message.error(t(failure, { error: readableSettingsError(error) }));
     }
   } finally {
-    saving.value = false;
+    if (settingsFlowOwns(mark)) hostSaving.value = false;
   }
 }
 
+async function handleAutoStartToggle(newValue: boolean) {
+  await patchHostToggle("auto_start", newValue, "自动启动设置失败：{error}");
+}
+
 async function handleDockVisibilityToggle(newValue: boolean) {
-  if (!loaded.value || !savedConfig.value) return;
-  const saved = { ...savedConfig.value };
-  const current = { ...config.value, show_dock_icon: newValue };
-  const next = { ...saved, show_dock_icon: newValue };
-  saving.value = true;
-  try {
-    const result = await settingsStore.putPresented(next);
-    next.revision = result.revision;
-    savedConfig.value = { ...next };
-    config.value.show_dock_icon = newValue;
-    config.value.revision = result.revision;
-    message.success(t("设置已保存"));
-  } catch (e) {
-    if (!(await reloadSettingsAfterConflict(e, current, saved))) {
-      config.value.show_dock_icon = savedConfig.value.show_dock_icon;
-      message.error(t("Dock 图标设置失败: {error}", { error: String(e) }));
-    }
-  } finally {
-    saving.value = false;
-  }
+  await patchHostToggle("show_dock_icon", newValue, "Dock 图标设置失败：{error}");
 }
 
 function normalizeClientRootInput(): boolean {
@@ -981,16 +1123,31 @@ function validateTimeouts(): boolean {
     !Number.isInteger(value) || value < min || value > max
   ));
   if (!invalid) return true;
-  message.error(t("{field}必须为 {min}–{max} 秒的整数", invalid));
+  message.error(t("{field}必须是 {min}–{max} 秒之间的整数", invalid));
   return false;
 }
 
 function acceptSettingsSnapshot(latest: AppConfig) {
   const pending = pendingSettingsMerge;
+  const current = pending?.current ?? { ...config.value };
+  const saved = pending?.saved ?? (savedConfig.value ? { ...savedConfig.value } : null);
+  const previous = acceptedCanonical;
+  let merged = loaded.value && saved
+    ? mergeUnsavedSettings(latest, current, saved)
+    : { ...latest };
+  // A canonical field that is unchanged from the last committed snapshot is
+  // not new server state. Keep the editor's value, including an edit that
+  // was just acknowledged and would otherwise look clean.
+  if (loaded.value && previous) {
+    for (const key of CANONICAL_EDIT_KEYS) {
+      if (sameSettingValue(latest[key], previous[key])) {
+        merged = { ...merged, [key]: current[key] };
+      }
+    }
+  }
+  acceptedCanonical = { ...latest };
   savedConfig.value = { ...latest };
-  config.value = pending
-    ? mergeUnsavedSettings(latest, pending.current, pending.saved)
-    : latest;
+  config.value = merged;
   pendingSettingsMerge = null;
   loaded.value = true;
   settingsLoadError.value = "";
@@ -1140,7 +1297,7 @@ function acceptObservedUpdateStatus(status: UpdateStatus): boolean {
 async function pollUpdateStatus(generation: number) {
   if (!isActiveUpdateGeneration(generation)) return;
   if (Date.now() >= updatePollDeadline) {
-    failUpdate(t("等待新版本启动超时。请确认安装窗口是否被安全软件拦截，然后重试。"));
+    failUpdate(t("等待新版本启动超时。请确认安装是否被安全软件拦截，然后重试。"));
     return;
   }
   try {
@@ -1235,11 +1392,14 @@ async function installAvailableUpdate() {
 
 onMounted(() => {
   updateDisposed = false;
+  settingsPageMark = captureSettingsFlow();
   void loadSettings();
   void restoreUpdateState();
 });
 onActivated(() => {
   if (saving.value || testingProxy.value) return;
+  if (settingsStore.settings && !revalidateGate.shouldRun()) return;
+  revalidateGate.record();
   if (savedConfig.value) {
     pendingSettingsMerge = {
       current: { ...config.value },
@@ -1249,6 +1409,7 @@ onActivated(() => {
   void loadSettings();
 });
 onUnmounted(() => {
+  invalidateSettingsFlows();
   updateDisposed = true;
   cancelUpdatePolling();
 });
@@ -1258,14 +1419,14 @@ onUnmounted(() => {
 .settings-grid {
   display: grid;
   grid-template-columns: minmax(0, 1fr);
-  gap: 16px;
+  gap: var(--ocg-space-lg);
   max-width: 1080px;
   margin: 0 auto;
 }
 .settings-card {
   padding: 22px;
   border: 1px solid var(--ocg-border);
-  border-radius: 14px;
+  border-radius: var(--ocg-radius-lg);
   background: var(--ocg-surface);
   box-shadow: var(--ocg-shadow-sm);
 }
@@ -1273,13 +1434,13 @@ onUnmounted(() => {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   align-self: start;
-  gap: 16px;
+  gap: var(--ocg-space-lg);
 }
 .downstream-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   align-items: start;
-  gap: 16px;
+  gap: var(--ocg-space-lg);
   padding-top: 18px;
   border-top: 1px solid var(--ocg-border);
 }
@@ -1295,7 +1456,7 @@ onUnmounted(() => {
   font: 700 var(--ocg-font-lg)/1.3 "Bahnschrift", "Segoe UI Variable Display", sans-serif;
 }
 .settings-head p {
-  margin: 4px 0 0;
+  margin: var(--ocg-space-xs) 0 0;
   color: var(--ocg-subtle);
   font-size: var(--ocg-font-sm);
 }
@@ -1315,7 +1476,7 @@ onUnmounted(() => {
   line-height: 1.5;
 }
 .settings-subsection {
-  margin-top: 8px;
+  margin-top: var(--ocg-space-sm);
   padding-top: 18px;
   border-top: 1px solid var(--ocg-border);
 }
@@ -1327,12 +1488,12 @@ onUnmounted(() => {
 .proxy-mode-group {
   display: flex;
   flex-wrap: wrap;
-  gap: 8px 18px;
+  gap: var(--ocg-space-sm) 18px;
   width: 100%;
 }
 .proxy-mode-help {
   min-height: 1.4em;
-  margin: 8px 0 12px;
+  margin: var(--ocg-space-sm) 0 var(--ocg-space-md);
 }
 .proxy-test-row {
   display: flex;
@@ -1340,24 +1501,24 @@ onUnmounted(() => {
   gap: 10px;
 }
 .proxy-test-result {
-  margin-top: 12px;
+  margin-top: var(--ocg-space-md);
 }
 .proxy-direction-group {
   display: flex;
   flex-wrap: wrap;
-  gap: 4px 16px;
+  gap: var(--ocg-space-xs) var(--ocg-space-lg);
 }
 .proxy-model-grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
-  gap: 6px 16px;
+  gap: 6px var(--ocg-space-lg);
   width: 100%;
 }
 .proxy-model-option {
   display: flex;
   align-items: center;
   flex-wrap: wrap;
-  gap: 0 8px;
+  gap: 0 var(--ocg-space-sm);
 }
 .proxy-model-hint {
   color: var(--n-text-color-disabled, inherit);
@@ -1365,24 +1526,24 @@ onUnmounted(() => {
 }
 .proxy-model-free-hint {
   flex-basis: 100%;
-  padding-left: 24px;
+  padding-left: var(--ocg-space-xl);
   color: var(--n-text-color-warning, inherit);
   font-size: 12px;
 }
 .proxy-stale-note {
-  margin-top: 8px;
+  margin-top: var(--ocg-space-sm);
 }
 .settings-load-error {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 12px;
-  margin-bottom: 12px;
+  gap: var(--ocg-space-md);
+  margin-bottom: var(--ocg-space-md);
 }
 .timeout-field {
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  gap: var(--ocg-space-xs);
   width: 100%;
 }
 .field-caption {
@@ -1390,54 +1551,10 @@ onUnmounted(() => {
   color: var(--ocg-subtle);
   line-height: 1.4;
 }
-.routing-intro {
-  margin: 8px 0 12px;
-}
-.routing-mode-group {
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-  width: 100%;
-}
-.routing-option {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  padding: 12px;
-  border: 1px solid var(--ocg-border);
-  border-radius: 10px;
-  background: var(--ocg-panel-soft, transparent);
-}
-.routing-option--selected {
-  border-color: var(--ocg-accent, var(--ocg-border));
-}
-.routing-option-title {
-  color: var(--ocg-ink);
-  font-weight: 600;
-}
-.routing-option .field-caption {
-  margin: 0;
-  padding-left: 24px;
-}
-.routing-sticky {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  margin-top: 14px;
-  padding: 12px;
-  border: 1px solid var(--ocg-border);
-  border-radius: 10px;
-}
-.routing-sticky-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-}
 .theme-grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(72px, 1fr));
-  gap: 8px;
+  gap: var(--ocg-space-sm);
 }
 .theme-option {
   position: relative;
@@ -1446,10 +1563,10 @@ onUnmounted(() => {
   min-height: 64px;
   align-items: center;
   justify-content: center;
-  gap: 8px;
-  padding: 8px;
+  gap: var(--ocg-space-sm);
+  padding: var(--ocg-space-sm);
   border: 1px solid var(--ocg-border);
-  border-radius: 10px;
+  border-radius: var(--ocg-radius-md);
   color: var(--ocg-muted);
   background: var(--ocg-canvas);
   font: 600 var(--ocg-font-sm)/1 "Segoe UI Variable Text", "Microsoft YaHei UI", sans-serif;
@@ -1498,12 +1615,12 @@ onUnmounted(() => {
 .update-result-content {
   display: grid;
   justify-items: start;
-  gap: 12px;
+  gap: var(--ocg-space-md);
 }
 .update-actions {
   display: flex;
   flex-wrap: wrap;
-  gap: 8px;
+  gap: var(--ocg-space-sm);
 }
 .update-status-body {
   display: grid;

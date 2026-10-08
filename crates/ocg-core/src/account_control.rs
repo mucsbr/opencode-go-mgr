@@ -8,7 +8,8 @@
 
 use crate::browser::{BrowserProfileOperationKind, StagedBrowserProfiles};
 use crate::models::{
-    Account, AccountSetupStep, AccountType, AccountUpdate, normalize_account_notes,
+    Account, AccountSetupStep, AccountType, AccountUpdate, NEW_READY_KEY_ACCOUNT_ENABLED,
+    normalize_account_notes,
 };
 use crate::provider::{
     CPA_ACCOUNT_ID, ConnectionVerificationStatus, OPENCODE_PROVIDER_ID, VerificationPolicy,
@@ -51,7 +52,7 @@ pub trait AccountControlHost: Sync {
         account_id: &str,
     ) -> anyhow::Result<Option<ConnectionVerificationStatus>>;
     fn delete_account_row(&self, id: &str) -> anyhow::Result<()>;
-    fn log_gateway(&self, level: &str, category: &str, message: &str) -> anyhow::Result<()>;
+    fn log_program_event(&self, level: &str, category: &str, message: &str) -> anyhow::Result<()>;
     fn stop_browser_account(
         &self,
         account_id: &str,
@@ -112,8 +113,8 @@ where
     fn delete_account_row(&self, id: &str) -> anyhow::Result<()> {
         self.deref().delete_account_row(id)
     }
-    fn log_gateway(&self, level: &str, category: &str, message: &str) -> anyhow::Result<()> {
-        self.deref().log_gateway(level, category, message)
+    fn log_program_event(&self, level: &str, category: &str, message: &str) -> anyhow::Result<()> {
+        self.deref().log_program_event(level, category, message)
     }
     fn stop_browser_account(
         &self,
@@ -171,7 +172,21 @@ pub fn create_go_api_key(
     username: Option<String>,
     password: Option<String>,
 ) -> Result<Account, AccountControlError> {
-    host.with_settings_update(|| create_go_api_key_locked(host, name, key, username, password))
+    create_go_api_key_recorded(host, name, key, username, password, |_, _| {})
+}
+
+/// Capture this account's committed identity before fallible publication/read.
+pub fn create_go_api_key_recorded(
+    host: &impl AccountControlHost,
+    name: String,
+    key: String,
+    username: Option<String>,
+    password: Option<String>,
+    on_committed: impl FnOnce(&str, u64),
+) -> Result<Account, AccountControlError> {
+    host.with_settings_update(|| {
+        create_go_api_key_locked(host, name, key, username, password, on_committed)
+    })
 }
 
 fn create_go_api_key_locked(
@@ -180,6 +195,7 @@ fn create_go_api_key_locked(
     key: String,
     username: Option<String>,
     password: Option<String>,
+    on_committed: impl FnOnce(&str, u64),
 ) -> Result<Account, AccountControlError> {
     let name = name.trim().to_string();
     if name.is_empty() {
@@ -208,7 +224,7 @@ fn create_go_api_key_locked(
         key_cipher: host
             .encrypt_key(key.trim())
             .map_err(AccountControlError::Internal)?,
-        enabled: true,
+        enabled: NEW_READY_KEY_ACCOUNT_ENABLED,
         account_type: AccountType::Key,
         setup_step: AccountSetupStep::Ready,
         referral_code: None,
@@ -231,12 +247,8 @@ fn create_go_api_key_locked(
         .map_err(|error| AccountControlError::Conflict(error.to_string()))?;
     host.create_account_with_contract(&account)
         .map_err(map_write_error)?;
-    let _ = host.log_gateway(
-        "info",
-        "account",
-        &format!("created account {}", account.name),
-    );
-    commit_account(host, &id, true)
+    let _ = host.log_program_event("info", "account", &format!("created account {id}"));
+    commit_account_recorded(host, &id, true, |revision| on_committed(&id, revision))
 }
 
 /// Enable or disable an account using Dashboard enablement policy.
@@ -248,15 +260,31 @@ pub fn set_account_enabled(
     id: &str,
     enabled: bool,
 ) -> Result<Account, AccountControlError> {
-    host.with_settings_update(|| set_account_enabled_locked(host, id, enabled))
+    set_account_enabled_recorded(host, id, enabled, |_| {})
 }
 
-/// Same persist + revision bump as [`set_account_enabled`], for callers that
-/// already hold `settings_update` (Dashboard CAS).
-pub(crate) fn set_account_enabled_locked(
+/// Capture this enablement's commit before its follow-up account read.
+pub fn set_account_enabled_recorded(
     host: &impl AccountControlHost,
     id: &str,
     enabled: bool,
+    on_committed: impl FnOnce(u64),
+) -> Result<Account, AccountControlError> {
+    host.with_settings_update(|| {
+        set_account_enabled_locked_recorded(host, id, enabled, on_committed)
+    })
+}
+
+/// Same write as [`set_account_enabled`], for callers holding `settings_update`.
+/// `on_committed` runs after the
+/// account row is updated and this call bumps `settings_revision`, before the
+/// follow-up account read. The callback must not reenter `settings_update` or
+/// the database lock.
+pub(crate) fn set_account_enabled_locked_recorded(
+    host: &impl AccountControlHost,
+    id: &str,
+    enabled: bool,
+    on_committed: impl FnOnce(u64),
 ) -> Result<Account, AccountControlError> {
     let account = load_account(host, id)?;
     if account.is_zen_free() {
@@ -291,16 +319,16 @@ pub(crate) fn set_account_enabled_locked(
         notes: None,
     };
     host.update_account(id, &update).map_err(map_write_error)?;
-    let _ = host.log_gateway(
+    let _ = host.log_program_event(
         "info",
         "account",
         &format!(
             "{} account {}",
             if enabled { "enabled" } else { "disabled" },
-            account.name
+            id
         ),
     );
-    commit_account(host, id, false)
+    commit_account_recorded(host, id, false, on_committed)
 }
 
 /// Delete an account, staging and purging its browser profiles.
@@ -313,6 +341,18 @@ pub async fn delete_account(
     host: &impl AccountControlHost,
     id: &str,
     cas: Option<(u64, u64)>,
+) -> Result<u64, AccountControlError> {
+    delete_account_recorded(host, id, cas, |_| {}).await
+}
+
+/// Notify the caller at this action's committed deletion, before fallible
+/// profile cleanup and contract publication. The callback must not reenter
+/// the configuration lock; persistence of the receipt happens after return.
+pub async fn delete_account_recorded(
+    host: &impl AccountControlHost,
+    id: &str,
+    cas: Option<(u64, u64)>,
+    on_committed: impl FnOnce(u64),
 ) -> Result<u64, AccountControlError> {
     host.with_settings_update(|| {
         check_cas(host, cas)?;
@@ -327,17 +367,18 @@ pub async fn delete_account(
         .await
         .map_err(|error| AccountControlError::Unavailable(error.to_string()))?;
 
-    host.with_settings_update(|| delete_account_persist(host, id, cas))
+    host.with_settings_update(|| delete_account_persist(host, id, cas, on_committed))
 }
 
 fn delete_account_persist(
     host: &impl AccountControlHost,
     id: &str,
     cas: Option<(u64, u64)>,
+    on_committed: impl FnOnce(u64),
 ) -> Result<u64, AccountControlError> {
     check_cas(host, cas)?;
     reject_singleton_delete(id)?;
-    let account = load_account(host, id)?;
+    load_account(host, id)?;
     let staged = StagedBrowserProfiles::stage(
         &host.data_dir(),
         id,
@@ -346,11 +387,7 @@ fn delete_account_persist(
     .map_err(AccountControlError::Internal)?;
     let delete_result = host.delete_account_row(id);
     if delete_result.is_ok() {
-        let _ = host.log_gateway(
-            "info",
-            "account",
-            &format!("deleted account {} ({})", id, account.name),
-        );
+        let _ = host.log_program_event("info", "account", &format!("deleted account {id}"));
     }
     if let Err(error) = delete_result {
         let restore_error = staged.restore().err();
@@ -362,6 +399,7 @@ fn delete_account_persist(
         }));
     }
     let revision = host.bump_settings_revision();
+    on_committed(revision);
     staged.purge().map_err(AccountControlError::Internal)?;
     host.reload_provider_contracts()
         .map_err(AccountControlError::Internal)?;
@@ -399,12 +437,14 @@ pub(crate) fn ensure_account_can_enable(
     Ok(())
 }
 
-fn commit_account(
+fn commit_account_recorded(
     host: &impl AccountControlHost,
     id: &str,
     reload_contracts: bool,
+    on_committed: impl FnOnce(u64),
 ) -> Result<Account, AccountControlError> {
-    let _revision = host.bump_settings_revision();
+    let revision = host.bump_settings_revision();
+    on_committed(revision);
     if reload_contracts {
         host.reload_provider_contracts()
             .map_err(AccountControlError::Internal)?;
@@ -549,7 +589,6 @@ mod tests {
         .unwrap();
         assert!(created.enabled);
         assert_eq!(created.provider_id, OPENCODE_PROVIDER_ID);
-        assert_eq!(created.provider_id, OPENCODE_PROVIDER_ID);
         assert_eq!(created.username.as_deref(), Some("alice"));
         assert_eq!(state.settings_revision(), before + 1);
 
@@ -601,17 +640,21 @@ mod tests {
         let now = Utc::now();
         let provider_id = uuid::Uuid::new_v4().to_string();
         let runtime = crate::dynamic::DynamicProviderRuntime {
+            preset_id: None,
             id: provider_id.clone(),
             name: "Lab".into(),
             endpoint_url: "http://127.0.0.1:9".into(),
             upstream_protocol: crate::provider::UpstreamProtocolKind::ChatCompletions,
             auth_kind: ocg_domain::dynamic::DynamicAuthKind::None,
             mappings: vec![ocg_domain::dynamic::DynamicModelMapping {
+                upstream_override: None,
                 public_model: "lab-opus".into(),
                 upstream_model: "vendor/opus".into(),
             }],
             created_at: now,
             updated_at: now,
+            origin: ocg_domain::provider::ProviderOrigin::Custom,
+            offering: "api".to_string(),
         };
         let mut account = custom_pending(&state, "dyn-none");
         account.provider_id = provider_id.clone();

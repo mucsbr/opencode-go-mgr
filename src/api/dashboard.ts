@@ -21,12 +21,11 @@ import type {
   AccountModelCapabilitiesUpdate,
   AccountSetupStep,
   AccountUsageUpdate,
-  ApplicationConnectorCommitRequest,
-  ApplicationConnectorPreviewRequest,
   AuthStatus,
-  ClaudeDesktopModelsUpdate,
   ForwardLogQuery as V3ForwardLogQuery,
+  GatewayLogQuery,
   KeyUpdate,
+  MutationAck,
   MutationExpectation,
   ProxyTestRequest,
 } from "./generated/dashboard-v3.ts";
@@ -46,6 +45,11 @@ import {
   type WithoutExpectation,
 } from "./dashboard-v3.ts";
 import {
+  getOperationLogs,
+  getRequestLogAttempts,
+  getRequestLogs,
+} from "./log-ledger.ts";
+import {
   accountCreateInput,
   accountUpdateInput,
   presentAccount,
@@ -56,10 +60,9 @@ import {
   presentDashboardSummary,
   presentForwardLogs,
   presentGatewayLog,
-  presentPricing,
-  presentProviderPricingRefresh,
   presentProxyTest,
   presentSettings,
+  settingsPatchInput,
   settingsUpdateInput,
   presentUpdateCheck,
   presentUpdateStatus,
@@ -72,13 +75,12 @@ import {
   type AccountModelTestResponse,
   type AccountUpdate,
   type AppConfig,
+  type SettingsPatch,
   type BrowserTarget,
   type ConnectionInfo,
   type CustomModelDiscoveryInput,
   type ForwardLogQuery,
   type ManagedAccountInput,
-  type PricingMultiplierUpdate,
-  type ProviderPricingRefreshRequest,
 } from "./dashboard-presenters.ts";
 
 export {
@@ -104,10 +106,32 @@ async function withCas<T>(
   return controlPlane.runMutation(run);
 }
 
+// Short local account writes only: the serial lane orders them on fresh CAS
+// tokens so two quick independent edits cannot self-conflict. Network
+// refreshes/verifications stay on plain withCas and never enter the lane.
+async function withLocalCas<T>(
+  target: string,
+  run: (expectation: { expectedRevision: number; processGeneration: number }) => Promise<T>,
+): Promise<T> {
+  return useControlPlaneStore().runLocalMutation(target, run);
+}
+
 async function mutatedAccount(result: Promise<{ account: Parameters<typeof presentAccount>[0] | null }>): Promise<Account> {
   const mutation = await result;
   if (mutation.account === null) throw new Error("account mutation returned no account");
   return presentAccount(mutation.account);
+}
+
+const SETTINGS_PATCH_FIELDS = [
+  "auto_start",
+  "conversation_sticky",
+  "opencode_invite_url",
+  "routing_mode",
+  "show_dock_icon",
+] as const satisfies readonly (keyof SettingsPatch)[];
+
+function settingsPatchFields(patch: SettingsPatch): string[] {
+  return SETTINGS_PATCH_FIELDS.filter((field) => patch[field] !== undefined);
 }
 
 function forwardLogQuery(value: ForwardLogQuery): V3ForwardLogQuery {
@@ -139,13 +163,6 @@ export const dashboardApi = {
     dashboardV3.logoutAdmin(expectation),
 
   getConnection: async (): Promise<ConnectionInfo> => presentConnection(await dashboardV3.getConnection()),
-  getApplicationConnectors: () => dashboardV3.getApplicationConnectors(),
-  previewApplicationConnector: (id: string, input: ApplicationConnectorPreviewRequest) =>
-    dashboardV3.previewApplicationConnector(id, input),
-  commitApplicationConnector: (
-    id: string,
-    input: WithoutExpectation<ApplicationConnectorCommitRequest>,
-  ) => withCas((expectation) => dashboardV3.commitApplicationConnector(id, input, expectation)),
   createKey: async (name: string, expectation: MutationExpectation): Promise<void> => {
     await dashboardV3.createKey(name, expectation);
   },
@@ -161,19 +178,26 @@ export const dashboardApi = {
   regenerateKey: async (id: string, expectation: MutationExpectation): Promise<void> => {
     await dashboardV3.regenerateKey(id, expectation);
   },
-  regeneratePrimaryKey: async (expectation: MutationExpectation): Promise<string> => {
+  regeneratePrimaryKey: async (expectation: MutationExpectation): Promise<void> => {
     await dashboardV3.regeneratePrimaryKey(expectation);
-    return (await dashboardV3.getConnection()).primaryKey;
   },
 
-  getAccounts: async (): Promise<Account[]> =>
-    (await dashboardV3.listAccounts()).accounts.map(presentAccount),
+  getAccounts: async (): Promise<Account[]> => (await dashboardApi.getAccountsSnapshot()).accounts,
+
+  /** Complete inventory and the process/CAS pair carried by that same response. */
+  getAccountsSnapshot: async (): Promise<{ accounts: Account[]; expectation: MutationExpectation }> => {
+    const result = await dashboardV3.listAccounts();
+    return {
+      accounts: result.accounts.map(presentAccount),
+      expectation: { expectedRevision: result.revision, processGeneration: result.processGeneration },
+    };
+  },
 
   createAccount: (input: AccountInput): Promise<Account> =>
-    mutatedAccount(withCas((expectation) => dashboardV3.createAccount(accountCreateInput(input), expectation))),
+    mutatedAccount(withLocalCas("account:create", (expectation) => dashboardV3.createAccount(accountCreateInput(input), expectation))),
 
   createManagedAccount: (input: ManagedAccountInput): Promise<Account> =>
-    mutatedAccount(withCas((expectation) => dashboardV3.createManagedAccount({
+    mutatedAccount(withLocalCas("account:create-managed", (expectation) => dashboardV3.createManagedAccount({
       name: input.name,
       username: input.username,
       notes: input.notes,
@@ -192,29 +216,26 @@ export const dashboardApi = {
   )),
 
   updateAccount: (id: string, update: AccountUpdate): Promise<Account> =>
-    mutatedAccount(withCas((expectation) => dashboardV3.updateAccount(id, accountUpdateInput(update), expectation))),
+    mutatedAccount(withLocalCas(`account:${id}`, (expectation) => dashboardV3.updateAccount(id, accountUpdateInput(update), expectation))),
 
   reorderAccounts: async (accountIds: string[]): Promise<Account[]> =>
-    (await withCas((expectation) => dashboardV3.reorderAccounts(accountIds, expectation))).accounts.map(presentAccount),
+    (await withLocalCas("account:reorder", (expectation) => dashboardV3.reorderAccounts(accountIds, expectation))).accounts.map(presentAccount),
 
   deleteAccount: async (id: string): Promise<void> => {
-    await withCas((expectation) => dashboardV3.deleteAccount(id, expectation));
+    await withLocalCas(`account:${id}`, (expectation) => dashboardV3.deleteAccount(id, expectation));
   },
 
   toggleAccount: (id: string): Promise<Account> =>
-    mutatedAccount(withCas((expectation) => dashboardV3.toggleAccount(id, expectation))),
+    mutatedAccount(withLocalCas(`account:${id}`, (expectation) => dashboardV3.toggleAccount(id, expectation))),
 
   resetAccountCooldown: (id: string): Promise<Account> =>
-    mutatedAccount(withCas((expectation) => dashboardV3.resetAccountCooldown(id, expectation))),
+    mutatedAccount(withLocalCas(`account:${id}`, (expectation) => dashboardV3.resetAccountCooldown(id, expectation))),
 
   advanceAccountSetup: (id: string, setupStep: AccountSetupStep): Promise<Account> =>
-    mutatedAccount(withCas((expectation) => dashboardV3.advanceAccountSetup(id, setupStep, expectation))),
+    mutatedAccount(withLocalCas(`account:${id}`, (expectation) => dashboardV3.advanceAccountSetup(id, setupStep, expectation))),
 
   verifyManagedAccountKey: (id: string, key: string): Promise<Account> =>
     mutatedAccount(withCas((expectation) => dashboardV3.verifyManagedAccountKey(id, key, expectation))),
-
-  verifyAccountConnection: (id: string): Promise<Account> =>
-    mutatedAccount(withCas((expectation) => dashboardV3.verifyAccount(id, expectation))),
 
   testAccountModel: (id: string, modelId: string): Promise<AccountModelTestResponse> =>
     dashboardV3.testAccountModel(id, modelId),
@@ -222,7 +243,7 @@ export const dashboardApi = {
   updateAccountCustomConfig: (
     id: string,
     config: AccountCustomConfigUpdateInput,
-  ): Promise<Account> => mutatedAccount(withCas((expectation) => {
+  ): Promise<Account> => mutatedAccount(withLocalCas(`account:${id}`, (expectation) => {
     const payload = {
       endpointUrl: config.endpoint_url,
       upstreamProtocol: config.upstream_protocol,
@@ -243,7 +264,7 @@ export const dashboardApi = {
   updateAccountModelCapabilities: (
     id: string,
     capabilities: AccountModelCapabilityInput[],
-  ): Promise<Account> => mutatedAccount(withCas((expectation) => dashboardV3.putAccountModelCapabilities(id, {
+  ): Promise<Account> => mutatedAccount(withLocalCas(`account:${id}`, (expectation) => dashboardV3.putAccountModelCapabilities(id, {
     capabilities: capabilities.map((capability) => ({
       publicModel: capability.public_model,
       protocol: capability.protocol,
@@ -274,19 +295,34 @@ export const dashboardApi = {
     window: "window_5h" | "window_week" | "window_month",
     percent: number,
     resetsInMinutes?: number | null,
-  ) => presentUsage((await withCas((expectation) => dashboardV3.patchAccountUsage(id, {
-    window,
-    percent,
-    resetsInMinutes: resetsInMinutes ?? null,
-  } satisfies WithoutExpectation<AccountUsageUpdate>, expectation))).usage),
+  ) => {
+    const receipt = await withCas((expectation) => dashboardV3.patchAccountUsage(id, {
+      window, percent, resetsInMinutes: resetsInMinutes ?? null,
+    } satisfies WithoutExpectation<AccountUsageUpdate>, expectation));
+    return { ...presentUsage(receipt.usage), observed_at: receipt.observedAt };
+  },
   refreshAccountUsage: async (id: string) =>
     presentUsageRefresh(await withCas((expectation) => dashboardV3.refreshAccountUsage(id, expectation))),
 
   getSettings: async () => presentSettings(await dashboardV3.getSettings()),
-  updateSettings: async (settings: AppConfig) => {
-    await withCas((expectation) => dashboardV3.putSettings(settingsUpdateInput(settings), expectation));
-    return presentSettings(await dashboardV3.getSettings());
-  },
+  // Receipt-only: the PUT ack carries just the CAS revision. The submitted
+  // draft is the caller's local projection, never the canonical resource;
+  // canonical fields come from a separate GET owned by the caller.
+  // `captured` is the editor baseline. Omit it to send the revision and
+  // process generation already stored on the snapshot — never the live
+  // global tokens, which may have moved since the editor loaded.
+  updateSettings: (settings: AppConfig, captured?: MutationExpectation): Promise<MutationAck> =>
+    dashboardV3.putSettings(settingsUpdateInput(settings), captured ?? {
+      expectedRevision: settings.revision,
+      processGeneration: settings.process_generation,
+    }),
+  // Explicit partial intent on the local CAS lane. The lane reads the
+  // current expectation at dispatch and does not replay a conflict.
+  patchSettings: (patch: SettingsPatch): Promise<MutationAck> =>
+    withLocalCas(
+      `settings-patch:${settingsPatchFields(patch).join("+")}`,
+      (expectation) => dashboardV3.putSettings(settingsPatchInput(patch), expectation),
+    ),
   testProxy: async (input: {
     proxy_mode: AppConfig["proxy_mode"];
     proxy_url?: string;
@@ -297,65 +333,18 @@ export const dashboardApi = {
     proxyListDirection: input.proxy_list_direction,
   } satisfies ProxyTestRequest)),
 
-  getPricing: async () => {
-    const result = await dashboardV3.getProviderPricing("opencode");
-    if (!result.snapshot) throw new Error("OpenCode Go pricing is not available");
-    return presentPricing(result.snapshot);
-  },
-  refreshProviderPricing: async (
-    providerId: string,
-    refresh: ProviderPricingRefreshRequest = {},
-  ) => {
-    const controlPlane = useControlPlaneStore();
-    if (!controlPlane.hasTokens()) await controlPlane.refresh();
-    const expectedProviderPricingRevision = refresh.expected_provider_revision;
-    if (!expectedProviderPricingRevision) {
-      throw new Error("provider pricing revision is not loaded yet");
-    }
-    const result = await controlPlane.runMutation((expectation) => (
-      dashboardV3.refreshProviderPricing(providerId, {
-        expectedProviderPricingRevision,
-        policy: refresh.policy,
-        expectedOfficialContentHash: refresh.expected_official_content_hash,
-      }, expectation)
-    ));
-    return presentProviderPricingRefresh(result);
-  },
-  updatePricingMultipliers: async (expectedPricingRevision: string, multipliers: PricingMultiplierUpdate[]) => {
-    const controlPlane = useControlPlaneStore();
-    if (!controlPlane.hasTokens()) await controlPlane.refresh();
-    return presentPricing(await controlPlane.runMutation((expectation) => dashboardV3.putPricingMultipliers({
-      expectedPricingRevision,
-      multipliers: multipliers.map((multiplier) => ({
-        modelId: multiplier.model_id,
-        multiplier: multiplier.multiplier,
-      })),
-    }, expectation)));
-  },
-
-  getApplicationModels: async () => (await dashboardV3.getApplicationModels()).models,
-  getClaudeDesktopModels: async () => {
-    const value = await dashboardV3.getClaudeDesktopModels();
-    return { sonnet: value.sonnet, opus: value.opus, haiku: value.haiku };
-  },
-  updateClaudeDesktopModels: async (models: { sonnet: string; opus: string; haiku: string }) => {
-    const result = await withCas((expectation) => dashboardV3.putClaudeDesktopModels({
-      sonnet: models.sonnet,
-      opus: models.opus,
-      haiku: models.haiku,
-    } satisfies WithoutExpectation<ClaudeDesktopModelsUpdate>, expectation));
-    return { sonnet: result.sonnet, opus: result.opus, haiku: result.haiku };
-  },
-
   checkForUpdate: async () => presentUpdateCheck(await dashboardV3.checkForUpdate()),
   getUpdateStatus: async () => presentUpdateStatus(await dashboardV3.getUpdateStatus()),
   installUpdate: async (expectedVersion: string) =>
     presentUpdateStatus(await withCas((expectation) => dashboardV3.installUpdate(expectedVersion, expectation))),
 
-  getGatewayLogs: async (limit?: number, requestId?: string | null) =>
-    (await dashboardV3.getGatewayLogs({ limit, requestId: requestId ?? null })).items.map(presentGatewayLog),
-  getForwardLogs: async (query: ForwardLogQuery = {}) =>
-    presentForwardLogs(await dashboardV3.getForwardLogs(forwardLogQuery(query))),
+  getGatewayLogs: async (query: GatewayLogQuery = {}, signal?: AbortSignal) =>
+    (await dashboardV3.getGatewayLogs(query, signal)).items.map(presentGatewayLog),
+  getForwardLogs: async (query: ForwardLogQuery = {}, signal?: AbortSignal) =>
+    presentForwardLogs(await dashboardV3.getForwardLogs(forwardLogQuery(query), signal)),
+  getOperationLogs,
+  getRequestLogs,
+  getRequestLogAttempts,
   getForwardLogModels: async () => (await dashboardV3.getForwardLogModels()).models,
   getForwardLogKeys: async () => (await dashboardV3.getForwardLogKeys()).keys,
   getDashboardSummary: async () => presentDashboardSummary(await dashboardV3.getDashboardSummary()),

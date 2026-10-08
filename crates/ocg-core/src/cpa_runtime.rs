@@ -8,10 +8,15 @@ mod device;
 mod extract;
 pub mod host;
 
+pub use device::CpaDeviceLoginSession;
+
 use crate::cpa::{CpaClient, CpaError};
 use crate::db::{CpaCatalogModel, CpaCatalogRecord, CpaIntegrationRecord};
 use crate::http_client;
-use crate::models::{Account as ModelAccount, AccountSetupStep, AccountType, AppConfig};
+use crate::models::{
+    Account as ModelAccount, AccountSetupStep, AccountType, AppConfig, ProxyListDirection,
+    ProxyMode,
+};
 use crate::provider::{
     CPA_ACCOUNT_ID, CPA_ACCOUNT_NAME, CPA_PROVIDER_ID, CredentialKind, QuotaScope,
 };
@@ -21,9 +26,12 @@ use futures_util::StreamExt;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+#[cfg(test)]
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -136,6 +144,86 @@ impl std::fmt::Display for CpaRuntimeError {
 
 impl std::error::Error for CpaRuntimeError {}
 
+/// External or durable work this failure already performed.
+/// `None` means the business error is the whole result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CpaExternalEffect {
+    None,
+    Compensated,
+    Partial,
+}
+
+/// The original runtime error plus an observed external or durable effect.
+/// Receipts must read `effect`; HTTP mapping must keep using `error`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CpaRuntimeFailure {
+    pub error: CpaRuntimeError,
+    pub effect: CpaExternalEffect,
+}
+
+impl CpaRuntimeFailure {
+    fn compensated(error: CpaRuntimeError) -> Self {
+        Self {
+            error,
+            effect: CpaExternalEffect::Compensated,
+        }
+    }
+
+    fn partial(error: CpaRuntimeError) -> Self {
+        Self {
+            error,
+            effect: CpaExternalEffect::Partial,
+        }
+    }
+
+    /// A later restore succeeded. An earlier partial restore stays partial.
+    fn after_successful_restore(self) -> Self {
+        if self.effect == CpaExternalEffect::None {
+            Self::compensated(self.error)
+        } else {
+            self
+        }
+    }
+
+    /// Fold one observed restore. Failure forces `Partial` and keeps `error`.
+    fn observe_restore(self, restore: Result<(), CpaRuntimeError>) -> Self {
+        match restore {
+            Ok(()) => self.after_successful_restore(),
+            Err(_) => Self {
+                error: self.error,
+                effect: CpaExternalEffect::Partial,
+            },
+        }
+    }
+
+    /// A file restore counts only when this operation wrote that file.
+    /// Restoring an unchanged file must not invent an effect.
+    fn observe_written_restore(self, written: bool, restore: Result<(), CpaRuntimeError>) -> Self {
+        if written {
+            self.observe_restore(restore)
+        } else {
+            self
+        }
+    }
+}
+
+impl std::fmt::Display for CpaRuntimeFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error.fmt(formatter)
+    }
+}
+
+impl std::error::Error for CpaRuntimeFailure {}
+
+impl From<CpaRuntimeError> for CpaRuntimeFailure {
+    fn from(error: CpaRuntimeError) -> Self {
+        Self {
+            error,
+            effect: CpaExternalEffect::None,
+        }
+    }
+}
+
 impl From<CpaError> for CpaRuntimeError {
     fn from(error: CpaError) -> Self {
         match error {
@@ -160,6 +248,10 @@ pub enum CpaRuntimePhase {
     Failed,
 }
 
+fn desired_running_is_false(value: &bool) -> bool {
+    !*value
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ManagedCpa {
@@ -168,6 +260,22 @@ pub struct ManagedCpa {
     pub previous_version: Option<String>,
     pub asset_sha256: String,
     pub port: u16,
+    /// Last explicit Start/Stop intent. Absent or false in older manifests.
+    #[serde(default, skip_serializing_if = "desired_running_is_false")]
+    pub desired_running: bool,
+}
+
+fn inherited_desired_running(previous: Option<&ManagedCpa>) -> bool {
+    previous.map(|item| item.desired_running).unwrap_or(true)
+}
+
+/// Run intent recorded after an install or update.
+///
+/// A manifest written before `desiredRunning` existed deserializes as `false`,
+/// so inheritance alone would mark a process the user currently has running as
+/// stopped. `was_running` carries that live state across the upgrade.
+fn committed_desired_running(previous: Option<&ManagedCpa>, was_running: bool) -> bool {
+    was_running || inherited_desired_running(previous)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -176,6 +284,7 @@ pub struct CpaRuntimeSnapshot {
     pub unavailable_reason: Option<String>,
     pub installed: bool,
     pub running: bool,
+    pub desired_running: bool,
     pub owned: bool,
     pub current_version: Option<String>,
     pub previous_version: Option<String>,
@@ -259,6 +368,19 @@ pub struct CpaRuntimeCapabilities {
     host: OnceLock<CpaRuntimeHost>,
     status: Mutex<RuntimeStatus>,
     device: Mutex<Option<Arc<device::DeviceSession>>>,
+    shutting_down: AtomicBool,
+    restore_scheduled: AtomicBool,
+    /// Serializes terminal shutdown (mark + owned stop) with `host.start_owned`
+    /// and with manual Start commits (launched and already-running). Never held
+    /// across awaits. Acquired before `settings_update` when both are needed;
+    /// status may follow only to refuse publishing Idle after terminal shutdown.
+    owned_process: Mutex<()>,
+    #[cfg(test)]
+    before_owned_spawn: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    #[cfg(test)]
+    before_manual_start_commit: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    #[cfg(test)]
+    test_release: Mutex<Option<TestManagedRelease>>,
 }
 
 struct RuntimeStatus {
@@ -281,6 +403,15 @@ impl CpaRuntimeCapabilities {
                 current_operation: None,
                 failure_logs: None,
             }),
+            shutting_down: AtomicBool::new(false),
+            restore_scheduled: AtomicBool::new(false),
+            owned_process: Mutex::new(()),
+            #[cfg(test)]
+            before_owned_spawn: Mutex::new(None),
+            #[cfg(test)]
+            before_manual_start_commit: Mutex::new(None),
+            #[cfg(test)]
+            test_release: Mutex::new(None),
         }
     }
 
@@ -352,6 +483,47 @@ impl CpaRuntimeCapabilities {
             status.current_operation.clone(),
         )
     }
+
+    #[cfg(test)]
+    fn pause_before_owned_spawn(&self) {
+        let pause = self.before_owned_spawn.lock().clone();
+        if let Some(pause) = pause {
+            pause();
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_before_owned_spawn_pause(&self, pause: impl Fn() + Send + Sync + 'static) {
+        *self.before_owned_spawn.lock() = Some(Arc::new(pause));
+    }
+
+    #[cfg(test)]
+    fn pause_before_manual_start_commit(&self) {
+        let pause = self.before_manual_start_commit.lock().clone();
+        if let Some(pause) = pause {
+            pause();
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_before_manual_start_commit_pause(
+        &self,
+        pause: impl Fn() + Send + Sync + 'static,
+    ) {
+        *self.before_manual_start_commit.lock() = Some(Arc::new(pause));
+    }
+
+    #[cfg(test)]
+    fn set_test_release(&self, release: TestManagedRelease) {
+        *self.test_release.lock() = Some(release);
+    }
+}
+
+#[cfg(test)]
+struct TestManagedRelease {
+    version: String,
+    archive: Vec<u8>,
+    kind: extract::CpaArchiveKind,
 }
 
 struct RuntimeOperationGuard<'a>(&'a CpaRuntimeCapabilities);
@@ -493,7 +665,118 @@ fn version_dir(data_dir: &Path, version: &str) -> Result<PathBuf, CpaRuntimeErro
     Ok(versions.join(normalized))
 }
 
+#[cfg(test)]
+static FAIL_MANAGED_SAVES: std::sync::LazyLock<Mutex<HashSet<PathBuf>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashSet::new()));
+
+#[cfg(test)]
+struct FailNextManagedSave {
+    data_dir: PathBuf,
+}
+
+#[cfg(test)]
+impl FailNextManagedSave {
+    fn arm(data_dir: &Path) -> Self {
+        let data_dir = data_dir.to_path_buf();
+        FAIL_MANAGED_SAVES.lock().insert(data_dir.clone());
+        Self { data_dir }
+    }
+}
+
+#[cfg(test)]
+impl Drop for FailNextManagedSave {
+    fn drop(&mut self) {
+        FAIL_MANAGED_SAVES.lock().remove(&self.data_dir);
+    }
+}
+
+#[cfg(test)]
+static FAIL_PERSISTENCE_CAPTURES: std::sync::LazyLock<Mutex<HashSet<PathBuf>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashSet::new()));
+
+#[cfg(test)]
+pub(crate) struct FailNextPersistenceCapture {
+    data_dir: PathBuf,
+}
+
+#[cfg(test)]
+impl FailNextPersistenceCapture {
+    pub(crate) fn arm(data_dir: &Path) -> Self {
+        let data_dir = data_dir.to_path_buf();
+        FAIL_PERSISTENCE_CAPTURES.lock().insert(data_dir.clone());
+        Self { data_dir }
+    }
+}
+
+#[cfg(test)]
+impl Drop for FailNextPersistenceCapture {
+    fn drop(&mut self) {
+        FAIL_PERSISTENCE_CAPTURES.lock().remove(&self.data_dir);
+    }
+}
+
+#[cfg(test)]
+struct AtomicWriteFault {
+    skip: usize,
+    fail: usize,
+}
+
+#[cfg(test)]
+static FAIL_ATOMIC_WRITES: std::sync::LazyLock<Mutex<HashMap<PathBuf, AtomicWriteFault>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+#[cfg(test)]
+pub(crate) struct FailAtomicWrites {
+    path: PathBuf,
+}
+
+#[cfg(test)]
+impl FailAtomicWrites {
+    pub(crate) fn arm(path: &Path, skip: usize, fail: usize) -> Self {
+        FAIL_ATOMIC_WRITES
+            .lock()
+            .insert(path.to_path_buf(), AtomicWriteFault { skip, fail });
+        Self {
+            path: path.to_path_buf(),
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for FailAtomicWrites {
+    fn drop(&mut self) {
+        FAIL_ATOMIC_WRITES.lock().remove(&self.path);
+    }
+}
+
+#[cfg(test)]
+fn take_atomic_write_fault(path: &Path) -> bool {
+    let mut faults = FAIL_ATOMIC_WRITES.lock();
+    let remove = {
+        let Some(fault) = faults.get_mut(path) else {
+            return false;
+        };
+        if fault.skip > 0 {
+            fault.skip -= 1;
+            return false;
+        }
+        if fault.fail == 0 {
+            return false;
+        }
+        fault.fail -= 1;
+        fault.skip == 0 && fault.fail == 0
+    };
+    if remove {
+        faults.remove(path);
+    }
+    true
+}
+
 pub fn save_managed(data_dir: &Path, managed: &ManagedCpa) -> Result<(), CpaRuntimeError> {
+    #[cfg(test)]
+    if FAIL_MANAGED_SAVES.lock().remove(data_dir) {
+        return Err(CpaRuntimeError::Failed("managed.json write failed".into()));
+    }
     let encoded = serde_json::to_vec_pretty(managed).map_err(|error| {
         CpaRuntimeError::Failed(format!("failed to encode CPA managed.json: {error}"))
     })?;
@@ -592,6 +875,7 @@ impl CoreStateInner {
             unavailable_reason,
             installed: managed.is_some(),
             running,
+            desired_running: managed.as_ref().is_some_and(|item| item.desired_running),
             owned: managed.is_some(),
             current_version: managed.as_ref().map(|item| item.current_version.clone()),
             previous_version: managed
@@ -626,10 +910,131 @@ impl CoreStateInner {
         Ok(host.logs())
     }
 
+    /// Re-assert the persisted outbound proxy policy on a managed CPA install:
+    /// rewrites config.yaml when the rendered content drifted and restarts an
+    /// OCG-owned running process so the new `requests.proxy-url` takes effect.
+    /// No-op without a process host, without a managed install, or when the
+    /// rendered config already matches.
+    pub async fn sync_cpa_proxy_settings(&self) -> Result<(), CpaRuntimeError> {
+        if self.cpa_runtime.host.get().is_none() {
+            return Ok(());
+        }
+        if load_managed(&self.data_dir)?.is_none() {
+            return Ok(());
+        }
+        let _operation = self.cpa_operations.lock().await;
+        self.sync_cpa_proxy_settings_locked().await
+    }
+
+    /// `cpa_operations` must already be held. Shared by the settings hook and
+    /// startup restore, which serializes on that same lock.
+    async fn sync_cpa_proxy_settings_locked(&self) -> Result<(), CpaRuntimeError> {
+        let managed = require_managed(&self.data_dir)?;
+        let requests_proxy_url = cpa_requests_proxy_url(&self.config()).map(str::to_owned);
+        let config_path = runtime_dir(&self.data_dir).join(CONFIG_NAME);
+        let secrets = self.load_saved_secrets()?;
+        let current = fs::read(&config_path).map_err(fs_error)?;
+        let extra_keys = config_extras(&current, &secrets.inference_key)?;
+        let auth_dir = runtime_dir(&self.data_dir).join("auth");
+        let desired = render_config_yaml(
+            managed.port,
+            &auth_dir,
+            &secrets.inference_key,
+            &extra_keys,
+            requests_proxy_url.as_deref(),
+        )?;
+        if current == desired.as_bytes() {
+            return Ok(());
+        }
+        atomic_write(&config_path, desired.as_bytes())?;
+        let previous_config_path = runtime_dir(&self.data_dir).join(PREVIOUS_CONFIG_NAME);
+        if previous_config_path.exists() {
+            atomic_write(&previous_config_path, desired.as_bytes())?;
+        }
+        let host = self.cpa_runtime.host()?.clone();
+        if !host.owned_running() {
+            return Ok(());
+        }
+        let _runtime_operation = self.cpa_runtime.begin_lifecycle_operation("restart");
+        self.stop_owned_serialized(&host)?;
+        self.launch_owned_managed_process(&managed)
+            .await
+            .map_err(|failure| failure.error)
+    }
+
     pub fn stop_owned_cpa_runtime(&self) {
         self.cpa_runtime.cancel_device_login();
+        let _owned = self.cpa_runtime.owned_process.lock();
+        self.cpa_runtime.shutting_down.store(true, Ordering::SeqCst);
         if let Some(host) = self.cpa_runtime.host.get() {
             let _ = host.stop_owned();
+        }
+    }
+
+    /// Once-per-CoreState owned CPA restore. Hosts spawn this on their existing
+    /// Tokio or Tauri runtime after the gateway listener starts successfully.
+    pub async fn restore_owned_cpa_runtime_on_startup(&self) {
+        if self
+            .cpa_runtime
+            .restore_scheduled
+            .swap(true, Ordering::SeqCst)
+        {
+            return;
+        }
+        let _operation = self.cpa_operations.lock().await;
+        if self.cpa_runtime.shutting_down.load(Ordering::SeqCst) {
+            return;
+        }
+        if std::env::var_os(crate::cpa::CPA_BASE_URL_ENV).is_some() {
+            return;
+        }
+        if !self.cpa_runtime.supported() {
+            return;
+        }
+        let managed = match load_managed(&self.data_dir) {
+            Ok(Some(managed)) if managed.desired_running => managed,
+            _ => return,
+        };
+        // Reconcile config.yaml with the persisted outbound proxy policy
+        // before launch; a drifted file must not keep the restored process on
+        // a stale requests.proxy-url. Sync failure is not fatal to the
+        // restore: the existing config still launches.
+        if let Err(error) = self.sync_cpa_proxy_settings_locked().await {
+            self.log_runtime_event(
+                "error",
+                "cpa",
+                &format!("event=cpa_proxy_sync_failed context=startup reason={error}"),
+            );
+        }
+        if self
+            .cpa_runtime
+            .host
+            .get()
+            .is_some_and(|host| host.owned_running())
+        {
+            return;
+        }
+        let _runtime_operation = self.cpa_runtime.begin_lifecycle_operation("start");
+        let host = match self.cpa_runtime.host() {
+            Ok(host) => host.clone(),
+            Err(_) => return,
+        };
+        match self.launch_owned_managed_process(&managed).await {
+            Ok(()) => {
+                let _owned = self.cpa_runtime.owned_process.lock();
+                if self.cpa_runtime.shutting_down.load(Ordering::SeqCst) {
+                    let _ = host.stop_owned();
+                    return;
+                }
+                self.cpa_runtime.set_phase(CpaRuntimePhase::Idle, None);
+            }
+            Err(_) if self.cpa_runtime.shutting_down.load(Ordering::SeqCst) => {
+                let _owned = self.cpa_runtime.owned_process.lock();
+                let _ = host.stop_owned();
+            }
+            Err(error) => self
+                .cpa_runtime
+                .set_phase(CpaRuntimePhase::Failed, Some(error.to_string())),
         }
     }
 
@@ -677,7 +1082,7 @@ impl CoreStateInner {
         expected_revision: u64,
         expected_generation: u64,
         expected_version: Option<&str>,
-    ) -> Result<CpaRuntimeSnapshot, CpaRuntimeError> {
+    ) -> Result<CpaRuntimeSnapshot, CpaRuntimeFailure> {
         self.install_or_update_cpa_runtime(
             InstallMode::Fresh,
             expected_revision,
@@ -693,13 +1098,14 @@ impl CoreStateInner {
         expected_revision: u64,
         expected_generation: u64,
         expected_version: Option<&str>,
-    ) -> Result<CpaRuntimeSnapshot, CpaRuntimeError> {
+    ) -> Result<CpaRuntimeSnapshot, CpaRuntimeFailure> {
         self.require_supported()?;
         if std::env::var_os(crate::cpa::CPA_BASE_URL_ENV).is_some() {
             return Err(CpaRuntimeError::Conflict(
                 "OCG_CPA_BASE_URL selects an external CPA; unset it before managing a runtime"
                     .into(),
-            ));
+            )
+            .into());
         }
         self.ensure_cas(expected_revision, expected_generation)?;
         let previous = match mode {
@@ -708,7 +1114,8 @@ impl CoreStateInner {
                 if self.cpa_runtime.host()?.owned_running() {
                     return Err(CpaRuntimeError::Conflict(
                         "an OCG-owned CPA process is running without a valid owner manifest".into(),
-                    ));
+                    )
+                    .into());
                 }
                 None
             }
@@ -735,7 +1142,7 @@ impl CoreStateInner {
                 )
                 .await
             }
-            Err(error) => Err(error),
+            Err(error) => Err(error.into()),
         };
         match &outcome {
             Ok(_) => self.cpa_runtime.set_phase(CpaRuntimePhase::Idle, None),
@@ -754,15 +1161,16 @@ impl CoreStateInner {
         expected_generation: u64,
         expected_version: Option<&str>,
         secrets: ManagedSecrets,
-    ) -> Result<CpaRuntimeSnapshot, CpaRuntimeError> {
-        let release = self.fetch_latest_release().await?;
+    ) -> Result<CpaRuntimeSnapshot, CpaRuntimeFailure> {
+        let (release, archive, sha256) = self.resolve_release_archive().await?;
         self.cpa_runtime.set_latest_version(release.version.clone());
         if let Some(expected) = expected_version {
             let expected = normalize_release_version(expected)?;
             if expected != release.version {
                 return Err(CpaRuntimeError::Invalid(
                     "CPA expectedVersion does not match the latest official release".into(),
-                ));
+                )
+                .into());
             }
         }
         if previous
@@ -772,9 +1180,9 @@ impl CoreStateInner {
             return Err(CpaRuntimeError::Invalid(format!(
                 "CPA {} is already installed",
                 release.version
-            )));
+            ))
+            .into());
         }
-        let (archive, sha256) = self.download_verified_asset(&release).await?;
         self.ensure_cas(expected_revision, expected_generation)?;
         self.cpa_runtime
             .set_phase(CpaRuntimePhase::Installing, None);
@@ -789,10 +1197,11 @@ impl CoreStateInner {
             Ok(_) => {
                 return Err(CpaRuntimeError::Conflict(
                     "the target CPA version directory already exists".into(),
-                ));
+                )
+                .into());
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(fs_error(error)),
+            Err(error) => return Err(fs_error(error).into()),
         }
         let token = format!("{}-{}", release.version, uuid::Uuid::new_v4().simple());
         let staging = root.join("versions").join(format!(".staging-{token}"));
@@ -810,7 +1219,7 @@ impl CoreStateInner {
         let _ = fs::remove_file(&archive_path);
         if let Err(error) = prepared {
             let _ = remove_known_path(&staging);
-            return Err(error);
+            return Err(error.into());
         }
         let mut candidate_guard = CandidateDirGuard::new(candidate_dir.clone());
 
@@ -821,10 +1230,11 @@ impl CoreStateInner {
                 Ok(_) => {
                     return Err(CpaRuntimeError::Conflict(
                         "a CPA config already exists without a managed owner manifest".into(),
-                    ));
+                    )
+                    .into());
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-                Err(error) => return Err(fs_error(error)),
+                Err(error) => return Err(fs_error(error).into()),
             },
             InstallMode::Update => Some(fs::read(&config_path).map_err(fs_error)?),
         };
@@ -856,12 +1266,14 @@ impl CoreStateInner {
             &root.join("auth"),
             &inference_key,
             &extra_keys,
+            cpa_requests_proxy_url(&self.config()),
         )?;
 
         let host = self.cpa_runtime.host()?.clone();
         let was_running = host.owned_running();
-        if was_running {
-            host.stop_owned()?;
+        if was_running && let Err(error) = host.stop_owned() {
+            // config.yaml is already replaced. A Drop retry is not an observed restore.
+            return Err(CpaRuntimeFailure::partial(error));
         }
         if tcp_open(port) {
             let error = CpaRuntimeError::Conflict(format!(
@@ -926,8 +1338,12 @@ impl CoreStateInner {
             return Err(with_compensation_error(error, compensation));
         }
 
-        if mode == InstallMode::Update && !was_running {
-            host.stop_owned()?;
+        if mode == InstallMode::Update
+            && !was_running
+            && let Err(error) = host.stop_owned()
+        {
+            // The candidate is already launched. Do not start a second recovery.
+            return Err(CpaRuntimeFailure::partial(error));
         }
 
         let previous_version = previous.as_ref().and_then(|item| {
@@ -938,6 +1354,7 @@ impl CoreStateInner {
             previous_version,
             asset_sha256: sha256,
             port,
+            desired_running: committed_desired_running(previous.as_ref(), was_running),
         };
         let committed = {
             let _settings = self.settings_update.lock();
@@ -974,11 +1391,13 @@ impl CoreStateInner {
                 .and(previous_config_restore)
                 .and(runtime_restore)
             {
-                return Err(CpaRuntimeError::Failed(format!(
-                    "{error}; restoring the previous CPA state also failed: {compensation}"
+                return Err(CpaRuntimeFailure::partial(CpaRuntimeError::Failed(
+                    format!(
+                        "{error}; restoring the previous CPA state also failed: {compensation}"
+                    ),
                 )));
             }
-            return Err(error);
+            return Err(CpaRuntimeFailure::compensated(error));
         }
         candidate_guard.keep();
         config_guard.keep();
@@ -990,71 +1409,39 @@ impl CoreStateInner {
         &self,
         expected_revision: u64,
         expected_generation: u64,
-    ) -> Result<CpaRuntimeSnapshot, CpaRuntimeError> {
+    ) -> Result<CpaRuntimeSnapshot, CpaRuntimeFailure> {
         self.require_supported()?;
         if std::env::var_os(crate::cpa::CPA_BASE_URL_ENV).is_some() {
             return Err(CpaRuntimeError::Conflict(
                 "OCG_CPA_BASE_URL selects an external CPA; unset it before starting the managed runtime"
                     .into(),
-            ));
+            )
+            .into());
         }
         self.ensure_cas(expected_revision, expected_generation)?;
         let managed = require_managed(&self.data_dir)?;
         let _runtime_operation = self.cpa_runtime.begin_lifecycle_operation("start");
         let host = self.cpa_runtime.host()?.clone();
         if host.owned_running() {
-            return Ok(self.cpa_runtime_snapshot());
+            return self
+                .commit_desired_running(expected_revision, expected_generation, true)
+                .map_err(Into::into);
         }
-        if tcp_open(managed.port) {
-            return Err(CpaRuntimeError::Conflict(format!(
-                "loopback port {} is already in use; OCG will not stop an external CPA",
-                managed.port
-            )));
-        }
-        self.cpa_runtime.set_phase(CpaRuntimePhase::Starting, None);
-        let config_path = runtime_dir(&self.data_dir).join(CONFIG_NAME);
-        let secrets = match self.load_saved_secrets() {
-            Ok(secrets) => secrets,
-            Err(error) => {
-                self.cpa_runtime
-                    .set_phase(CpaRuntimePhase::Failed, Some(error.to_string()));
-                return Err(error);
-            }
-        };
-        let started = self.start_version(
-            &host,
-            &managed.current_version,
-            &config_path,
-            &secrets.management_key,
-        );
-        if let Err(error) = started {
-            self.cpa_runtime
-                .set_phase(CpaRuntimePhase::Failed, Some(error.to_string()));
-            return Err(error);
-        }
-        let probe = self
-            .probe_candidate(
-                managed.port,
-                &secrets.management_key,
-                &secrets.inference_key,
-            )
-            .await;
-        match probe {
-            Ok(_) => {
-                if let Err(error) = self.ensure_cas(expected_revision, expected_generation) {
-                    let _ = host.stop_owned();
-                    self.cpa_runtime.set_phase(CpaRuntimePhase::Idle, None);
-                    return Err(error);
+        match self.launch_owned_managed_process(&managed).await {
+            Ok(()) => self.commit_launched_start(&host, expected_revision, expected_generation),
+            Err(failure) => {
+                if self.cpa_runtime.shutting_down.load(Ordering::SeqCst) {
+                    let still_running = host.owned_running();
+                    let stop = self.stop_owned_serialized(&host);
+                    return Err(if still_running {
+                        failure.observe_restore(stop)
+                    } else {
+                        failure
+                    });
                 }
-                self.bump_settings_revision();
-                self.cpa_runtime.set_phase(CpaRuntimePhase::Idle, None);
-                Ok(self.cpa_runtime_snapshot())
-            }
-            Err(error) => {
-                let _ = host.stop_owned();
                 self.cpa_runtime
-                    .set_phase(CpaRuntimePhase::Failed, Some(error.to_string()));
-                Err(error)
+                    .set_phase(CpaRuntimePhase::Failed, Some(failure.to_string()));
+                Err(failure)
             }
         }
     }
@@ -1063,19 +1450,38 @@ impl CoreStateInner {
         &self,
         expected_revision: u64,
         expected_generation: u64,
-    ) -> Result<CpaRuntimeSnapshot, CpaRuntimeError> {
+    ) -> Result<CpaRuntimeSnapshot, CpaRuntimeFailure> {
         self.require_supported()?;
-        self.ensure_cas(expected_revision, expected_generation)?;
-        let _ = require_managed(&self.data_dir)?;
+        let host = self.cpa_runtime.host()?.clone();
+        let _owned = self.cpa_runtime.owned_process.lock();
+        let changed = {
+            let _settings = self.settings_update.lock();
+            self.ensure_cas(expected_revision, expected_generation)?;
+            let managed = require_managed(&self.data_dir)?;
+            let running = host.owned_running();
+            if !running && !managed.desired_running {
+                return Err(
+                    CpaRuntimeError::Invalid("no OCG-owned CPA process is running".into()).into(),
+                );
+            }
+            let changed = self.persist_desired_running(false)?;
+            if changed || running {
+                self.bump_settings_revision();
+            }
+            changed
+        };
         let _runtime_operation = self.cpa_runtime.begin_lifecycle_operation("stop");
-        let host = self.cpa_runtime.host()?;
-        if !host.owned_running() {
-            return Err(CpaRuntimeError::Invalid(
-                "no OCG-owned CPA process is running".into(),
-            ));
+        if host.owned_running()
+            && let Err(error) = host.stop_owned()
+        {
+            self.cpa_runtime
+                .set_phase(CpaRuntimePhase::Failed, Some(error.to_string()));
+            return Err(if changed {
+                CpaRuntimeFailure::partial(error)
+            } else {
+                error.into()
+            });
         }
-        host.stop_owned()?;
-        self.bump_settings_revision();
         self.cpa_runtime.set_phase(CpaRuntimePhase::Idle, None);
         Ok(self.cpa_runtime_snapshot())
     }
@@ -1084,13 +1490,14 @@ impl CoreStateInner {
         &self,
         expected_revision: u64,
         expected_generation: u64,
-    ) -> Result<CpaRuntimeSnapshot, CpaRuntimeError> {
+    ) -> Result<CpaRuntimeSnapshot, CpaRuntimeFailure> {
         self.require_supported()?;
         if std::env::var_os(crate::cpa::CPA_BASE_URL_ENV).is_some() {
             return Err(CpaRuntimeError::Conflict(
                 "OCG_CPA_BASE_URL selects an external CPA; unset it before rolling back the managed runtime"
                     .into(),
-            ));
+            )
+            .into());
         }
         self.ensure_cas(expected_revision, expected_generation)?;
         let managed = require_managed(&self.data_dir)?;
@@ -1112,7 +1519,7 @@ impl CoreStateInner {
         managed: ManagedCpa,
         expected_revision: u64,
         expected_generation: u64,
-    ) -> Result<CpaRuntimeSnapshot, CpaRuntimeError> {
+    ) -> Result<CpaRuntimeSnapshot, CpaRuntimeFailure> {
         let previous_version = managed.previous_version.clone().ok_or_else(|| {
             CpaRuntimeError::Invalid("no previous CPA version is available to roll back".into())
         })?;
@@ -1134,8 +1541,6 @@ impl CoreStateInner {
         if was_running {
             host.stop_owned()?;
         }
-        atomic_write(&config_path, &previous_config_bytes)?;
-        self.cpa_runtime.set_phase(CpaRuntimePhase::Starting, None);
         let restore = RollbackRestore {
             host: &host,
             managed: &managed,
@@ -1145,13 +1550,20 @@ impl CoreStateInner {
             management_key: &secrets.management_key,
             inference_key: &secrets.inference_key,
         };
+        if let Err(error) = atomic_write(&config_path, &previous_config_bytes) {
+            if was_running {
+                return self.rollback_failed(error.into(), restore).await;
+            }
+            return Err(error.into());
+        }
+        self.cpa_runtime.set_phase(CpaRuntimePhase::Starting, None);
         if let Err(error) = self.start_version(
             &host,
             &previous_version,
             &config_path,
             &secrets.management_key,
         ) {
-            return self.rollback_failed(error, restore).await;
+            return self.rollback_failed(error.into(), restore).await;
         }
         let models = match self
             .probe_candidate(
@@ -1163,50 +1575,77 @@ impl CoreStateInner {
         {
             Ok(models) => models,
             Err(error) => {
-                return self.rollback_failed(error, restore).await;
+                return self.rollback_failed(error.into(), restore).await;
             }
         };
         if let Err(error) = self.ensure_cas(expected_revision, expected_generation) {
-            return self.rollback_failed(error, restore).await;
+            return self.rollback_failed(error.into(), restore).await;
         }
         if !was_running && let Err(error) = host.stop_owned() {
-            return self.rollback_failed(error, restore).await;
+            return self.rollback_failed(error.into(), restore).await;
         }
         if let Err(error) = atomic_write(&previous_config, &current_config_bytes) {
-            return self.rollback_failed(error, restore).await;
+            return self.rollback_failed(error.into(), restore).await;
         }
         let next_managed = ManagedCpa {
             current_version: previous_version,
             previous_version: Some(managed.current_version.clone()),
             asset_sha256: previous_sha,
             port: managed.port,
+            desired_running: managed.desired_running,
         };
-        let mut persistence_before = Some(self.capture_persistence_backup()?);
+        let persistence_before = match self.capture_persistence_backup() {
+            Ok(backup) => backup,
+            Err(error) => {
+                let previous_restore =
+                    restore_optional_file(&previous_config, Some(&previous_config_bytes));
+                return match self.rollback_failed(error.into(), restore).await {
+                    Err(failure) => Err(failure.observe_restore(previous_restore)),
+                    Ok(snapshot) => Ok(snapshot),
+                };
+            }
+        };
+        let mut persistence_before = Some(persistence_before);
         let committed = {
             let _settings = self.settings_update.lock();
-            self.ensure_cas(expected_revision, expected_generation)
-                .and_then(|_| {
-                    self.activate_cpa_model_catalog(
-                        models,
-                        &format!("http://127.0.0.1:{}", managed.port),
-                        Utc::now(),
-                    )
-                    .map_err(|error| CpaRuntimeError::Failed(error.to_string()))?;
-                    if let Err(error) = save_managed(&self.data_dir, &next_managed) {
-                        let restore = self.restore_persistence_backup(
-                            persistence_before
-                                .take()
-                                .expect("rollback persistence backup must be available"),
-                        );
-                        return Err(with_compensation_error(error, restore));
-                    }
-                    self.bump_settings_revision();
-                    Ok(())
-                })
+            (|| -> Result<(), CpaRuntimeFailure> {
+                self.ensure_cas(expected_revision, expected_generation)?;
+                if let Err(error) = self.activate_cpa_model_catalog(
+                    models,
+                    &format!("http://127.0.0.1:{}", managed.port),
+                    Utc::now(),
+                ) {
+                    // Catalog persistence precedes fallible publication. Runtime
+                    // and YAML restoration alone cannot compensate this write.
+                    let restore = self.restore_persistence_backup(
+                        persistence_before
+                            .take()
+                            .expect("rollback persistence backup must be available"),
+                    );
+                    return Err(with_compensation_error(
+                        CpaRuntimeError::Failed(error.to_string()),
+                        restore,
+                    ));
+                }
+                if let Err(error) = save_managed(&self.data_dir, &next_managed) {
+                    let restore = self.restore_persistence_backup(
+                        persistence_before
+                            .take()
+                            .expect("rollback persistence backup must be available"),
+                    );
+                    return Err(with_compensation_error(error, restore));
+                }
+                self.bump_settings_revision();
+                Ok(())
+            })()
         };
         if let Err(error) = committed {
-            let _ = restore_optional_file(&previous_config, Some(&previous_config_bytes));
-            return self.rollback_failed(error, restore).await;
+            let previous_restore =
+                restore_optional_file(&previous_config, Some(&previous_config_bytes));
+            return match self.rollback_failed(error, restore).await {
+                Err(failure) => Err(failure.observe_restore(previous_restore)),
+                Ok(snapshot) => Ok(snapshot),
+            };
         }
         Ok(self.cpa_runtime_snapshot())
     }
@@ -1216,7 +1655,7 @@ impl CoreStateInner {
         expected_revision: u64,
         expected_generation: u64,
         expected_version: Option<&str>,
-    ) -> Result<CpaRuntimeSnapshot, CpaRuntimeError> {
+    ) -> Result<CpaRuntimeSnapshot, CpaRuntimeFailure> {
         self.install_or_update_cpa_runtime(
             InstallMode::Update,
             expected_revision,
@@ -1230,29 +1669,41 @@ impl CoreStateInner {
         &self,
         expected_revision: u64,
         expected_generation: u64,
-    ) -> Result<CpaRuntimeSnapshot, CpaRuntimeError> {
+    ) -> Result<CpaRuntimeSnapshot, CpaRuntimeFailure> {
         self.require_supported()?;
         self.ensure_cas(expected_revision, expected_generation)?;
         let managed = require_managed(&self.data_dir)?;
         let _ = managed;
         let _runtime_operation = self.cpa_runtime.begin_lifecycle_operation("remove");
         let host = self.cpa_runtime.host()?.clone();
+        let mut files_or_process = false;
         if host.owned_running() {
             host.stop_owned()?;
+            files_or_process = true;
         }
         let root = runtime_dir(&self.data_dir);
-        let mut persistence_before = Some(self.capture_persistence_backup()?);
+        let mut persistence_before = Some(
+            self.capture_persistence_backup()
+                .map_err(|error| effect_after_own_steps(error, files_or_process))?,
+        );
         {
             let _settings = self.settings_update.lock();
-            self.ensure_cas(expected_revision, expected_generation)?;
+            self.ensure_cas(expected_revision, expected_generation)
+                .map_err(|error| effect_after_own_steps(error, files_or_process))?;
             // Keep the owner marker until every canonical owned artifact is gone
             // and the database has disconnected. A failed earlier removal is
             // therefore safe to retry as an owned removal.
-            remove_known_path(&root.join(CONFIG_NAME))?;
-            remove_known_path(&root.join(PREVIOUS_CONFIG_NAME))?;
-            remove_known_path(&root.join("logs"))?;
-            remove_known_path(&root.join("versions"))?;
-            remove_known_path(&root.join("auth"))?;
+            for name in [
+                CONFIG_NAME,
+                PREVIOUS_CONFIG_NAME,
+                "logs",
+                "versions",
+                "auth",
+            ] {
+                let path = root.join(name);
+                remove_known_path_recorded(&path, &mut files_or_process)
+                    .map_err(|error| effect_after_own_steps(error, files_or_process))?;
+            }
             if let Err(error) = self
                 .disconnect_cpa_integration()
                 .map_err(|error| CpaRuntimeError::Failed(error.to_string()))
@@ -1262,7 +1713,7 @@ impl CoreStateInner {
                         .take()
                         .expect("remove persistence backup must be available"),
                 );
-                return Err(with_compensation_error(error, restore));
+                return Err(removal_database_restore(error, restore, files_or_process));
             }
             if let Err(error) = remove_known_path(&root.join(MANAGED_NAME)) {
                 let restore = self.restore_persistence_backup(
@@ -1270,7 +1721,7 @@ impl CoreStateInner {
                         .take()
                         .expect("remove persistence backup must be available"),
                 );
-                return Err(with_compensation_error(error, restore));
+                return Err(removal_database_restore(error, restore, files_or_process));
             }
             self.bump_settings_revision();
         }
@@ -1306,7 +1757,7 @@ impl CoreStateInner {
         &self,
         expected_revision: u64,
         expected_generation: u64,
-    ) -> Result<CpaRuntimeKeyCreated, CpaRuntimeError> {
+    ) -> Result<CpaRuntimeKeyCreated, CpaRuntimeFailure> {
         self.require_supported()?;
         self.ensure_cas(expected_revision, expected_generation)?;
         let _runtime_operation = self.cpa_runtime.begin_operation("create-client-key");
@@ -1328,7 +1779,7 @@ impl CoreStateInner {
         expected_revision: u64,
         expected_generation: u64,
         fingerprint: &str,
-    ) -> Result<(), CpaRuntimeError> {
+    ) -> Result<(), CpaRuntimeFailure> {
         self.require_supported()?;
         self.ensure_cas(expected_revision, expected_generation)?;
         let _runtime_operation = self.cpa_runtime.begin_operation("delete-client-key");
@@ -1338,16 +1789,15 @@ impl CoreStateInner {
         if fingerprint == protected {
             return Err(CpaRuntimeError::Invalid(
                 "the OCG-protected CPA Inference Key cannot be deleted".into(),
-            ));
+            )
+            .into());
         }
         let original = self.managed_config_keys()?;
         if original
             .iter()
             .all(|secret| fingerprint_key(secret) != fingerprint)
         {
-            return Err(CpaRuntimeError::Invalid(
-                "CPA client key was not found".into(),
-            ));
+            return Err(CpaRuntimeError::Invalid("CPA client key was not found".into()).into());
         }
         let remaining: Vec<String> = original
             .into_iter()
@@ -1362,7 +1812,7 @@ impl CoreStateInner {
         expected_revision: u64,
         expected_generation: u64,
         fingerprint: &str,
-    ) -> Result<CpaRuntimeKeyCreated, CpaRuntimeError> {
+    ) -> Result<CpaRuntimeKeyCreated, CpaRuntimeFailure> {
         self.require_supported()?;
         self.ensure_cas(expected_revision, expected_generation)?;
         let _runtime_operation = self.cpa_runtime.begin_operation("rotate-client-key");
@@ -1409,6 +1859,144 @@ impl CoreStateInner {
         }
     }
 
+    fn persist_desired_running(&self, desired: bool) -> Result<bool, CpaRuntimeError> {
+        let mut managed = require_managed(&self.data_dir)?;
+        if managed.desired_running == desired {
+            return Ok(false);
+        }
+        managed.desired_running = desired;
+        save_managed(&self.data_dir, &managed)?;
+        Ok(true)
+    }
+
+    fn commit_desired_running(
+        &self,
+        expected_revision: u64,
+        expected_generation: u64,
+        desired: bool,
+    ) -> Result<CpaRuntimeSnapshot, CpaRuntimeError> {
+        let _owned = self.cpa_runtime.owned_process.lock();
+        if self.cpa_runtime.shutting_down.load(Ordering::SeqCst) {
+            return Err(Self::shutdown_abort_error());
+        }
+        {
+            let _settings = self.settings_update.lock();
+            self.ensure_cas(expected_revision, expected_generation)?;
+            if self.persist_desired_running(desired)? {
+                self.bump_settings_revision();
+            }
+        }
+        self.cpa_runtime.set_phase(CpaRuntimePhase::Idle, None);
+        Ok(self.cpa_runtime_snapshot())
+    }
+
+    fn commit_launched_start(
+        &self,
+        host: &CpaRuntimeHost,
+        expected_revision: u64,
+        expected_generation: u64,
+    ) -> Result<CpaRuntimeSnapshot, CpaRuntimeFailure> {
+        #[cfg(test)]
+        self.cpa_runtime.pause_before_manual_start_commit();
+        let _owned = self.cpa_runtime.owned_process.lock();
+        if self.cpa_runtime.shutting_down.load(Ordering::SeqCst) {
+            let stop = host.stop_owned();
+            return Err(CpaRuntimeFailure::from(Self::shutdown_abort_error()).observe_restore(stop));
+        }
+        let committed: Result<(), CpaRuntimeError> = (|| {
+            let _settings = self.settings_update.lock();
+            self.ensure_cas(expected_revision, expected_generation)?;
+            self.persist_desired_running(true)?;
+            self.bump_settings_revision();
+            Ok(())
+        })();
+        match committed {
+            Ok(()) => {
+                self.cpa_runtime.set_phase(CpaRuntimePhase::Idle, None);
+                Ok(self.cpa_runtime_snapshot())
+            }
+            Err(error) => {
+                let stop = host.stop_owned();
+                if matches!(error, CpaRuntimeError::Conflict(_)) {
+                    self.cpa_runtime.set_phase(CpaRuntimePhase::Idle, None);
+                } else {
+                    self.cpa_runtime
+                        .set_phase(CpaRuntimePhase::Failed, Some(error.to_string()));
+                }
+                Err(CpaRuntimeFailure::from(error).observe_restore(stop))
+            }
+        }
+    }
+
+    fn shutdown_abort_error() -> CpaRuntimeError {
+        CpaRuntimeError::Invalid(
+            "CPA runtime restore aborted because Open Console Gateway is shutting down".into(),
+        )
+    }
+
+    fn stop_owned_if_shutting_down(
+        &self,
+        host: &CpaRuntimeHost,
+    ) -> Option<Result<(), CpaRuntimeError>> {
+        let _owned = self.cpa_runtime.owned_process.lock();
+        if !self.cpa_runtime.shutting_down.load(Ordering::SeqCst) {
+            return None;
+        }
+        Some(host.stop_owned())
+    }
+
+    fn stop_owned_serialized(&self, host: &CpaRuntimeHost) -> Result<(), CpaRuntimeError> {
+        let _owned = self.cpa_runtime.owned_process.lock();
+        host.stop_owned()
+    }
+
+    async fn launch_owned_managed_process(
+        &self,
+        managed: &ManagedCpa,
+    ) -> Result<(), CpaRuntimeFailure> {
+        let host = self.cpa_runtime.host()?.clone();
+        if host.owned_running() {
+            return Ok(());
+        }
+        if self.cpa_runtime.shutting_down.load(Ordering::SeqCst) {
+            return Err(Self::shutdown_abort_error().into());
+        }
+        if tcp_open(managed.port) {
+            return Err(CpaRuntimeError::Conflict(format!(
+                "loopback port {} is already in use; OCG will not stop an external CPA",
+                managed.port
+            ))
+            .into());
+        }
+        self.cpa_runtime.set_phase(CpaRuntimePhase::Starting, None);
+        let config_path = runtime_dir(&self.data_dir).join(CONFIG_NAME);
+        let secrets = self.load_saved_secrets()?;
+        self.start_version(
+            &host,
+            &managed.current_version,
+            &config_path,
+            &secrets.management_key,
+        )?;
+        if let Some(stop) = self.stop_owned_if_shutting_down(&host) {
+            return Err(CpaRuntimeFailure::from(Self::shutdown_abort_error()).observe_restore(stop));
+        }
+        if let Err(error) = self
+            .probe_candidate(
+                managed.port,
+                &secrets.management_key,
+                &secrets.inference_key,
+            )
+            .await
+        {
+            let stop = self.stop_owned_serialized(&host);
+            return Err(CpaRuntimeFailure::from(error).observe_restore(stop));
+        }
+        if let Some(stop) = self.stop_owned_if_shutting_down(&host) {
+            return Err(CpaRuntimeFailure::from(Self::shutdown_abort_error()).observe_restore(stop));
+        }
+        Ok(())
+    }
+
     fn start_version(
         &self,
         host: &CpaRuntimeHost,
@@ -1427,14 +2015,21 @@ impl CoreStateInner {
             .chain(std::iter::once(management_password.to_string()))
             .map(CpaRuntimeSecret::new)
             .collect();
-        host.start_owned(&CpaRuntimeProcessSpec {
+        let spec = CpaRuntimeProcessSpec {
             codex_device_login: false,
             executable: executable.clone(),
             config_path: config_path.to_path_buf(),
             working_dir,
             management_password: CpaRuntimeSecret::new(management_password),
             log_secrets,
-        })?;
+        };
+        #[cfg(test)]
+        self.cpa_runtime.pause_before_owned_spawn();
+        let _owned = self.cpa_runtime.owned_process.lock();
+        if self.cpa_runtime.shutting_down.load(Ordering::SeqCst) {
+            return Err(Self::shutdown_abort_error());
+        }
+        host.start_owned(&spec)?;
         Ok(executable)
     }
 
@@ -1485,9 +2080,9 @@ impl CoreStateInner {
 
     async fn rollback_failed(
         &self,
-        original: CpaRuntimeError,
+        original: CpaRuntimeFailure,
         restore: RollbackRestore<'_>,
-    ) -> Result<CpaRuntimeSnapshot, CpaRuntimeError> {
+    ) -> Result<CpaRuntimeSnapshot, CpaRuntimeFailure> {
         let compensation = (|| {
             restore.host.stop_owned()?;
             self.cpa_runtime.cache_failure_logs(restore.host.logs());
@@ -1515,14 +2110,22 @@ impl CoreStateInner {
             other => other,
         };
         match compensation {
-            Ok(()) => Err(original),
-            Err(compensation) => Err(CpaRuntimeError::Failed(format!(
-                "{original}; restoring the previous CPA runtime also failed: {compensation}"
+            Ok(()) => Err(original.after_successful_restore()),
+            Err(compensation) => Err(CpaRuntimeFailure::partial(CpaRuntimeError::Failed(
+                format!(
+                    "{original}; restoring the previous CPA runtime also failed: {compensation}"
+                ),
             ))),
         }
     }
 
     fn capture_persistence_backup(&self) -> Result<CpaPersistenceBackup, CpaRuntimeError> {
+        #[cfg(test)]
+        if FAIL_PERSISTENCE_CAPTURES.lock().remove(&self.data_dir) {
+            return Err(CpaRuntimeError::Failed(
+                "CPA persistence backup failed".into(),
+            ));
+        }
         let db = self.db.lock();
         Ok(CpaPersistenceBackup {
             record: db
@@ -1545,6 +2148,16 @@ impl CoreStateInner {
             .map_err(|error| CpaRuntimeError::Failed(error.to_string()))?;
         match (backup.record, backup.account) {
             (Some(record), Some(account)) => {
+                // `delete_cpa_integration` removes the credential and leaves its
+                // usage-sync row. The account insert below owns that primary key.
+                self.db
+                    .lock()
+                    .conn
+                    .execute(
+                        "DELETE FROM provider_usage_sync_state WHERE account_id = ?1",
+                        [CPA_ACCOUNT_ID],
+                    )
+                    .map_err(|error| CpaRuntimeError::Failed(error.to_string()))?;
                 self.db
                     .lock()
                     .upsert_cpa_integration(
@@ -1560,6 +2173,15 @@ impl CoreStateInner {
                         catalog.refreshed_at.unwrap_or_else(Utc::now),
                     )
                     .map_err(|error| CpaRuntimeError::Failed(error.to_string()))?;
+                } else {
+                    // The restore resurrected the integration, destination,
+                    // and credential rows that `disconnect_cpa_integration`
+                    // just republished as deleted, and nothing else on this
+                    // compensation path advances the revision. Bump so the
+                    // next preparation read detects the drift and rebuilds
+                    // against the restored rows instead of serving the
+                    // deleted state indefinitely.
+                    self.bump_settings_revision();
                 }
                 self.routing.reset();
                 Ok(())
@@ -1679,7 +2301,7 @@ impl CoreStateInner {
         expected_generation: u64,
         next_keys: Vec<String>,
         new_protected: Option<String>,
-    ) -> Result<(), CpaRuntimeError> {
+    ) -> Result<(), CpaRuntimeFailure> {
         let managed = require_managed(&self.data_dir)?;
         let saved = self.load_saved_secrets()?;
         let protected = new_protected
@@ -1689,7 +2311,8 @@ impl CoreStateInner {
         if !next_keys.iter().any(|key| key == &protected) {
             return Err(CpaRuntimeError::Invalid(
                 "the protected OCG CPA key must remain present".into(),
-            ));
+            )
+            .into());
         }
         let config_path = runtime_dir(&self.data_dir).join(CONFIG_NAME);
         let config_before = fs::read(&config_path).map_err(fs_error)?;
@@ -1724,11 +2347,13 @@ impl CoreStateInner {
             if let Err(error) = self.ensure_cas(expected_revision, expected_generation) {
                 let compensation = client.replace_api_keys(&keys).await;
                 return match compensation {
-                    Ok(()) => Err(error),
+                    Ok(()) => Err(CpaRuntimeFailure::compensated(error)),
                     Err(compensation) => {
                         let compensation = redact_text(&compensation.to_string(), &known_secrets);
-                        Err(CpaRuntimeError::Failed(format!(
-                            "{error}; restoring CPA client keys also failed: {compensation}"
+                        Err(CpaRuntimeFailure::partial(CpaRuntimeError::Failed(
+                            format!(
+                                "{error}; restoring CPA client keys also failed: {compensation}"
+                            ),
                         )))
                     }
                 };
@@ -1743,71 +2368,93 @@ impl CoreStateInner {
             .filter(|key| *key != &protected)
             .cloned()
             .collect::<Vec<_>>();
+        let mut active_written = false;
+        let mut previous_written = false;
         let local_result = {
             let _settings = self.settings_update.lock();
-            self.ensure_cas(expected_revision, expected_generation)
-                .and_then(|_| {
-                    write_config_yaml(
-                        &config_path,
+            (|| -> Result<(), CpaRuntimeFailure> {
+                self.ensure_cas(expected_revision, expected_generation)?;
+                let requests_proxy_url = cpa_requests_proxy_url(&self.config()).map(str::to_owned);
+                write_config_yaml(
+                    &config_path,
+                    managed.port,
+                    &runtime_dir(&self.data_dir).join("auth"),
+                    &protected,
+                    &extras,
+                    requests_proxy_url.as_deref(),
+                )?;
+                active_written = true;
+                if previous_config_path.exists()
+                    && let Err(error) = write_config_yaml(
+                        &previous_config_path,
                         managed.port,
                         &runtime_dir(&self.data_dir).join("auth"),
                         &protected,
                         &extras,
-                    )?;
-                    if previous_config_path.exists()
-                        && let Err(error) = write_config_yaml(
-                            &previous_config_path,
-                            managed.port,
-                            &runtime_dir(&self.data_dir).join("auth"),
-                            &protected,
-                            &extras,
-                        )
-                    {
-                        let _ = atomic_write(&config_path, &config_before);
-                        return Err(error);
-                    }
-                    if let Some(new_protected) = new_protected.as_deref()
-                        && let Err(error) = self.persist_inference_key(new_protected)
-                    {
-                        let restore = atomic_write(&config_path, &config_before);
-                        let previous_restore = restore_optional_file(
-                            &previous_config_path,
-                            previous_config_before.as_deref(),
-                        );
-                        return match restore {
-                            Ok(()) if previous_restore.is_ok() => Err(error),
-                            Err(restore) => Err(CpaRuntimeError::Failed(format!(
-                                "{error}; restoring managed CPA config also failed: {restore}"
-                            ))),
-                            Ok(()) => Err(CpaRuntimeError::Failed(format!(
-                                "{error}; restoring previous CPA config also failed"
-                            ))),
-                        };
-                    }
-                    self.bump_settings_revision();
-                    Ok(())
-                })
+                        requests_proxy_url.as_deref(),
+                    )
+                {
+                    let restore = atomic_write(&config_path, &config_before);
+                    return Err(
+                        CpaRuntimeFailure::from(error).observe_written_restore(true, restore)
+                    );
+                }
+                if previous_config_path.exists() {
+                    previous_written = true;
+                }
+                if let Some(new_protected) = new_protected.as_deref()
+                    && let Err(error) = self.persist_inference_key(new_protected)
+                {
+                    let restore = atomic_write(&config_path, &config_before);
+                    let previous_restore = restore_optional_file(
+                        &previous_config_path,
+                        previous_config_before.as_deref(),
+                    );
+                    return match restore {
+                        Ok(()) if previous_restore.is_ok() => {
+                            Err(CpaRuntimeFailure::compensated(error))
+                        }
+                        Err(restore) => Err(CpaRuntimeFailure::partial(CpaRuntimeError::Failed(
+                            format!("{error}; restoring managed CPA config also failed: {restore}"),
+                        ))),
+                        Ok(()) => Err(CpaRuntimeFailure::partial(CpaRuntimeError::Failed(
+                            format!("{error}; restoring previous CPA config also failed"),
+                        ))),
+                    };
+                }
+                self.bump_settings_revision();
+                Ok(())
+            })()
         };
-        if let Err(error) = local_result {
-            let _ = atomic_write(&config_path, &config_before);
-            let _ = restore_optional_file(&previous_config_path, previous_config_before.as_deref());
-            if let Some(upstream_before) = upstream_before
-                && let Err(compensation) = client.replace_api_keys(&upstream_before).await
-            {
-                let mut secrets = next_keys.iter().map(String::as_str).collect::<Vec<_>>();
-                secrets.extend(upstream_before.iter().map(String::as_str));
-                secrets.push(saved.management_key.as_str());
-                let compensation = redact_text(&compensation.to_string(), &secrets);
-                return Err(CpaRuntimeError::Failed(format!(
-                    "{error}; restoring CPA client keys also failed: {compensation}"
-                )));
+        if let Err(failure) = local_result {
+            let active_restore = atomic_write(&config_path, &config_before);
+            let previous_restore =
+                restore_optional_file(&previous_config_path, previous_config_before.as_deref());
+            let failure = failure
+                .observe_written_restore(active_written, active_restore)
+                .observe_written_restore(previous_written, previous_restore);
+            if let Some(upstream_before) = upstream_before {
+                match client.replace_api_keys(&upstream_before).await {
+                    Ok(()) => return Err(failure.after_successful_restore()),
+                    Err(compensation) => {
+                        let mut secrets = next_keys.iter().map(String::as_str).collect::<Vec<_>>();
+                        secrets.extend(upstream_before.iter().map(String::as_str));
+                        secrets.push(saved.management_key.as_str());
+                        let compensation = redact_text(&compensation.to_string(), &secrets);
+                        return Err(CpaRuntimeFailure::partial(CpaRuntimeError::Failed(
+                            format!(
+                                "{failure}; restoring CPA client keys also failed: {compensation}"
+                            ),
+                        )));
+                    }
+                }
             }
-            return Err(error);
+            return Err(failure);
         }
         Ok(())
     }
 
-    fn persist_managed_connection(
+    pub(crate) fn persist_managed_connection(
         &self,
         port: u16,
         management_key: &str,
@@ -1854,6 +2501,18 @@ impl CoreStateInner {
             created_at: existing.as_ref().map_or(now, |item| item.created_at),
             updated_at: now,
         };
+        let previous = self
+            .db
+            .lock()
+            .cpa_model_catalog()
+            .map_err(|error| CpaRuntimeError::Failed(error.to_string()))?;
+        let models = CpaCatalogModel::merge_refresh(
+            models,
+            previous
+                .as_ref()
+                .map(|item| item.models.as_slice())
+                .unwrap_or(&[]),
+        );
         self.db
             .lock()
             .upsert_cpa_integration(&account, &base_url, &management_key_cipher)
@@ -1928,6 +2587,30 @@ impl CoreStateInner {
             saved.inference_key,
             false,
         )?)
+    }
+
+    async fn resolve_release_archive(
+        &self,
+    ) -> Result<(ResolvedRelease, Vec<u8>, String), CpaRuntimeError> {
+        #[cfg(test)]
+        if let Some(injected) = self.cpa_runtime.test_release.lock().take() {
+            let version = normalize_release_version(&injected.version)?;
+            let sha256 = format!("{:x}", Sha256::digest(&injected.archive));
+            return Ok((
+                ResolvedRelease {
+                    version,
+                    asset_name: String::new(),
+                    asset_url: String::new(),
+                    checksums_url: String::new(),
+                    archive_kind: injected.kind,
+                },
+                injected.archive,
+                sha256,
+            ));
+        }
+        let release = self.fetch_latest_release().await?;
+        let (archive, sha256) = self.download_verified_asset(&release).await?;
+        Ok((release, archive, sha256))
     }
 
     async fn fetch_latest_release(&self) -> Result<ResolvedRelease, CpaRuntimeError> {
@@ -2179,7 +2862,42 @@ fn write_config_yaml(
     auth_dir: &Path,
     inference_key: &str,
     extra_keys: &[String],
+    requests_proxy_url: Option<&str>,
 ) -> Result<(), CpaRuntimeError> {
+    let body = render_config_yaml(
+        port,
+        auth_dir,
+        inference_key,
+        extra_keys,
+        requests_proxy_url,
+    )?;
+    atomic_write(path, body.as_bytes())
+}
+
+/// The effective CPA `requests.proxy-url` for the persisted outbound proxy
+/// policy. `None` leaves the key unset so CPA follows environment proxies,
+/// matching the gateway's automatic mode. List mode maps to the direction's
+/// default leg because CPA egress is not model-scoped: the per-model
+/// exceptions stay inside the gateway's own forwarding path.
+pub(crate) fn cpa_requests_proxy_url(config: &AppConfig) -> Option<&str> {
+    match config.proxy_mode {
+        ProxyMode::Auto => None,
+        ProxyMode::Manual => Some(config.proxy_url.as_str()),
+        ProxyMode::Direct => Some("direct"),
+        ProxyMode::List => match config.proxy_list_direction {
+            ProxyListDirection::Whitelist => Some("direct"),
+            ProxyListDirection::Blacklist => Some(config.proxy_url.as_str()),
+        },
+    }
+}
+
+fn render_config_yaml(
+    port: u16,
+    auth_dir: &Path,
+    inference_key: &str,
+    extra_keys: &[String],
+    requests_proxy_url: Option<&str>,
+) -> Result<String, CpaRuntimeError> {
     validate_managed_secret(inference_key)?;
     let mut seen = HashSet::new();
     if !seen.insert(inference_key) {
@@ -2202,13 +2920,20 @@ fn write_config_yaml(
         keys.push_str(&yaml_escape(key));
         keys.push_str("\"\n");
     }
-    let body = format!(
-        "host: \"127.0.0.1\"\nport: {port}\nauth-dir: \"{auth_dir}\"\ndebug: false\nlogging-to-file: false\nremote-management:\n  allow-remote: false\n  secret-key: \"\"\n  disable-control-panel: true\n  disable-auto-update-panel: true\napi-keys:\n{keys}"
-    );
-    atomic_write(path, body.as_bytes())
+    let requests = match requests_proxy_url {
+        Some(proxy_url) => format!("requests:\n  proxy-url: \"{}\"\n", yaml_escape(proxy_url)),
+        None => String::new(),
+    };
+    Ok(format!(
+        "host: \"127.0.0.1\"\nport: {port}\nauth-dir: \"{auth_dir}\"\ndebug: false\nlogging-to-file: false\nremote-management:\n  allow-remote: false\n  secret-key: \"\"\n  disable-control-panel: true\n  disable-auto-update-panel: true\n{requests}api-keys:\n{keys}"
+    ))
 }
 
 fn remove_known_path(path: &Path) -> Result<(), CpaRuntimeError> {
+    remove_known_path_recorded(path, &mut false)
+}
+
+fn remove_known_path_recorded(path: &Path, removed: &mut bool) -> Result<(), CpaRuntimeError> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -2216,10 +2941,23 @@ fn remove_known_path(path: &Path) -> Result<(), CpaRuntimeError> {
     };
     reject_reparse_tree(path)?;
     if metadata.is_dir() {
-        fs::remove_dir_all(path).map_err(fs_error)
+        // Observe each completed deletion: recursive removal can fail after
+        // deleting only part of this owned tree.
+        let mut children = fs::read_dir(path)
+            .map_err(fs_error)?
+            .map(|entry| entry.map(|entry| entry.path()))
+            .collect::<std::io::Result<Vec<_>>>()
+            .map_err(fs_error)?;
+        children.sort();
+        for child in children {
+            remove_known_path_recorded(&child, removed)?;
+        }
+        fs::remove_dir(path).map_err(fs_error)?;
     } else {
-        fs::remove_file(path).map_err(fs_error)
+        fs::remove_file(path).map_err(fs_error)?;
     }
+    *removed = true;
+    Ok(())
 }
 
 fn is_reparse_path(path: &Path) -> bool {
@@ -2244,6 +2982,12 @@ fn yaml_escape(value: &str) -> String {
 }
 
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), CpaRuntimeError> {
+    #[cfg(test)]
+    if take_atomic_write_fault(path) {
+        return Err(CpaRuntimeError::Failed(
+            "CPA runtime file error: atomic write failed".into(),
+        ));
+    }
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(fs_error)?;
     }
@@ -2569,12 +3313,34 @@ fn redact_runtime_error(error: CpaRuntimeError, secrets: &[&str]) -> CpaRuntimeE
 fn with_compensation_error(
     original: CpaRuntimeError,
     compensation: Result<(), CpaRuntimeError>,
-) -> CpaRuntimeError {
+) -> CpaRuntimeFailure {
     match compensation {
-        Ok(()) => original,
-        Err(compensation) => CpaRuntimeError::Failed(format!(
+        Ok(()) => CpaRuntimeFailure::compensated(original),
+        Err(compensation) => CpaRuntimeFailure::partial(CpaRuntimeError::Failed(format!(
             "{original}; restoring the previous CPA runtime also failed: {compensation}"
-        )),
+        ))),
+    }
+}
+
+fn effect_after_own_steps(error: CpaRuntimeError, live: bool) -> CpaRuntimeFailure {
+    if live {
+        CpaRuntimeFailure::partial(error)
+    } else {
+        error.into()
+    }
+}
+
+fn removal_database_restore(
+    error: CpaRuntimeError,
+    restore: Result<(), CpaRuntimeError>,
+    files_or_process: bool,
+) -> CpaRuntimeFailure {
+    match restore {
+        Err(compensation) => CpaRuntimeFailure::partial(CpaRuntimeError::Failed(format!(
+            "{error}; restoring the previous CPA runtime also failed: {compensation}"
+        ))),
+        Ok(()) if files_or_process => CpaRuntimeFailure::partial(error),
+        Ok(()) => CpaRuntimeFailure::compensated(error),
     }
 }
 

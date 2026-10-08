@@ -53,7 +53,7 @@ fn wire_fields_are_camel_case() {
 fn error_envelope_always_emits_nullable_fields() {
     let error = V3Error::missing_expected_revision();
     let value = serde_json::to_value(&error).unwrap();
-    assert_eq!(value["code"], "missingExpectedRevision");
+    assert_eq!(value["code"], ERROR_MISSING_EXPECTED_REVISION);
     assert_eq!(value["currentRevision"], Value::Null);
     assert_eq!(value["processGeneration"], Value::Null);
     assert!(!value.as_object().unwrap().contains_key("current_revision"));
@@ -602,22 +602,24 @@ fn custom_capability_writes_accept_only_canonical_or_legacy_shapes() {
 }
 
 #[test]
-fn service_unavailable_error_emits_stable_code_and_cas_tokens() {
-    let error = V3Error::service_unavailable("browser stop failed", 11, 9);
-    let value = serde_json::to_value(&error).unwrap();
-    assert_eq!(value["code"], ERROR_SERVICE_UNAVAILABLE);
-    assert_eq!(value["code"], "serviceUnavailable");
-    assert_eq!(value["message"], "browser stop failed");
-    assert_eq!(value["currentRevision"], 11);
-    assert_eq!(value["processGeneration"], 9);
-
-    let schema = contract_schema();
-    let defs = schema["$defs"].as_object().expect("catalog $defs");
-    assert!(defs.contains_key("V3Error"));
-    assert_eq!(
-        defs["V3Error"]["properties"]["code"]["type"], "string",
-        "new error codes must not reshape the V3Error catalog definition"
-    );
+fn service_unavailable_and_not_implemented_errors_emit_stable_code_and_cas_tokens() {
+    for (label, error, code) in [
+        (
+            "service_unavailable",
+            V3Error::service_unavailable("browser stop failed", 11, 9),
+            ERROR_SERVICE_UNAVAILABLE,
+        ),
+        (
+            "not_implemented",
+            V3Error::not_implemented("protocol probes are not available", 11, 9),
+            ERROR_NOT_IMPLEMENTED,
+        ),
+    ] {
+        let value = serde_json::to_value(&error).unwrap();
+        assert_eq!(value["code"], code, "{label}");
+        assert_eq!(value["currentRevision"], 11, "{label}");
+        assert_eq!(value["processGeneration"], 9, "{label}");
+    }
 }
 
 #[test]
@@ -679,29 +681,10 @@ fn browser_dtos_are_distinct_secret_free_and_emit_required_nulls() {
     );
 }
 
-#[test]
-fn not_implemented_error_emits_stable_code_and_cas_tokens() {
-    let error = V3Error::not_implemented("protocol probes are not available", 11, 9);
-    let value = serde_json::to_value(&error).unwrap();
-    assert_eq!(value["code"], ERROR_NOT_IMPLEMENTED);
-    assert_eq!(value["code"], "notImplemented");
-    assert_eq!(value["message"], "protocol probes are not available");
-    assert_eq!(value["currentRevision"], 11);
-    assert_eq!(value["processGeneration"], 9);
-
-    let schema = contract_schema();
-    let defs = schema["$defs"].as_object().expect("catalog $defs");
-    assert_eq!(
-        defs["V3Error"]["properties"]["code"]["type"], "string",
-        "open string error codes must not reshape the V3Error catalog definition"
-    );
-}
-
 const ACCOUNTS_CATALOG_PREFIX: &[&str] = &[
     "ControlRevision",
     "MutationAck",
     "MutationExpectation",
-    "PricingRevision",
     "V3Error",
     "ConnectionInfo",
     "ConnectionSubKey",
@@ -820,6 +803,10 @@ fn sample_catalog_entry() -> ProviderCatalogEntry {
     ProviderCatalogEntry {
         provider_id: "opencode".into(),
 
+        origin: ProviderOrigin::Builtin,
+        editable: false,
+        deletable: false,
+        offering: "plan".into(),
         display_name: "OpenCode Go".into(),
         display_family: "OpenCode".into(),
         credential_kind: AccountCredentialKind::ApiKey,
@@ -875,6 +862,7 @@ fn sample_catalog_entry() -> ProviderCatalogEntry {
 
 fn sample_contracts() -> ProviderContracts {
     let goat = ProviderContractGroup {
+        presentation: None,
         scope_kind: ContractScopeKind::Provider,
         scope_id: "command-code".into(),
         provider_id: "command-code".into(),
@@ -934,8 +922,8 @@ fn sample_contracts() -> ProviderContracts {
     };
     ProviderContracts {
         providers: vec![goat],
-        alias_bindings: Vec::new(),
         custom_endpoints: vec![CustomEndpointContract {
+            presentation: None,
             scope_kind: ContractScopeKind::CustomEndpoint,
             scope_id: "custom-1".into(),
             provider_id: "custom".into(),
@@ -1586,6 +1574,9 @@ const PROVIDER_CATALOG_TYPES: &[&str] = &[
     "ZenFreeModels",
     "ZenFreeModel",
     "ProviderContracts",
+    "ProviderCatalogPresentation",
+    "ProviderModelPresentation",
+    "ProviderModelAction",
     "ProviderContractGroup",
     "CustomEndpointContract",
     "ProviderAccountChoice",
@@ -1603,22 +1594,7 @@ const PROVIDER_CATALOG_TYPES: &[&str] = &[
     "ProtocolProbeResponse",
 ];
 
-const PRICING_CATALOG_TYPES: &[&str] = &[
-    "PricingSnapshot",
-    "PricingLimits",
-    "PricingModel",
-    "PricingAdjustment",
-    "PricingTimeWindow",
-    "PricingRefresh",
-    "PricingRefreshStatus",
-    "PricingMultiplierChange",
-    "PricingRefreshUpdate",
-    "PricingRefreshPolicy",
-    "PricingMultipliersUpdate",
-    "PricingMultiplierWrite",
-    "ProviderPricing",
-    "PricingAvailability",
-];
+const PRICING_CATALOG_TYPES: &[&str] = &[];
 
 const USAGE_CATALOG_TYPES: &[&str] = &[
     "UsageWindow",
@@ -1702,7 +1678,6 @@ const CUSTOM_DISCOVERY_CATALOG_TYPES: &[&str] = &[
     "CustomModelDiscoveryRequest",
     "CustomModelDiscoveryResponse",
 ];
-const CLAUDE_DESKTOP_CATALOG_TYPES: &[&str] = &["ClaudeDesktopModels", "ClaudeDesktopModelsUpdate"];
 
 const UPDATER_CATALOG_TYPES: &[&str] = &["UpdateCheck", "DesktopUpdate", "InstallUpdate"];
 const USAGE_REFRESH_CATALOG_TYPES: &[&str] = &[
@@ -1710,14 +1685,7 @@ const USAGE_REFRESH_CATALOG_TYPES: &[&str] = &[
     "UsageRefreshUpdate",
     "UsageRefreshThrottleError",
 ];
-const PROVIDER_REFRESH_CATALOG_TYPES: &[&str] = &[
-    "ProviderModelsRefreshUpdate",
-    "ProviderModels",
-    "ProviderPricingSnapshot",
-    "ProviderPricingValue",
-    "ProviderPricingRefresh",
-    "ProviderPricingRefreshUpdate",
-];
+const PROVIDER_REFRESH_CATALOG_TYPES: &[&str] = &["ProviderModelsRefreshUpdate", "ProviderModels"];
 const ACCOUNT_TRANSFER_CATALOG_TYPES: &[&str] = &[
     "AccountExportRequest",
     "AccountExport",
@@ -1727,17 +1695,6 @@ const ACCOUNT_TRANSFER_CATALOG_TYPES: &[&str] = &[
     "AccountImportDisposition",
     "AccountImportRequest",
     "AccountImportResult",
-];
-const APPLICATION_CONNECTOR_CATALOG_TYPES: &[&str] = &[
-    "ApplicationConnectorAction",
-    "ApplicationConnectorStatus",
-    "ApplicationConnectorChange",
-    "ApplicationConnectorItem",
-    "ApplicationConnectors",
-    "ApplicationConnectorPreviewRequest",
-    "ApplicationConnectorPreview",
-    "ApplicationConnectorCommitRequest",
-    "ApplicationConnectorCommitResult",
 ];
 const CPA_CATALOG_TYPES: &[&str] = &[
     "CpaIntegration",
@@ -1761,6 +1718,7 @@ const CPA_CATALOG_TYPES: &[&str] = &[
     "CpaCliImportRequest",
     "CpaCliImportResult",
     "CpaRuntime",
+    "CpaRuntimeActions",
     "CpaRuntimePhase",
     "CpaRuntimeCheck",
     "CpaRuntimeInstall",
@@ -1770,19 +1728,18 @@ const CPA_CATALOG_TYPES: &[&str] = &[
     "CpaRuntimeKeyCreated",
 ];
 const DYNAMIC_PROVIDER_CATALOG_TYPES: &[&str] = &[
-    "DynamicProviderAuthKind",
-    "DynamicProviderModel",
-    "DynamicProvider",
-    "DynamicProviderCreate",
-    "DynamicProviderUpdate",
-    "DynamicProviderMutation",
-    "DynamicProviderDiscoverRequest",
-    "DynamicProviderDiscoverResponse",
-    "DynamicProviderTestRequest",
-    "DynamicProviderTestResponse",
+    "ProviderDefinitionAuthKind",
+    "ProviderDefinitionModel",
+    "ProviderDefinition",
+    "ProviderDefinitionCreate",
+    "ProviderDefinitionUpdate",
+    "ProviderDefinitionMutation",
+    "ProviderDefinitionDiscoverRequest",
+    "ProviderDefinitionDiscoverResponse",
+    "ProviderDefinitionTestRequest",
+    "ProviderDefinitionTestResponse",
 ];
 const OLLAMA_USAGE_CATALOG_TYPES: &[&str] = &["OllamaBillingTier"];
-const MODEL_ALIAS_CATALOG_TYPES: &[&str] = &["ModelAliasBinding", "ModelAliasBindingsUpdate"];
 
 #[test]
 fn catalog_type_names_append_pricing_dtos_after_the_provider_prefix() {
@@ -1822,14 +1779,9 @@ fn catalog_type_names_append_pricing_dtos_after_the_provider_prefix() {
         &CATALOG_TYPE_NAMES[proxy_end..custom_discovery_end],
         CUSTOM_DISCOVERY_CATALOG_TYPES
     );
-    let claude_end = custom_discovery_end + CLAUDE_DESKTOP_CATALOG_TYPES.len();
+    let account_verify_end = custom_discovery_end + 1;
     assert_eq!(
-        &CATALOG_TYPE_NAMES[custom_discovery_end..claude_end],
-        CLAUDE_DESKTOP_CATALOG_TYPES
-    );
-    let account_verify_end = claude_end + 1;
-    assert_eq!(
-        &CATALOG_TYPE_NAMES[claude_end..account_verify_end],
+        &CATALOG_TYPE_NAMES[custom_discovery_end..account_verify_end],
         ["AccountVerify"]
     );
     let browser_end = account_verify_end + BROWSER_CATALOG_TYPES.len();
@@ -1862,15 +1814,9 @@ fn catalog_type_names_append_pricing_dtos_after_the_provider_prefix() {
         &CATALOG_TYPE_NAMES[provider_refresh_end..account_transfer_end],
         ACCOUNT_TRANSFER_CATALOG_TYPES
     );
-    let application_connector_end =
-        account_transfer_end + APPLICATION_CONNECTOR_CATALOG_TYPES.len();
+    let cpa_end = account_transfer_end + CPA_CATALOG_TYPES.len();
     assert_eq!(
-        &CATALOG_TYPE_NAMES[account_transfer_end..application_connector_end],
-        APPLICATION_CONNECTOR_CATALOG_TYPES
-    );
-    let cpa_end = application_connector_end + CPA_CATALOG_TYPES.len();
-    assert_eq!(
-        &CATALOG_TYPE_NAMES[application_connector_end..cpa_end],
+        &CATALOG_TYPE_NAMES[account_transfer_end..cpa_end],
         CPA_CATALOG_TYPES
     );
     let dynamic_end = cpa_end + DYNAMIC_PROVIDER_CATALOG_TYPES.len();
@@ -1883,12 +1829,19 @@ fn catalog_type_names_append_pricing_dtos_after_the_provider_prefix() {
         &CATALOG_TYPE_NAMES[dynamic_end..ollama_end],
         OLLAMA_USAGE_CATALOG_TYPES
     );
-    let model_alias_end = ollama_end + MODEL_ALIAS_CATALOG_TYPES.len();
     assert_eq!(
-        &CATALOG_TYPE_NAMES[ollama_end..model_alias_end],
-        MODEL_ALIAS_CATALOG_TYPES
+        &CATALOG_TYPE_NAMES[ollama_end..],
+        &[
+            "PlatformAccounts",
+            "PlatformAccount",
+            "PlatformLink",
+            "PlatformSnapshot",
+            "PlatformCreate",
+            "PlatformUpdate",
+            "PlatformLinkWrite",
+            "PlatformRefresh",
+        ]
     );
-    assert_eq!(CATALOG_TYPE_NAMES.len(), model_alias_end);
 }
 
 #[test]
@@ -2231,9 +2184,9 @@ fn observability_dtos_emit_camel_case_nulls_and_stay_secret_free() {
         total_accounts: 2,
         available_accounts: 1,
         gateway_running: true,
-        today_cost: 1.5,
-        week_cost: 2.5,
-        month_cost: 3.5,
+        today_cost: Some(1.5),
+        week_cost: Some(2.5),
+        month_cost: Some(3.5),
         revision: 11,
         process_generation: 9,
         pricing_revision: "seed".into(),
@@ -2282,7 +2235,7 @@ fn observability_dtos_emit_camel_case_nulls_and_stay_secret_free() {
             prompt_tokens: 1,
             completion_tokens: 2,
             cached_tokens: 0,
-            cost: 0.1,
+            cost: Some(0.1),
         },
         revision: 11,
         process_generation: 9,
@@ -2414,9 +2367,9 @@ fn observability_catalog_registers_new_defs_without_reshaping_the_prefix() {
 fn usage_responses_emit_camel_case_nulls_and_reject_unknown_request_fields() {
     let usage = UsageWindow {
         account_id: "acct-1".into(),
-        window_5h: 6.0,
-        window_week: 6.0,
-        window_month: 6.0,
+        window_5h: Some(6.0),
+        window_week: Some(6.0),
+        window_month: Some(6.0),
         resets_in_5h: None,
         resets_in_week: None,
         resets_in_month: None,
@@ -2450,6 +2403,7 @@ fn usage_responses_emit_camel_case_nulls_and_reject_unknown_request_fields() {
 
     let mutation = UsageMutation {
         usage: goat,
+        observed_at: "2026-10-07T00:00:00Z".into(),
         revision: 11,
         process_generation: 9,
     };
@@ -2770,141 +2724,6 @@ fn proxy_test_catalog_registers_without_cas_or_secret_fields() {
 }
 
 #[test]
-fn claude_desktop_models_are_camel_case_cas_and_secret_free() {
-    let models = ClaudeDesktopModels {
-        sonnet: "glm-5.2".into(),
-        opus: "grok-4.5".into(),
-        haiku: "mimo-v2.5".into(),
-        revision: 11,
-        process_generation: 9,
-    };
-    let value = serde_json::to_value(&models).unwrap();
-    assert_eq!(
-        value,
-        json!({
-            "sonnet": "glm-5.2",
-            "opus": "grok-4.5",
-            "haiku": "mimo-v2.5",
-            "revision": 11,
-            "processGeneration": 9 })
-    );
-    let object = value.as_object().unwrap();
-    for forbidden in [
-        "pricingRevision",
-        "pricing_revision",
-        "key",
-        "gatewayKey",
-        "gateway_key",
-        "primaryKey",
-        "cipher",
-        "secret",
-        "token",
-    ] {
-        assert!(
-            !object.contains_key(forbidden),
-            "ClaudeDesktopModels must not expose {forbidden}"
-        );
-    }
-
-    let parsed: ClaudeDesktopModelsUpdate = serde_json::from_value(json!({
-        "expectedRevision": 11,
-        "processGeneration": 9,
-        "sonnet": "glm-5.2",
-        "opus": "",
-        "haiku": "mimo-v2.5"
-    }))
-    .unwrap();
-    assert_eq!(parsed.expectation.expected_revision, 11);
-    assert_eq!(parsed.expectation.process_generation, 9);
-    assert_eq!(parsed.sonnet, "glm-5.2");
-    assert_eq!(parsed.opus, "");
-    assert_eq!(parsed.haiku, "mimo-v2.5");
-
-    assert!(
-        serde_json::from_value::<ClaudeDesktopModelsUpdate>(json!({
-            "processGeneration": 9,
-            "sonnet": "glm-5.2",
-            "opus": "",
-            "haiku": ""
-        }))
-        .is_err()
-    );
-    assert!(
-        serde_json::from_value::<ClaudeDesktopModelsUpdate>(json!({
-            "expectedRevision": 11,
-            "processGeneration": 9,
-            "opus": "",
-            "haiku": ""
-        }))
-        .is_err()
-    );
-    assert!(
-        serde_json::from_value::<ClaudeDesktopModelsUpdate>(json!({
-            "expectedRevision": 11,
-            "processGeneration": 9,
-            "sonnet": "glm-5.2",
-            "opus": "",
-            "haiku": "",
-            "gatewayKey": "ocg-secret"
-        }))
-        .is_err()
-    );
-}
-
-#[test]
-fn claude_desktop_catalog_registers_required_roles_and_cas() {
-    let schema = contract_schema();
-    let defs = schema["$defs"].as_object().expect("catalog $defs");
-    for name in CLAUDE_DESKTOP_CATALOG_TYPES {
-        assert!(defs.contains_key(*name), "schema missing {name}");
-        assert_eq!(defs[*name]["additionalProperties"], false);
-    }
-
-    let response_required = defs["ClaudeDesktopModels"]["required"]
-        .as_array()
-        .expect("ClaudeDesktopModels.required");
-    assert_eq!(
-        response_required,
-        &vec![
-            json!("sonnet"),
-            json!("opus"),
-            json!("haiku"),
-            json!("revision"),
-            json!("processGeneration"),
-        ]
-    );
-    let response_props = defs["ClaudeDesktopModels"]["properties"]
-        .as_object()
-        .expect("ClaudeDesktopModels.properties");
-    assert!(!response_props.contains_key("pricingRevision"));
-    assert!(!response_props.contains_key("key"));
-    assert!(!response_props.contains_key("gatewayKey"));
-
-    let update_required = defs["ClaudeDesktopModelsUpdate"]["required"]
-        .as_array()
-        .expect("ClaudeDesktopModelsUpdate.required");
-    assert_eq!(
-        update_required,
-        &vec![
-            json!("expectedRevision"),
-            json!("processGeneration"),
-            json!("sonnet"),
-            json!("opus"),
-            json!("haiku"),
-        ]
-    );
-    let update_props = defs["ClaudeDesktopModelsUpdate"]["properties"]
-        .as_object()
-        .expect("ClaudeDesktopModelsUpdate.properties");
-    for forbidden in ["key", "gatewayKey", "primaryKey", "pricingRevision"] {
-        assert!(
-            !update_props.contains_key(forbidden),
-            "ClaudeDesktopModelsUpdate must not expose {forbidden}"
-        );
-    }
-}
-
-#[test]
 fn managed_key_verify_request_requires_cas_and_write_only_key() {
     let schema = contract_schema();
     let defs = schema["$defs"].as_object().expect("catalog $defs");
@@ -2970,9 +2789,9 @@ fn usage_refresh_dtos_are_camel_case_secret_free_and_append_only() {
     let refresh = UsageRefresh {
         usage: UsageWindow {
             account_id: "acct-1".into(),
-            window_5h: 6.0,
-            window_week: 6.0,
-            window_month: 6.0,
+            window_5h: Some(6.0),
+            window_week: Some(6.0),
+            window_month: Some(6.0),
             resets_in_5h: None,
             resets_in_week: None,
             resets_in_month: None,

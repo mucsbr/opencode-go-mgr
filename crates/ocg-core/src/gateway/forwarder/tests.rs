@@ -1,4 +1,721 @@
 use super::*;
+use crate::gateway::attempt_pricing::capture_execution_pricing;
+use crate::kernel::pricing::PricingSnapshot;
+
+#[tokio::test]
+async fn fork_goat_credit_400_persists_only_the_receiving_keys_monthly_cooldown() {
+    const CREDIT_ERROR: &str = r#"{"error":{"code":"BAD_REQUEST","message":"You have insufficient credits to make this request. Please purchase more credits to continue using the service.","type":"invalid_request_error"}}"#;
+    for configured_date in [true, false] {
+        let app = axum::Router::new().fallback(axum::routing::post(|| async {
+            (
+                StatusCode::BAD_REQUEST,
+                [("content-type", "application/json")],
+                CREDIT_ERROR,
+            )
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let (dir, state) = test_state("fork-goat-credit-400");
+        let mut config = state.config();
+        config.proxy_mode = ProxyMode::Direct;
+        state.set_config(config).unwrap();
+        let mut account = custom_account(&state);
+        account.id = format!("fork-goat-{}", uuid::Uuid::new_v4());
+        account.provider_id = crate::provider::COMMAND_CODE_PROVIDER_ID.into();
+        account.name = "GOAT test".into();
+        if configured_date {
+            account.purchase_date = Local::now().date_naive().to_string();
+        }
+        state.db.lock().create_account(&account).unwrap();
+        if !configured_date {
+            // Reproduce a historical Key without a purchase date; new Keys
+            // otherwise receive today's date from the upstream create path.
+            state
+                .db
+                .lock()
+                .conn
+                .execute(
+                    "UPDATE credentials SET purchase_date = '' WHERE legacy_account_id = ?1",
+                    [&account.id],
+                )
+                .unwrap();
+        }
+        let mut sibling = account.clone();
+        sibling.id = "goat-sibling".into();
+        sibling.key_cipher = state.encrypt_key("sk-sibling").unwrap();
+        state.db.lock().create_account(&sibling).unwrap();
+        let model = "deepseek/deepseek-v4-flash";
+        let scope = crate::provider_contracts::ContractScope::provider(&account.provider_id);
+        state
+            .db
+            .lock()
+            .set_contract_catalog(
+                &scope,
+                &[model.into()],
+                Some(Utc::now()),
+                "test_command_code_catalog",
+                &base,
+                Utc::now(),
+            )
+            .unwrap();
+        state
+            .db
+            .lock()
+            .set_model_protocol_overrides(
+                &scope,
+                &[(
+                    model.into(),
+                    UpstreamProtocolKind::ChatCompletions,
+                    crate::provider_contracts::ProtocolOverrideState::ForceOn,
+                )],
+                Utc::now(),
+            )
+            .unwrap();
+        state.reload_provider_contracts().unwrap();
+        if !configured_date {
+            state
+                .db
+                .lock()
+                .conn
+                .execute(
+                    "UPDATE credentials SET purchase_date = '' WHERE legacy_account_id = ?1",
+                    [&account.id],
+                )
+                .unwrap();
+        }
+        let _route = crate::gateway::provider_adapter::install_goat_loopback_route_for_test(
+            account.id.clone(),
+            base,
+        )
+        .unwrap();
+        let plan = chat_plan(model, None);
+        let selection = live_send_selection(&state, &account, &plan);
+        let result = forward_once(&state, &account, &plan, &selection, &[]).await;
+        assert_eq!(result.action, ForwardAction::TryNextAccount);
+        assert_eq!(result.response.status(), StatusCode::BAD_REQUEST);
+        let expected = configured_date.then(|| {
+            Local
+                .from_local_datetime(
+                    &NaiveDate::parse_from_str(
+                        &crate::models::purchase_expires_on(&account.purchase_date).unwrap(),
+                        "%Y-%m-%d",
+                    )
+                    .unwrap()
+                    .and_hms_opt(0, 0, 0)
+                    .unwrap(),
+                )
+                .single()
+                .unwrap()
+                .with_timezone(&Utc)
+        });
+        {
+            let db = state.db.lock();
+            let saved =
+                crate::goat_plan_cooldowns::load_for_legacy_on(&db.conn, &account.id).unwrap();
+            assert_eq!(saved.and_then(|map| map.month), expected);
+            let snapshot = crate::routing_snapshot::RoutingSnapshot::load(&db).unwrap();
+            let credential = snapshot
+                .credentials
+                .iter()
+                .find(|row| row.id == account.id)
+                .unwrap();
+            assert_eq!(credential.goat_plan.month, expected);
+            assert_eq!(
+                credential.is_cooling_for(UpstreamChannel::Go, Utc::now()),
+                configured_date
+            );
+            assert!(
+                db.get_account(&sibling.id)
+                    .unwrap()
+                    .unwrap()
+                    .cooldown_until
+                    .is_none()
+            );
+            let log = db.list_forward_logs(1).unwrap().remove(0);
+            assert_eq!(log.http_status, Some(400));
+            assert_eq!(log.diagnostic.unwrap()["retry_action"], "try_next_account");
+        }
+        drop(state);
+        let db = Database::open(dir.clone()).unwrap();
+        let saved = crate::goat_plan_cooldowns::load_for_legacy_on(&db.conn, &account.id).unwrap();
+        assert_eq!(saved.and_then(|map| map.month), expected);
+        drop(db);
+        server.abort();
+        fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+fn install_test_credits(state: &CoreState, account: &Account) {
+    use crate::billing_types::{CreditBucket, CreditBucketKind, CreditConfigurationWrite};
+    let now = Utc::now();
+    let db = state.db.lock();
+    let tx = db.conn.unchecked_transaction().unwrap();
+    crate::db::billing::configure_on(
+        &tx,
+        &account.id,
+        CreditConfigurationWrite {
+            name: "test credits".into(),
+            currency: "CNY".into(),
+            monthly: None,
+            source_url: None,
+        },
+        Some(vec![CreditBucket {
+            id: "current".into(),
+            kind: CreditBucketKind::Manual,
+            label: "current".into(),
+            granted: 100_000_000.0,
+            remaining: 100_000_000.0,
+            starts_at: now,
+            expires_at: None,
+        }]),
+        now,
+    )
+    .unwrap();
+    tx.commit().unwrap();
+}
+
+fn test_credit_view(state: &CoreState) -> crate::billing_types::CreditMeterView {
+    crate::db::billing::read_view_on(&state.db.lock().conn, ACCOUNT, Utc::now())
+        .unwrap()
+        .unwrap()
+}
+
+fn credit_test_account(state: &CoreState, endpoint: &str) -> Account {
+    let mut config = state.config();
+    config.proxy_mode = ProxyMode::Direct;
+    state.set_config(config).unwrap();
+    let account = custom_account(state);
+    persist_custom_at(state, &account, endpoint);
+    grant_binding(
+        state,
+        &account.id,
+        &[RouteSpec {
+            operation: EndpointOperation::ChatCreate,
+            url: Some(endpoint.into()),
+        }],
+        LegacyConnectionKind::CustomAccount,
+        &account.id,
+    );
+    install_test_credits(state, &account);
+    account
+}
+
+#[tokio::test]
+async fn credits_json_and_sse_preserve_balance_without_receipts_after_reopen() {
+    for stream in [false, true] {
+        let app = axum::Router::new().fallback(axum::routing::post(move || async move {
+            let usage = json!({"prompt_tokens":1_000_000,"completion_tokens":100_000,
+                "prompt_tokens_details":{"cached_tokens":200_000},"cache_creation_input_tokens":100_000});
+            if stream {
+                let text = format!("data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+                    json!({"id":"credit","object":"chat.completion.chunk","model":"local-custom",
+                        "choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":null}]}),
+                    json!({"id":"credit","object":"chat.completion.chunk","model":"local-custom",
+                        "choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":usage}));
+                ([("content-type","text/event-stream")], text)
+            } else {
+                ([("content-type","application/json")], json!({"id":"credit","object":"chat.completion",
+                    "model":"local-custom","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],
+                    "usage":usage}).to_string())
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!(
+            "http://{}/v1/chat/completions",
+            listener.local_addr().unwrap()
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let (dir, state) = test_state("credit-real-wire");
+        let account = credit_test_account(&state, &endpoint);
+        let mut plan = chat_plan("local-custom", Some(&endpoint));
+        plan.stream = stream;
+        let selection = live_send_selection(&state, &account, &plan);
+        let result = forward_once(&state, &account, &plan, &selection, &[]).await;
+        assert_eq!(
+            result.response.status(),
+            StatusCode::OK,
+            "{:?}",
+            result.error_message
+        );
+        let body = axum::body::to_bytes(result.response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("ok"));
+        let view = test_credit_view(&state);
+        assert_eq!(view.pending_requests, 0, "{stream}");
+        assert_eq!(view.unpriced_requests, 0, "{stream}");
+        assert!((view.remaining - 100_000_000.0).abs() < 1e-6, "{stream}");
+        let db = state.db.lock();
+        let logs = db.list_forward_logs(10).unwrap();
+        assert_eq!(logs.len(), 1, "{stream}: {logs:?}");
+        let log = &logs[0];
+        assert_eq!(log.prompt_tokens, 1_000_000, "{stream}");
+        assert_eq!(log.completion_tokens, 100_000, "{stream}");
+        assert_eq!(log.cached_tokens, 200_000, "{stream}");
+        assert_eq!(log.cache_creation_tokens, 0, "{stream}");
+        assert_eq!(log.status, "success", "{stream}");
+        assert_eq!(log.cost_state, "unknown", "{stream}");
+        assert!(log.cost.is_none(), "{stream}");
+        assert!(log.pricing_revision_id.is_none(), "{stream}");
+        assert!(
+            log.raw_cost_usd.is_none() && log.quota_debit.is_none(),
+            "{stream}"
+        );
+        let native = db.forward_log_native_attribution(log.id).unwrap().unwrap();
+        assert_eq!(native.native_cost_unit, None, "{stream}");
+        assert_eq!(native.native_cost_value, None, "{stream}");
+        assert_eq!(native.native_cost_currency, None, "{stream}");
+        drop(db);
+        let remaining = view.remaining;
+        drop(state);
+        let reopened = Database::open(dir.clone()).unwrap();
+        assert_eq!(
+            crate::db::billing::read_view_on(&reopened.conn, ACCOUNT, Utc::now())
+                .unwrap()
+                .unwrap()
+                .remaining,
+            remaining
+        );
+        drop(reopened);
+        server.abort();
+        let _ = fs::remove_dir_all(dir);
+    }
+}
+
+#[tokio::test]
+async fn credits_cancelled_before_headers_keep_balance_and_allow_calibration() {
+    let received = Arc::new(tokio::sync::Notify::new());
+    let signal = received.clone();
+    let app = axum::Router::new().fallback(axum::routing::post(move || {
+        let signal = signal.clone();
+        async move {
+            signal.notify_one();
+            std::future::pending::<()>().await;
+            "unreachable"
+        }
+    }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!(
+        "http://{}/v1/chat/completions",
+        listener.local_addr().unwrap()
+    );
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let (dir, state) = test_state("credit-cancel-before-headers");
+    let account = credit_test_account(&state, &endpoint);
+    let plan = chat_plan("local-custom", Some(&endpoint));
+    let selection = live_send_selection(&state, &account, &plan);
+    let mut future = Box::pin(forward_once(&state, &account, &plan, &selection, &[]));
+    tokio::select! {
+        result = &mut future => panic!("request completed before fixture signal: {:?}", result.error_message),
+        result = tokio::time::timeout(StdDuration::from_secs(10), received.notified()) => result.unwrap(),
+    }
+    assert_eq!(test_credit_view(&state).pending_requests, 0);
+    assert_eq!(test_credit_view(&state).unpriced_requests, 0);
+    crate::db::billing::calibrate_on(&state.db.lock().conn, ACCOUNT, &[], Utc::now())
+        .expect("an in-flight request no longer holds a credit receipt");
+    drop(future);
+    let view = test_credit_view(&state);
+    assert_eq!(view.pending_requests, 0);
+    assert_eq!(view.unpriced_requests, 0);
+    assert_eq!(view.remaining, 100_000_000.0);
+    server.abort();
+    drop(state);
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn credits_startup_preserves_an_abandoned_receipt_byte_exact() {
+    let (dir, state) = test_state("credit-restart-pending");
+    let endpoint = "https://example.test/v1/chat/completions";
+    let account = credit_test_account(&state, endpoint);
+    let context = attempt_context("local-custom");
+    let attempt = crate::db::billing::capture_on(
+        &state.db.lock().conn,
+        ACCOUNT,
+        endpoint,
+        "local-custom",
+        Utc::now(),
+    )
+    .unwrap()
+    .unwrap();
+    let pricing = RequestPricingSnapshot::Unpriced;
+    let db = state.db.lock();
+    let log_id = DbAttemptSink::new(&db)
+        .insert(
+            &(&account).into(),
+            "local-custom",
+            "streaming",
+            None,
+            metadata_metrics(&pricing, None, "not_applicable"),
+            None,
+            &context,
+            None,
+        )
+        .unwrap();
+    crate::db::billing::attach_attempt_on(&db.conn, log_id, &attempt).unwrap();
+    let historical_receipt: String = db
+        .conn
+        .query_row(
+            "SELECT credit_receipt_json FROM forward_logs WHERE id=?1",
+            [log_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    drop(db);
+    assert_eq!(test_credit_view(&state).pending_requests, 0);
+    drop(state);
+    for _ in 0..2 {
+        let db = Database::open(dir.clone()).unwrap();
+        let view = crate::db::billing::read_view_on(&db.conn, ACCOUNT, Utc::now())
+            .unwrap()
+            .unwrap();
+        assert_eq!(view.pending_requests, 0);
+        assert_eq!(view.unpriced_requests, 0);
+        assert_eq!(view.remaining, 100_000_000.0);
+        let receipt: String = db
+            .conn
+            .query_row(
+                "SELECT credit_receipt_json FROM forward_logs WHERE id=?1",
+                [log_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(receipt, historical_receipt);
+        drop(db);
+    }
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn mixed_sse_line_endings_preserve_usage_and_done_at_every_chunk_split() {
+    for (first, second) in [("\r\n\r\n", "\n\n"), ("\n\n", "\r\n\r\n")] {
+        let payload = format!(
+            "data: {{\"usage\":{{\"prompt_tokens\":7,\"completion_tokens\":11}}}}{first}data: [DONE]{second}"
+        );
+        for split in 0..=payload.len() {
+            let mut state = StreamState::default();
+            for chunk in [&payload.as_bytes()[..split], &payload.as_bytes()[split..]] {
+                process_chunk_for_usage(
+                    &mut state,
+                    ApiFormat::ChatCompletions,
+                    &Bytes::copy_from_slice(chunk),
+                    None,
+                );
+            }
+            assert!(state.has_usage, "usage lost at split {split}");
+            assert_eq!(token_counts(state.usage), (7, 11, 0, 0));
+            assert!(state.terminal, "DONE lost at split {split}");
+            assert!(state.buf.is_empty());
+        }
+    }
+}
+
+#[test]
+fn mixed_sse_line_endings_keep_the_first_error_terminal() {
+    let mut state = StreamState::default();
+    process_chunk_for_usage(
+        &mut state,
+        ApiFormat::ChatCompletions,
+        &Bytes::from_static(
+            b"data: {\"error\":{\"message\":\"mock failure\"}}\r\n\r\ndata: {\"usage\":{\"prompt_tokens\":999}}\n\n",
+        ),
+        None,
+    );
+    assert!(state.error);
+    assert!(state.terminal);
+    assert_eq!(state.error_message.as_deref(), Some("mock failure"));
+    assert!(
+        !state.has_usage,
+        "later events must not override a terminal error"
+    );
+    assert!(state.buf.is_empty());
+}
+
+use crate::crypto::{KeyCipher, StaticKeyCipher};
+use crate::db::Database;
+use crate::gateway::diagnostics::RequestTrace;
+use crate::gateway::protocol::{CustomRouteSpec, RequestPlan};
+use crate::http_client::RouteLabel;
+use crate::kernel::protocol::ApiFormat;
+use crate::models::{
+    Account, AccountCustomConfigInput, AccountModelCapabilityInput, AccountSetupStep, AccountType,
+    ProxyMode, UpstreamChannel,
+};
+use crate::platform::{PlatformGroup, PlatformKind, PlatformPrice, PlatformSnapshot};
+use crate::provider::{
+    CUSTOM_PROVIDER_ID, OPENCODE_PROVIDER_ID, ProviderAdapterKind, UpstreamProtocolKind,
+};
+use crate::state::CoreStateInner;
+use bytes::Bytes;
+use chrono::{Local, NaiveDate, TimeZone, Utc};
+use ocg_domain::connection::{
+    EndpointOperation, LegacyConnectionKind, connection_id_for_legacy, endpoint_id_for,
+};
+use ocg_domain::credential::{
+    ModelScope, RouteSpec, assigned_endpoints_for_routes, normalize_origin,
+};
+use serde_json::json;
+use std::fs;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::thread;
+
+const UPSTREAM: &str = "gpt-4o";
+const GROUP: &str = "default";
+const PARENT: &str = "parent-1";
+const ACCOUNT: &str = "custom-1";
+
+#[test]
+fn openrouter_free_policy_requires_the_official_route_and_exact_free_model_id() {
+    for model in ["openrouter/free", "vendor/model:free"] {
+        for path in ["chat/completions", "responses", "messages"] {
+            let url = reqwest::Url::parse(&format!("https://openrouter.ai/api/v1/{path}")).unwrap();
+            assert!(is_openrouter_free_request(&url, model), "{url} {model}");
+        }
+    }
+    for (url, model) in [
+        (
+            "https://openrouter.ai/api/v1/chat/completions",
+            "vendor/model",
+        ),
+        (
+            "https://example.com/api/v1/chat/completions",
+            "openrouter/free",
+        ),
+        (
+            "http://openrouter.ai/api/v1/chat/completions",
+            "openrouter/free",
+        ),
+        (
+            "https://openrouter.ai:8443/api/v1/chat/completions",
+            "openrouter/free",
+        ),
+        ("https://openrouter.ai/api/v1/models", "openrouter/free"),
+        (
+            "https://openrouter.ai/api/v1/chat/completions?route=other",
+            "openrouter/free",
+        ),
+    ] {
+        assert!(!is_openrouter_free_request(
+            &reqwest::Url::parse(url).unwrap(),
+            model
+        ));
+    }
+}
+
+fn temp_dir(label: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "ocg-platform-price-{}-{}",
+        label,
+        uuid::Uuid::new_v4()
+    ));
+    fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+fn test_state(label: &str) -> (PathBuf, CoreState) {
+    let dir = temp_dir(label);
+    let cipher: Arc<dyn KeyCipher + Send + Sync> = Arc::new(StaticKeyCipher::new("platform-price"));
+    let db = Database::open(dir.clone()).unwrap();
+    let state = Arc::new(CoreStateInner::new(db, dir.clone(), cipher).unwrap());
+    (dir, state)
+}
+
+fn custom_account(state: &CoreState) -> Account {
+    let now = Utc::now();
+    Account {
+        id: ACCOUNT.into(),
+        provider_id: CUSTOM_PROVIDER_ID.into(),
+        credential_kind: crate::provider::default_credential_kind(),
+        quota_scope: crate::provider::default_quota_scope(),
+        name: "custom".into(),
+        username: None,
+        password_cipher: None,
+        key_cipher: state.encrypt_key("sk-custom").unwrap(),
+        enabled: true,
+        account_type: AccountType::Key,
+        setup_step: AccountSetupStep::Ready,
+        referral_code: None,
+        purchase_date: String::new(),
+        expires_on: String::new(),
+        cooldown_until: None,
+        cooldown_generic_until: None,
+        cooldown_5h_until: None,
+        cooldown_week_until: None,
+        cooldown_month_until: None,
+        cooldown_free_until: None,
+        last_error: None,
+        auth_error: None,
+        notes: None,
+        created_at: now,
+        updated_at: now,
+    }
+}
+
+fn persist_custom(state: &CoreState, account: &Account) {
+    state
+        .db
+        .lock()
+        .create_account_with_contract(
+            account,
+            Some(&AccountCustomConfigInput {
+                endpoint_url: "https://api.example.com/v1/chat/completions".into(),
+                upstream_protocol: UpstreamProtocolKind::ChatCompletions,
+            }),
+            &[AccountModelCapabilityInput {
+                public_model: UPSTREAM.into(),
+                upstream_model: UPSTREAM.into(),
+                protocol: UpstreamProtocolKind::ChatCompletions,
+                source: None,
+            }],
+        )
+        .unwrap();
+}
+
+fn billable_price() -> PlatformPrice {
+    PlatformPrice {
+        model: UPSTREAM.into(),
+        group_id: Some(GROUP.into()),
+        currency: "CNY".into(),
+        input: Some(0.002),
+        output: Some(0.008),
+        cache_read: Some(0.001),
+        cache_write: Some(0.003),
+        source: "platform".into(),
+        official_reference: false,
+        unavailable_reason: None,
+        valid_until: Utc::now().timestamp() + 3_600,
+    }
+}
+
+fn snapshot(prices: Vec<PlatformPrice>, stale: bool) -> PlatformSnapshot {
+    PlatformSnapshot {
+        observed_at: Utc::now().timestamp(),
+        stale,
+        prices,
+        ..PlatformSnapshot::default()
+    }
+}
+
+fn link_with_snapshot(state: &CoreState, group: PlatformGroup, snapshot: PlatformSnapshot) {
+    let db = state.db.lock();
+    db.create_platform_account(
+        PARENT,
+        PlatformKind::NewApi,
+        "New API",
+        "https://api.example.com",
+        None,
+    )
+    .unwrap();
+    db.link_platform_account(ACCOUNT, PARENT, &group).unwrap();
+    let token = db.platform_refresh_token(PARENT, Some(ACCOUNT)).unwrap();
+    assert!(
+        db.save_platform_refresh(PARENT, Some(ACCOUNT), &token, &snapshot)
+            .unwrap()
+    );
+}
+
+fn pinned_group() -> PlatformGroup {
+    PlatformGroup {
+        subscription_type: None,
+        id: Some(GROUP.into()),
+        platform: Some("openai".into()),
+        auto_groups: Vec::new(),
+        verified: true,
+    }
+}
+
+fn attempt_context(upstream: &str) -> ForwardAttemptContext {
+    ForwardAttemptContext {
+        trace: RequestTrace::new(),
+        client_body_bytes: 0,
+        upstream_body_bytes: 0,
+        attempt: 1,
+        client_format: ApiFormat::ChatCompletions,
+        upstream_format: ApiFormat::ChatCompletions,
+        model: upstream.into(),
+        requested_model: upstream.into(),
+        resolved_alias: None,
+        upstream_model: upstream.into(),
+        stream: false,
+        route: RouteLabel::Direct,
+        known_secret: None,
+        route_account_id: Some(ACCOUNT.into()),
+        provider_id: Some(CUSTOM_PROVIDER_ID.into()),
+        credential_account_id: Some(ACCOUNT.into()),
+        client_key_id: None,
+        client_key_name: None,
+        restriction_details: None,
+        credit_log_id: None,
+    }
+}
+
+fn bind_for(
+    state: &CoreState,
+    account: &Account,
+    upstream: &str,
+) -> (RequestPricingSnapshot, ForwardAttemptContext) {
+    let context = attempt_context(upstream);
+    let plan = chat_plan(upstream, None);
+    let pricing = capture_execution_pricing(
+        state,
+        &account.into(),
+        crate::routing_runtime::adapter_for_account(account, None),
+        &plan,
+    );
+    (pricing, context)
+}
+
+fn assert_usd_and_quota_null(metrics: &ForwardMetrics) {
+    assert_eq!(metrics.raw_cost_usd, None);
+    assert_eq!(metrics.quota_debit, None);
+    assert_eq!(metrics.effective_paid_cost_usd, None);
+    assert_eq!(metrics.cost, 0.0);
+    assert_ne!(metrics.cost_state, "priced");
+}
+
+/// Persist real usage without consuming a stored price snapshot.
+#[allow(clippy::too_many_arguments)]
+fn persist_unpriced_row(
+    state: &CoreState,
+    account: &Account,
+    pricing: &RequestPricingSnapshot,
+    context: &ForwardAttemptContext,
+    prompt: i64,
+    completion: i64,
+    cached: i64,
+    cache_creation: i64,
+) -> i64 {
+    let metrics = pricing_metrics(
+        pricing,
+        UPSTREAM,
+        prompt,
+        completion,
+        cached,
+        cache_creation,
+        None,
+    );
+    DbAttemptSink::new(&state.db.lock())
+        .insert(
+            &(account).into(),
+            UPSTREAM,
+            success_status_for_cost(metrics.cost_state),
+            Some(200),
+            metrics,
+            None,
+            context,
+            None,
+        )
+        .unwrap()
+}
 
 #[test]
 fn explicit_opencode_identity_is_copied_from_the_original_client_map() {
@@ -14,4 +731,3594 @@ fn explicit_opencode_identity_is_copied_from_the_original_client_map() {
     assert_eq!(upstream.get("x-opencode-project").unwrap(), "proj_keep");
     assert!(upstream.get("x-session-id").is_none());
     assert!(upstream.get("x-opencode-session").is_none());
+}
+
+#[test]
+fn stored_platform_prices_do_not_price_new_log_rows() {
+    let (dir, state) = test_state("frozen");
+    let account = custom_account(&state);
+    persist_custom(&state, &account);
+    link_with_snapshot(
+        &state,
+        pinned_group(),
+        snapshot(vec![billable_price()], false),
+    );
+    let (pricing, context) = bind_for(&state, &account, UPSTREAM);
+    let metrics = pricing_metrics(&pricing, "ignored-alias", 10, 5, 0, 0, None);
+    assert_eq!(metrics.cost_state, "unknown");
+    assert_usd_and_quota_null(&metrics);
+    assert_eq!(metrics.pricing_revision_id, None);
+
+    let id = persist_unpriced_row(&state, &account, &pricing, &context, 10, 5, 0, 0);
+    let log = state.db.lock().list_forward_logs(1).unwrap().remove(0);
+    assert_eq!(log.cost_state, "unknown");
+    assert_eq!(log.raw_cost_usd, None);
+    assert_eq!(log.quota_debit, None);
+    assert_eq!(log.effective_paid_cost_usd, None);
+    assert_eq!(log.cost, None);
+    let native = state
+        .db
+        .lock()
+        .forward_log_native_attribution(id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(native.native_cost_value, None);
+    assert_eq!(native.native_cost_unit, None);
+    assert_eq!(native.native_cost_currency, None);
+    drop(state);
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn stored_cache_rates_do_not_price_new_log_rows() {
+    let (dir, state) = test_state("cache-known");
+    let account = custom_account(&state);
+    persist_custom(&state, &account);
+    link_with_snapshot(
+        &state,
+        pinned_group(),
+        snapshot(vec![billable_price()], false),
+    );
+    let (pricing, context) = bind_for(&state, &account, UPSTREAM);
+    let id = persist_unpriced_row(&state, &account, &pricing, &context, 10, 2, 4, 1);
+    let native = state
+        .db
+        .lock()
+        .forward_log_native_attribution(id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(native.native_cost_value, None);
+    drop(state);
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn cache_tokens_without_known_rate_stay_unknown_and_do_not_use_input() {
+    let (dir, state) = test_state("cache-unknown");
+    let account = custom_account(&state);
+    persist_custom(&state, &account);
+    let mut price = billable_price();
+    price.cache_read = None;
+    price.cache_write = None;
+    link_with_snapshot(&state, pinned_group(), snapshot(vec![price], false));
+    let (pricing, context) = bind_for(&state, &account, UPSTREAM);
+    let metrics = pricing_metrics(&pricing, UPSTREAM, 10, 2, 4, 0, None);
+    assert_eq!(metrics.cost_state, "unknown");
+    assert_usd_and_quota_null(&metrics);
+    let id = persist_unpriced_row(&state, &account, &pricing, &context, 10, 2, 4, 0);
+    let native = state
+        .db
+        .lock()
+        .forward_log_native_attribution(id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(native.native_cost_value, None);
+    drop(state);
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn auto_group_stale_expired_incomplete_unavailable_and_official_are_unknown() {
+    let cases: &[(&str, PlatformGroup, PlatformSnapshot)] = &[
+        (
+            "auto",
+            PlatformGroup {
+                subscription_type: None,
+                id: None,
+                auto_groups: vec!["a".into()],
+                ..PlatformGroup::default()
+            },
+            snapshot(vec![billable_price()], false),
+        ),
+        (
+            "stale",
+            pinned_group(),
+            snapshot(vec![billable_price()], true),
+        ),
+    ];
+    for (label, group, snap) in cases {
+        let (dir, state) = test_state(label);
+        let account = custom_account(&state);
+        persist_custom(&state, &account);
+        link_with_snapshot(&state, group.clone(), snap.clone());
+        let (pricing, context) = bind_for(&state, &account, UPSTREAM);
+        let metrics = pricing_metrics(&pricing, UPSTREAM, 10, 5, 0, 0, None);
+        assert_eq!(metrics.cost_state, "unknown", "{label}");
+        assert_usd_and_quota_null(&metrics);
+        let id = persist_unpriced_row(&state, &account, &pricing, &context, 10, 5, 0, 0);
+        let native = state
+            .db
+            .lock()
+            .forward_log_native_attribution(id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(native.native_cost_value, None, "{label}");
+        drop(state);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    let mut expired = billable_price();
+    expired.valid_until = Utc::now().timestamp() - 10;
+    let mut incomplete = billable_price();
+    incomplete.output = None;
+    let mut unavailable = billable_price();
+    unavailable.unavailable_reason = Some("quota".into());
+    let mut official = billable_price();
+    official.official_reference = true;
+    let mut other_model = billable_price();
+    other_model.model = "other".into();
+    let mut other_group = billable_price();
+    other_group.group_id = Some("other".into());
+
+    for (label, price) in [
+        ("expired", expired),
+        ("incomplete", incomplete),
+        ("unavailable", unavailable),
+        ("official", official),
+        ("model-mismatch", other_model),
+        ("group-mismatch", other_group),
+    ] {
+        let (dir, state) = test_state(label);
+        let account = custom_account(&state);
+        persist_custom(&state, &account);
+        link_with_snapshot(&state, pinned_group(), snapshot(vec![price], false));
+        let (pricing, context) = bind_for(&state, &account, UPSTREAM);
+        if label == "expired" {
+            let metrics = pricing_metrics(&pricing, UPSTREAM, 10, 5, 0, 0, None);
+            assert_eq!(metrics.cost_state, "unknown", "{label} estimate");
+            assert_usd_and_quota_null(&metrics);
+        }
+        let id = persist_unpriced_row(&state, &account, &pricing, &context, 10, 5, 0, 0);
+        let native = state
+            .db
+            .lock()
+            .forward_log_native_attribution(id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(native.native_cost_value, None, "{label}");
+        let log = state.db.lock().list_forward_logs(1).unwrap().remove(0);
+        assert_eq!(log.cost_state, "unknown", "{label}");
+        assert_eq!(log.raw_cost_usd, None, "{label}");
+        drop(state);
+        let _ = fs::remove_dir_all(dir);
+    }
+}
+
+#[test]
+fn linked_unknown_does_not_inherit_go_provider_prices() {
+    let (dir, state) = test_state("no-go-fallback");
+    let account = custom_account(&state);
+    persist_custom(&state, &account);
+    let mut official = billable_price();
+    official.official_reference = true;
+    link_with_snapshot(&state, pinned_group(), snapshot(vec![official], false));
+    let (pricing, _) = bind_for(&state, &account, UPSTREAM);
+    assert!(matches!(pricing, RequestPricingSnapshot::Unpriced));
+    let metrics = pricing_metrics(&pricing, "gpt-5", 1_000_000, 1_000_000, 0, 0, None);
+    assert_eq!(metrics.cost_state, "unknown");
+    assert_usd_and_quota_null(&metrics);
+    drop(state);
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn stream_finalization_keeps_cost_unknown_after_snapshot_refresh() {
+    let (dir, state) = test_state("stream-retain");
+    let account = custom_account(&state);
+    persist_custom(&state, &account);
+    link_with_snapshot(
+        &state,
+        pinned_group(),
+        snapshot(vec![billable_price()], false),
+    );
+    let (pricing, context) = bind_for(&state, &account, UPSTREAM);
+    let id = {
+        let db = state.db.lock();
+        DbAttemptSink::new(&db)
+            .insert(
+                &(&account).into(),
+                UPSTREAM,
+                "streaming",
+                Some(200),
+                metadata_metrics(&pricing, None, "not_applicable"),
+                None,
+                &context,
+                None,
+            )
+            .unwrap()
+    };
+    let preliminary = state
+        .db
+        .lock()
+        .forward_log_native_attribution(id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(preliminary.native_cost_value, None);
+
+    let mut later = billable_price();
+    later.input = Some(9.0);
+    later.output = Some(9.0);
+    let token = state
+        .db
+        .lock()
+        .platform_refresh_token(PARENT, Some(ACCOUNT))
+        .unwrap();
+    assert!(
+        state
+            .db
+            .lock()
+            .save_platform_refresh(PARENT, Some(ACCOUNT), &token, &snapshot(vec![later], false),)
+            .unwrap()
+    );
+
+    let metrics = pricing_metrics(&pricing, UPSTREAM, 10, 5, 0, 0, None);
+    DbAttemptSink::new(&state.db.lock())
+        .finalize(
+            id,
+            success_status_for_cost(metrics.cost_state),
+            Some(200),
+            metrics,
+            None,
+            None,
+            &context,
+        )
+        .unwrap();
+    let native = state
+        .db
+        .lock()
+        .forward_log_native_attribution(id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(native.native_cost_value, None);
+    let log = state.db.lock().list_forward_logs(1).unwrap().remove(0);
+    assert_eq!(log.raw_cost_usd, None);
+    assert_eq!(log.quota_debit, None);
+    drop(state);
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn fallback_attempts_stay_unpriced_after_snapshot_refresh() {
+    let (dir, state) = test_state("fallback-rebind");
+    let account = custom_account(&state);
+    persist_custom(&state, &account);
+    link_with_snapshot(
+        &state,
+        pinned_group(),
+        snapshot(vec![billable_price()], false),
+    );
+    let (first, first_ctx) = bind_for(&state, &account, UPSTREAM);
+    let first_id = persist_unpriced_row(&state, &account, &first, &first_ctx, 10, 0, 0, 0);
+
+    let mut next = billable_price();
+    next.input = Some(0.05);
+    next.output = Some(0.05);
+    let token = state
+        .db
+        .lock()
+        .platform_refresh_token(PARENT, Some(ACCOUNT))
+        .unwrap();
+    assert!(
+        state
+            .db
+            .lock()
+            .save_platform_refresh(PARENT, Some(ACCOUNT), &token, &snapshot(vec![next], false))
+            .unwrap()
+    );
+
+    let (second, second_ctx) = bind_for(&state, &account, UPSTREAM);
+    let second_id = persist_unpriced_row(&state, &account, &second, &second_ctx, 10, 0, 0, 0);
+    let first_native = state
+        .db
+        .lock()
+        .forward_log_native_attribution(first_id)
+        .unwrap()
+        .unwrap();
+    let second_native = state
+        .db
+        .lock()
+        .forward_log_native_attribution(second_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(first_native.native_cost_value, None);
+    assert_eq!(second_native.native_cost_value, None);
+    drop(state);
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn fallback_between_linked_accounts_keeps_both_attempts_unpriced() {
+    let (dir, state) = test_state("o05-ab");
+    let mut account_a = custom_account(&state);
+    account_a.id = "custom-a".into();
+    account_a.name = "A".into();
+    persist_custom(&state, &account_a);
+
+    let mut account_b = custom_account(&state);
+    account_b.id = "custom-b".into();
+    account_b.name = "B".into();
+    account_b.key_cipher = state.encrypt_key("sk-custom-b").unwrap();
+    persist_custom(&state, &account_b);
+
+    {
+        let db = state.db.lock();
+        db.create_platform_account(
+            "parent-a",
+            PlatformKind::NewApi,
+            "Parent A",
+            "https://api.example.com",
+            None,
+        )
+        .unwrap();
+        db.create_platform_account(
+            "parent-b",
+            PlatformKind::NewApi,
+            "Parent B",
+            "https://api.example.com",
+            None,
+        )
+        .unwrap();
+        db.link_platform_account("custom-a", "parent-a", &pinned_group())
+            .unwrap();
+        db.link_platform_account("custom-b", "parent-b", &pinned_group())
+            .unwrap();
+        let token_a = db
+            .platform_refresh_token("parent-a", Some("custom-a"))
+            .unwrap();
+        let mut price_a = billable_price();
+        price_a.currency = "CNY".into();
+        price_a.input = Some(0.002);
+        price_a.output = Some(0.008);
+        assert!(
+            db.save_platform_refresh(
+                "parent-a",
+                Some("custom-a"),
+                &token_a,
+                &snapshot(vec![price_a], false)
+            )
+            .unwrap()
+        );
+        let token_b = db
+            .platform_refresh_token("parent-b", Some("custom-b"))
+            .unwrap();
+        let mut price_b = billable_price();
+        price_b.currency = "USD".into();
+        price_b.input = Some(0.01);
+        price_b.output = Some(0.03);
+        assert!(
+            db.save_platform_refresh(
+                "parent-b",
+                Some("custom-b"),
+                &token_b,
+                &snapshot(vec![price_b], false)
+            )
+            .unwrap()
+        );
+    }
+
+    let (pricing_a, mut ctx_a) = bind_for(&state, &account_a, UPSTREAM);
+    ctx_a.route_account_id = Some("custom-a".into());
+    ctx_a.credential_account_id = Some("custom-a".into());
+    let (pricing_b, mut ctx_b) = bind_for(&state, &account_b, UPSTREAM);
+    ctx_b.route_account_id = Some("custom-b".into());
+    ctx_b.credential_account_id = Some("custom-b".into());
+
+    let id_a = persist_unpriced_row(&state, &account_a, &pricing_a, &ctx_a, 10, 5, 0, 0);
+    let id_b = persist_unpriced_row(&state, &account_b, &pricing_b, &ctx_b, 10, 5, 0, 0);
+    let native_a = state
+        .db
+        .lock()
+        .forward_log_native_attribution(id_a)
+        .unwrap()
+        .unwrap();
+    let native_b = state
+        .db
+        .lock()
+        .forward_log_native_attribution(id_b)
+        .unwrap()
+        .unwrap();
+    assert_eq!(native_a.native_cost_value, None);
+    assert_eq!(native_a.native_cost_currency, None);
+    assert_eq!(native_a.native_cost_unit, None);
+    assert_eq!(native_b.native_cost_value, None);
+    assert_eq!(native_b.native_cost_currency, None);
+    assert_eq!(native_b.native_cost_unit, None);
+    drop(state);
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn s02_secret_bearing_headers_are_detected() {
+    let mut secret = reqwest::header::HeaderMap::new();
+    secret.insert(
+        reqwest::header::AUTHORIZATION,
+        reqwest::header::HeaderValue::from_static("Bearer sk-secret"),
+    );
+    assert!(headers_carry_upstream_secret(&secret));
+    assert!(!crate::custom_http::follows_redirects_with_secret(
+        true,
+        headers_carry_upstream_secret(&secret)
+    ));
+    assert!(!headers_carry_upstream_secret(
+        &reqwest::header::HeaderMap::new()
+    ));
+}
+
+#[test]
+fn s01_forward_grant_allows_sealed_goat_origin() {
+    assert!(
+        crate::custom_http::ensure_sealed_secret_origin(
+            "https://api.commandcode.ai/provider/v1/chat/completions",
+            crate::provider::COMMAND_CODE_GOAT_BASE_URL,
+        )
+        .is_ok()
+    );
+}
+
+#[tokio::test]
+async fn p09_forward_attempt_emits_carried_legacy_tool_compat() {
+    use crate::gateway::diagnostics::{RequestTrace, take_legacy_tool_compat_emissions};
+    use crate::gateway::protocol::{
+        CustomRouteSpec, LEGACY_TOOL_COMPAT_PROFILE, LEGACY_TOOL_COMPAT_VERSION, MaterializeSpec,
+        materialize_parsed_request, parse_client_request,
+    };
+    use crate::http_client::RouteLabel;
+    use crate::kernel::protocol::ApiFormat;
+    use crate::models::UpstreamChannel;
+    use axum::http::HeaderMap;
+    use bytes::Bytes;
+    use serde_json::{Value, json};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let _ = take_legacy_tool_compat_emissions();
+
+    let hits = Arc::new(AtomicUsize::new(0));
+    let app = axum::Router::new()
+        .fallback(axum::routing::any(p09_count_ok))
+        .with_state(hits.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app)
+            .with_graceful_shutdown(async {
+                let _ = stop_rx.await;
+            })
+            .await;
+    });
+    let endpoint_url = format!("http://{addr}/v1/chat/completions");
+
+    let (dir, state) = test_state("p09-legacy-compat");
+    let mut config = state.config();
+    config.proxy_mode = ProxyMode::Direct;
+    state.set_config(config.clone()).unwrap();
+
+    let account = custom_account(&state);
+    persist_custom_at(&state, &account, &endpoint_url);
+    grant_binding(
+        &state,
+        &account.id,
+        &[RouteSpec {
+            operation: EndpointOperation::ChatCreate,
+            url: Some(endpoint_url.clone()),
+        }],
+        LegacyConnectionKind::CustomAccount,
+        &account.id,
+    );
+
+    let secret = "sk-p09-must-not-leak";
+    let client_body = json!({
+        "model": "local-custom",
+        "store": false,
+        "input": format!("secret {secret}"),
+        "tools": [
+            {"type": "function", "name": "local", "parameters": {"type": "object"}},
+            {"type": "web_search"}
+        ],
+        "tool_choice": "auto"
+    });
+    let client_bytes = Bytes::from(serde_json::to_vec(&client_body).unwrap());
+    let parsed = parse_client_request(ApiFormat::Responses, client_bytes.clone()).unwrap();
+    let plan = materialize_parsed_request(
+        &parsed,
+        &MaterializeSpec {
+            client_model: "local-custom".into(),
+            upstream_model: "local-custom".into(),
+            resolved_alias: None,
+            channel: UpstreamChannel::Go,
+            upstream_base_override: None,
+            original_model: None,
+            forced_upstream: Some(ApiFormat::ChatCompletions),
+            effort_aliases: &[],
+            custom_route: Some(CustomRouteSpec {
+                endpoint_url: endpoint_url.clone(),
+                auth_kind: ocg_domain::dynamic::DynamicAuthKind::Bearer,
+            }),
+        },
+    )
+    .expect("legacy_compat conversion must produce a request plan");
+    let carried = plan
+        .legacy_tool_compat
+        .as_ref()
+        .expect("materialize must carry the converter marker to the forward consumer");
+    assert_eq!(carried.profile, LEGACY_TOOL_COMPAT_PROFILE);
+    assert_eq!(carried.version, LEGACY_TOOL_COMPAT_VERSION);
+    assert_eq!(carried.dropped_hosted_tools, vec!["web_search".to_string()]);
+
+    let trace = RequestTrace::new();
+    let request_id = trace.request_id.clone();
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let selection = live_send_selection(&state, &account, &plan);
+    let result = forward_request(
+        &client,
+        RouteLabel::Direct,
+        &state,
+        &account,
+        ProviderAdapterKind::ConfigurableHttp,
+        &config,
+        &plan,
+        &trace,
+        &client_bytes,
+        1,
+        false,
+        HeaderMap::new(),
+        state.pricing_snapshot(),
+        None,
+        &[],
+        &selection,
+    )
+    .await
+    .expect("local custom forward should complete");
+    assert_eq!(hits.load(Ordering::SeqCst), 1, "{:?}", result.error_message);
+
+    let emissions = take_legacy_tool_compat_emissions();
+    assert_eq!(
+        emissions.len(),
+        1,
+        "forward attempt must emit the carried marker"
+    );
+    let payload = &emissions[0];
+    assert_eq!(payload["request_id"], request_id);
+    assert_eq!(payload["profile"], LEGACY_TOOL_COMPAT_PROFILE);
+    assert_eq!(payload["version"], LEGACY_TOOL_COMPAT_VERSION);
+    assert_eq!(payload["dropped_hosted_tools"], json!(["web_search"]));
+    let encoded = payload.to_string();
+    assert!(!encoded.contains(secret), "{encoded}");
+    assert!(!encoded.contains("local-custom"), "{encoded}");
+    let body: Value = serde_json::from_slice(&plan.body).unwrap();
+    assert!(!encoded.contains(&body.to_string()), "{encoded}");
+
+    let _ = stop_tx.send(());
+    drop(state);
+    let _ = fs::remove_dir_all(dir);
+}
+
+async fn p09_count_ok(
+    axum::extract::State(hits): axum::extract::State<
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    >,
+) -> impl axum::response::IntoResponse {
+    hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    (
+        axum::http::StatusCode::OK,
+        [("content-type", "application/json")],
+        r#"{"id":"ok","object":"chat.completion","model":"local-custom","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}"#,
+    )
+}
+
+fn live_send_selection(
+    state: &CoreState,
+    account: &Account,
+    plan: &crate::gateway::protocol::RequestPlan,
+) -> crate::gateway::forwarder::LiveSendSelection {
+    let snapshot = crate::routing_snapshot::RoutingSnapshot::load(&state.db.lock()).unwrap();
+    let credential = snapshot
+        .credentials
+        .iter()
+        .find(|c| c.id == account.id)
+        .unwrap()
+        .clone();
+    let destination = snapshot
+        .projection
+        .destinations
+        .iter()
+        .find(|d| d.id == credential.destination_id)
+        .unwrap()
+        .clone();
+    let model = destination
+        .catalog
+        .iter()
+        .find(|m| m.upstream_model == plan.model)
+        .unwrap_or_else(|| panic!("missing fixture model {}", plan.model))
+        .clone();
+    let plan = frozen_test_plan(plan, &destination, &model);
+    let spec = crate::gateway::provider_adapter::resolve_execution_route(
+        &credential,
+        &destination,
+        &state.config(),
+        &plan,
+    )
+    .unwrap();
+    let target = crate::gateway::materialize::FrozenTarget {
+        endpoint_id: crate::gateway::materialize::endpoint_id_for_target(
+            &credential,
+            &destination,
+            &model,
+            plan.upstream,
+        )
+        .unwrap(),
+        destination,
+        model,
+    };
+    let route = crate::gateway::materialize::ExecutionRoute {
+        routing: crate::routing_runtime::RoutingCandidate {
+            account: credential,
+            adapter: crate::routing_runtime::adapter_for_account(account, None),
+            channel: plan.channel,
+            resolved_model: plan.model.clone(),
+        },
+        plan: plan.clone(),
+        spec,
+        target,
+    };
+    crate::gateway::forwarder::LiveSendSelection::from_execution(
+        &route,
+        &plan.client_model,
+        &plan.model,
+    )
+}
+
+fn persist_custom_at(state: &CoreState, account: &Account, endpoint_url: &str) {
+    state
+        .db
+        .lock()
+        .create_account_with_contract(
+            account,
+            Some(&AccountCustomConfigInput {
+                endpoint_url: endpoint_url.into(),
+                upstream_protocol: UpstreamProtocolKind::ChatCompletions,
+            }),
+            &[AccountModelCapabilityInput {
+                public_model: "local-custom".into(),
+                upstream_model: "local-custom".into(),
+                protocol: UpstreamProtocolKind::ChatCompletions,
+                source: None,
+            }],
+        )
+        .unwrap();
+}
+
+async fn spawn_hit_counter() -> (
+    std::net::SocketAddr,
+    Arc<AtomicUsize>,
+    tokio::sync::oneshot::Sender<()>,
+) {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let app = axum::Router::new()
+        .fallback(axum::routing::any(p09_count_ok))
+        .with_state(hits.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app)
+            .with_graceful_shutdown(async {
+                let _ = stop_rx.await;
+            })
+            .await;
+    });
+    (addr, hits, stop_tx)
+}
+
+fn chat_plan(model: &str, custom_endpoint: Option<&str>) -> RequestPlan {
+    RequestPlan {
+        client: ApiFormat::ChatCompletions,
+        upstream: ApiFormat::ChatCompletions,
+        model: model.into(),
+        client_model: model.into(),
+        stream: false,
+        body: Bytes::from(
+            serde_json::to_vec(&json!({
+                "model": model,
+                "messages": [{"role": "user", "content": "hi"}]
+            }))
+            .unwrap(),
+        ),
+        channel: UpstreamChannel::Go,
+        upstream_base_override: None,
+        original_model: None,
+        resolved_alias: Some(model.into()),
+        custom_route: custom_endpoint.map(|endpoint_url| CustomRouteSpec {
+            endpoint_url: endpoint_url.to_string(),
+            auth_kind: ocg_domain::dynamic::DynamicAuthKind::Bearer,
+        }),
+        replay_domain: None,
+        service_tier: None,
+        custom_tools: Vec::new(),
+        namespace_tools: Vec::new(),
+        legacy_tool_compat: None,
+        response_parallel_tool_calls: true,
+        response_tool_choice: json!("auto"),
+        response_tools: Vec::new(),
+    }
+}
+
+fn grant_binding(
+    state: &CoreState,
+    account_id: &str,
+    routes: &[RouteSpec],
+    connection_kind: LegacyConnectionKind,
+    legacy_id: &str,
+) {
+    let assigned = assigned_endpoints_for_routes(
+        &connection_id_for_legacy(connection_kind, legacy_id),
+        routes,
+    );
+    let ids: Vec<String> = assigned
+        .iter()
+        .map(|endpoint| endpoint.id.clone())
+        .collect();
+    let origins: Vec<String> = assigned
+        .iter()
+        .filter_map(|endpoint| endpoint.url.as_deref().and_then(normalize_origin))
+        .collect();
+    let db = state.db.lock();
+    let binding = db
+        .list_inference_bindings()
+        .unwrap()
+        .into_iter()
+        .find(|row| row.account_id == account_id)
+        .expect("stored binding");
+    db.update_credential_binding(
+        &binding.binding_id,
+        None,
+        None,
+        Some(ids.as_slice()),
+        Some(origins.as_slice()),
+    )
+    .unwrap();
+}
+
+fn assert_no_secret_leak(text: &str, secrets: &[&str]) {
+    for secret in secrets {
+        assert!(!text.contains(secret), "error leaked secret material");
+    }
+}
+
+async fn forward_once(
+    state: &CoreState,
+    account: &Account,
+    plan: &RequestPlan,
+    selection: &crate::gateway::forwarder::LiveSendSelection,
+    dynamics: &[crate::dynamic::DynamicProviderRuntime],
+) -> crate::gateway::forwarder::ForwardResult {
+    let config = state.config();
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    forward_request(
+        &client,
+        RouteLabel::Direct,
+        state,
+        account,
+        crate::routing_runtime::adapter_for_account(account, None),
+        &config,
+        plan,
+        &RequestTrace::new(),
+        &plan.body,
+        1,
+        true,
+        axum::http::HeaderMap::new(),
+        state.pricing_snapshot(),
+        None,
+        dynamics,
+        selection,
+    )
+    .await
+    .expect("forward should complete locally")
+}
+
+#[tokio::test]
+async fn r06_granted_same_origin_custom_sends_once() {
+    let (addr, hits, stop_tx) = spawn_hit_counter().await;
+    let endpoint = format!("http://{addr}/v1/chat/completions");
+    let (dir, state) = test_state("r06-granted-same");
+    let mut config = state.config();
+    config.proxy_mode = ProxyMode::Direct;
+    state.set_config(config).unwrap();
+    let account = custom_account(&state);
+    persist_custom_at(&state, &account, &endpoint);
+    grant_binding(
+        &state,
+        &account.id,
+        &[RouteSpec {
+            operation: EndpointOperation::ChatCreate,
+            url: Some(endpoint.clone()),
+        }],
+        LegacyConnectionKind::CustomAccount,
+        &account.id,
+    );
+    let plan = chat_plan("local-custom", Some(&endpoint));
+    let selection = live_send_selection(&state, &account, &plan);
+    let result = forward_once(&state, &account, &plan, &selection, &[]).await;
+    assert_eq!(hits.load(Ordering::SeqCst), 1, "{:?}", result.error_message);
+    let _ = stop_tx.send(());
+    drop(state);
+    let _ = fs::remove_dir_all(dir);
+}
+
+/// Pre-send confirmation with no quota trial pending re-authorizes against live
+/// rows only, so it must not wait for the global `settings_update` gate. The
+/// gate is a writer lock; ordinary traffic may not queue behind dashboard
+/// writes.
+#[test]
+fn confirm_execution_send_authorizes_while_the_settings_gate_is_held() {
+    let (dir, state) = test_state("confirm-fast-path");
+    let endpoint = "https://example.test/v1/chat/completions";
+    let mut config = state.config();
+    config.proxy_mode = ProxyMode::Direct;
+    state.set_config(config).unwrap();
+    let account = custom_account(&state);
+    persist_custom_at(&state, &account, endpoint);
+    grant_binding(
+        &state,
+        &account.id,
+        &[RouteSpec {
+            operation: EndpointOperation::ChatCreate,
+            url: Some(endpoint.into()),
+        }],
+        LegacyConnectionKind::CustomAccount,
+        &account.id,
+    );
+    let plan = chat_plan("local-custom", Some(endpoint));
+    let selection = live_send_selection(&state, &account, &plan);
+    let spec = selection
+        .attempt_spec
+        .clone()
+        .expect("a routed fixture must carry the attempt spec it was built from");
+
+    let worker_state = Arc::clone(&state);
+    let (tx, rx) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        // Hold the control-plane gate on this thread, then confirm the send.
+        // An implementation that acquires `settings_update` before deciding
+        // whether a quota trial is needed self-deadlocks here, because
+        // `settings_update` is not reentrant. The receive timeout below turns
+        // that regression into an ordinary failure instead of a hung suite.
+        let _gate = worker_state.settings_update.lock();
+        let outcome = super::live_send::confirm_execution_send(&worker_state, &selection, &spec);
+        let _ = tx.send(outcome.map(|episode| episode.is_some()));
+    });
+
+    match rx.recv_timeout(StdDuration::from_secs(10)) {
+        Ok(Ok(trial_started)) => {
+            worker
+                .join()
+                .expect("the confirmation thread should finish");
+            assert!(
+                !trial_started,
+                "no quota recovery is pending, so confirmation must not start a trial"
+            );
+        }
+        Ok(Err(error)) => panic!("an unchanged routed selection must still authorize: {error:?}"),
+        // Deliberately not joining: a regression leaves that thread blocked on
+        // the gate forever, and joining it would hang the suite instead.
+        Err(_) => panic!(
+            "confirm_execution_send blocked on settings_update: the no-trial fast path must not take the gate"
+        ),
+    }
+
+    drop(state);
+    let _ = fs::remove_dir_all(dir);
+}
+
+/// The `next_retry_at` one published generation carries for a credential.
+fn published_retry_at(
+    aggregate: &crate::state::GatewayPreparationSnapshot,
+    account_id: &str,
+) -> chrono::DateTime<chrono::Utc> {
+    aggregate
+        .routing()
+        .credentials
+        .iter()
+        .find(|credential| credential.id == account_id)
+        .expect("the fixture credential should be in the published routing rows")
+        .quota_recovery
+        .as_ref()
+        .expect("the fixture starts in quota recovery")
+        .next_retry_at
+}
+
+/// A confirmed quota-trial send mutates routing state (`quota_recovery_json`),
+/// advances the revision, and republishes — and that publish belongs to the
+/// production entry, not to a test standing in for it. Stamping the aggregate
+/// before the bump would leave it one revision behind, so every later request
+/// would pay a gated drift rebuild for a trial the send path already had in hand.
+///
+/// The teeth are the gate. `confirm_execution_send` publishes before it
+/// returns, so the very next read is already current and completes on the fast
+/// path while another thread holds `settings_update`. Delete the republish from
+/// the `QuotaAcquire::Trial` arm — revision bumped, nothing published — and the
+/// same read blocks on the gate, which the timeout below turns into a failure
+/// instead of a hung suite.
+#[test]
+fn a_confirmed_trial_send_publishes_the_preparation_aggregate() {
+    let endpoint = "https://example.test/v1/chat/completions";
+    let (dir, state) = test_state("trial-publish");
+    let mut config = state.config();
+    config.proxy_mode = ProxyMode::Direct;
+    state.set_config(config).unwrap();
+    let account = custom_account(&state);
+    persist_granted_custom(&state, &account, endpoint);
+    seed_due_recovery(&state, &account.id);
+    let plan = chat_plan("local-custom", Some(endpoint));
+    let selection = live_send_selection(&state, &account, &plan);
+    let spec = selection
+        .attempt_spec
+        .clone()
+        .expect("a routed fixture must carry the attempt spec it was built from");
+
+    // The fixture writes its rows directly, which is not a wired writer. Publish
+    // once so the starting aggregate genuinely carries the due recovery.
+    {
+        let _settings_update = state.settings_update.lock();
+        let db = state.db.lock();
+        state
+            .publish_gateway_preparation(&db)
+            .expect("the fixture should publish");
+    }
+    let before = state
+        .gateway_preparation()
+        .expect("the aggregate should publish");
+    assert_eq!(before.revision(), state.settings_revision());
+    let ready_at = published_retry_at(&before, &account.id);
+
+    let episode = super::live_send::confirm_execution_send(&state, &selection, &spec)
+        .expect("a due recovery must still authorize the send")
+        .expect("a due recovery must start a trial");
+    assert_eq!(episode.account_id, account.id);
+    assert!(
+        state.settings_revision() > before.revision(),
+        "starting a trial advances the revision"
+    );
+
+    let worker_state = Arc::clone(&state);
+    let (tx, rx) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let _gate = worker_state.settings_update.lock();
+        let aggregate = worker_state
+            .gateway_preparation()
+            .expect("the aggregate should publish");
+        let _ = tx.send(aggregate.revision());
+    });
+    let published_revision = rx
+        .recv_timeout(StdDuration::from_secs(10))
+        // Deliberately not joining on the timeout path: a regression leaves that
+        // thread blocked on the gate forever, and joining it would hang the suite.
+        .unwrap_or_else(|_| {
+            panic!(
+                "a confirmed trial send must publish the preparation aggregate: \
+                 the next read waited for the settings gate over a generation the send path already had"
+            )
+        });
+    worker.join().expect("the reading thread should finish");
+    assert_eq!(
+        published_revision,
+        state.settings_revision(),
+        "the publish must stamp the post-bump revision, or the next reader rebuilds for nothing"
+    );
+
+    let after = state
+        .gateway_preparation()
+        .expect("the aggregate should publish");
+    assert!(
+        Arc::ptr_eq(&after, &state.gateway_preparation().unwrap()),
+        "a send path that published correctly leaves later reads on the fast path"
+    );
+    assert!(
+        published_retry_at(&after, &account.id) > ready_at,
+        "the published rows must carry the trial's crash-safe retry, not the pre-trial generation"
+    );
+
+    drop(state);
+    let _ = fs::remove_dir_all(dir);
+}
+
+/// The `auth_error` a request path writes is an admission gate inside
+/// `RoutingSnapshot`. If that write never invalidates the published preparation
+/// aggregate, a key the upstream just rejected stays selectable — and, because
+/// nothing else on this path advances the revision, it stays selectable for the
+/// life of the process.
+///
+/// This pins the write as the forwarder performs it. Without the revision bump
+/// the aggregate still matches the (unchanged) revision, so the read below
+/// takes the fast path and serves the pre-401 credential.
+#[test]
+fn an_upstream_401_reaches_the_next_preparation_read() {
+    let (dir, state) = test_state("auth-error-invalidation");
+    let account = custom_account(&state);
+    persist_custom_at(&state, &account, "https://example.test/v1/chat/completions");
+
+    // The fixture writes its rows directly, which is not a wired writer. Publish
+    // once so the starting aggregate genuinely contains this credential with no
+    // auth error, rather than merely lacking it.
+    {
+        let _settings_update = state.settings_update.lock();
+        let db = state.db.lock();
+        state
+            .publish_gateway_preparation(&db)
+            .expect("the fixture should publish");
+    }
+
+    let before = state
+        .gateway_preparation()
+        .expect("the aggregate should publish");
+    let credential = before
+        .routing()
+        .credentials
+        .iter()
+        .find(|credential| credential.id == account.id)
+        .expect("the fixture credential should be in the published routing rows");
+    assert_eq!(
+        credential.auth_error, None,
+        "the fixture starts healthy, so a failure below can only come from the write"
+    );
+
+    {
+        let db = state.db.lock();
+        super::record_upstream_auth_error(
+            &state,
+            &db,
+            &account.id,
+            &account.key_cipher,
+            "upstream account error 401: bad key",
+        )
+        .expect("a current-key 401 should record");
+    }
+
+    let after = state
+        .gateway_preparation()
+        .expect("the aggregate should rebuild");
+    let credential = after
+        .routing()
+        .credentials
+        .iter()
+        .find(|credential| credential.id == account.id)
+        .expect("the fixture credential should still be in the published routing rows");
+    assert_eq!(
+        credential.auth_error.as_deref(),
+        Some("upstream account error 401: bad key"),
+        "a key the upstream rejected must leave the routing set, not stay selectable"
+    );
+    assert_eq!(
+        after.revision(),
+        state.settings_revision(),
+        "the rebuild must land on the current revision so later reads stay on the fast path"
+    );
+
+    drop(state);
+    let _ = fs::remove_dir_all(dir);
+}
+
+/// The bump is conditional on the guarded write landing. A late 401 for a key
+/// that has since been rotated writes no row, so it must not invalidate the
+/// aggregate either — otherwise every stale response would hand every later
+/// request a rebuild for a no-op.
+#[test]
+fn a_stale_key_401_leaves_the_preparation_aggregate_alone() {
+    let (dir, state) = test_state("auth-error-stale-key");
+    let account = custom_account(&state);
+    persist_custom_at(&state, &account, "https://example.test/v1/chat/completions");
+    {
+        let _settings_update = state.settings_update.lock();
+        let db = state.db.lock();
+        state
+            .publish_gateway_preparation(&db)
+            .expect("the fixture should publish");
+    }
+
+    let before = state
+        .gateway_preparation()
+        .expect("the aggregate should publish");
+    let revision = state.settings_revision();
+
+    {
+        let db = state.db.lock();
+        super::record_upstream_auth_error(
+            &state,
+            &db,
+            &account.id,
+            "cipher-of-a-key-that-was-already-replaced",
+            "late 401 from the replaced key",
+        )
+        .expect("a stale-key 401 is a no-op, not a failure");
+    }
+
+    assert_eq!(
+        state.settings_revision(),
+        revision,
+        "a write that matched no row must not invalidate the published aggregate"
+    );
+    let after = state
+        .gateway_preparation()
+        .expect("the aggregate should publish");
+    assert!(
+        Arc::ptr_eq(&before, &after),
+        "without a bump there is no drift, so the reader must keep the same generation"
+    );
+    let credential = after
+        .routing()
+        .credentials
+        .iter()
+        .find(|credential| credential.id == account.id)
+        .expect("the fixture credential should be in the published routing rows");
+    assert_eq!(credential.auth_error, None);
+
+    drop(state);
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn r06_shared_custom_second_key_uses_owner_grant_and_model_override() {
+    let (default_addr, default_hits, default_stop) = spawn_hit_counter().await;
+    let (override_addr, override_hits, override_stop) = spawn_hit_counter().await;
+    let default_url = format!("http://{default_addr}/v1/chat/completions");
+    let override_url = format!("http://{override_addr}/v1/chat/completions");
+    let (dir, state) = test_state("r06-shared-custom-override");
+    let mut config = state.config();
+    config.proxy_mode = ProxyMode::Direct;
+    state.set_config(config).unwrap();
+
+    let mut owner = custom_account(&state);
+    owner.id = uuid::Uuid::new_v4().to_string();
+    owner.name = "Owner".into();
+    persist_custom_at(&state, &owner, &default_url);
+    let destination_id = ocg_domain::destination::destination_id_for_custom_account(&owner.id);
+    let mut second = custom_account(&state);
+    second.id = uuid::Uuid::new_v4().to_string();
+    second.name = "Second".into();
+    second.key_cipher = state.encrypt_key("sk-shared-second").unwrap();
+    state
+        .db
+        .lock()
+        .commit_onboarding_existing_account(
+            &second,
+            Some(&destination_id),
+            &crate::db::NewDashboardOperation {
+                operation_id: uuid::Uuid::new_v4().to_string(),
+                kind: "onboarding_commit".into(),
+                payload_digest: "1".repeat(64),
+                result_json: "{}".into(),
+            },
+        )
+        .unwrap();
+    let definition = ocg_domain::dynamic::DynamicProviderDefinition {
+        preset_id: None,
+        id: owner.id.clone(),
+        name: "Shared".into(),
+        endpoint_url: default_url.clone(),
+        upstream_protocol: UpstreamProtocolKind::ChatCompletions,
+        auth_kind: ocg_domain::dynamic::DynamicAuthKind::Bearer,
+        mappings: vec![ocg_domain::dynamic::DynamicModelMapping {
+            public_model: "shared-model".into(),
+            upstream_model: "vendor/shared-model".into(),
+            upstream_override: Some(ocg_domain::dynamic::DynamicModelUpstreamOverride {
+                protocol: UpstreamProtocolKind::ChatCompletions,
+                endpoint_url: override_url.clone(),
+            }),
+        }],
+    };
+    state
+        .db
+        .lock()
+        .replace_custom_destination(
+            &destination_id,
+            &definition,
+            &[ocg_domain::credential::credential_id_for_legacy_account(&second.id).to_string()],
+        )
+        .unwrap();
+
+    let mut plan = chat_plan("vendor/shared-model", Some(&override_url));
+    plan.resolved_alias = Some("shared-model".into());
+    let selection = live_send_selection(&state, &second, &plan);
+    let result = forward_once(&state, &second, &plan, &selection, &[]).await;
+    assert_eq!(
+        override_hits.load(Ordering::SeqCst),
+        1,
+        "{:?}",
+        result.error_message
+    );
+    assert_eq!(default_hits.load(Ordering::SeqCst), 0);
+
+    let _ = default_stop.send(());
+    let _ = override_stop.send(());
+    drop(state);
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn r06_ungranted_and_edited_destination_send_zero_times() {
+    let old_key = "sk-test-old-grant";
+    let (foreign_addr, foreign_hits, foreign_stop) = spawn_hit_counter().await;
+    let (granted_addr, granted_hits, granted_stop) = spawn_hit_counter().await;
+    let granted = format!("http://{granted_addr}/v1/chat/completions");
+    let foreign = format!("http://{foreign_addr}/v1/chat/completions");
+    let (dir, state) = test_state("r06-ungranted-edit");
+    let mut config = state.config();
+    config.proxy_mode = ProxyMode::Direct;
+    state.set_config(config).unwrap();
+    let mut account = custom_account(&state);
+    account.id = "custom-edit".into();
+    account.key_cipher = state.encrypt_key(old_key).unwrap();
+    persist_custom_at(&state, &account, &granted);
+    grant_binding(
+        &state,
+        &account.id,
+        &[RouteSpec {
+            operation: EndpointOperation::ChatCreate,
+            url: Some(granted.clone()),
+        }],
+        LegacyConnectionKind::CustomAccount,
+        &account.id,
+    );
+    let plan = chat_plan("local-custom", Some(&foreign));
+    let selection = live_send_selection(&state, &account, &plan);
+    let result = forward_once(&state, &account, &plan, &selection, &[]).await;
+    assert_eq!(
+        foreign_hits.load(Ordering::SeqCst),
+        0,
+        "{:?}",
+        result.error_message
+    );
+    assert_eq!(granted_hits.load(Ordering::SeqCst), 0);
+    let message = result.error_message.unwrap_or_default();
+    assert!(
+        message.contains("not authorized") || message.contains("refusing"),
+        "{message}"
+    );
+    assert_no_secret_leak(&message, &[old_key]);
+
+    state
+        .db
+        .lock()
+        .upsert_account_custom_config(
+            &account.id,
+            &AccountCustomConfigInput {
+                endpoint_url: foreign.clone(),
+                upstream_protocol: UpstreamProtocolKind::ChatCompletions,
+            },
+        )
+        .unwrap();
+    let edited_plan = chat_plan("local-custom", Some(&foreign));
+    let edited = forward_once(&state, &account, &edited_plan, &selection, &[]).await;
+    assert_eq!(
+        foreign_hits.load(Ordering::SeqCst),
+        0,
+        "{:?}",
+        edited.error_message
+    );
+    assert_no_secret_leak(&edited.error_message.unwrap_or_default(), &[old_key]);
+
+    let _ = foreign_stop.send(());
+    let _ = granted_stop.send(());
+    drop(state);
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn r06_granted_foreign_dynamic_override_sends_and_ungranted_does_not() {
+    let (granted_addr, granted_hits, granted_stop) = spawn_hit_counter().await;
+    let (foreign_addr, foreign_hits, foreign_stop) = spawn_hit_counter().await;
+    let default_url = format!("http://{granted_addr}/v1");
+    let foreign_url = format!("http://{foreign_addr}/v1");
+    let (dir, state) = test_state("r06-foreign-override");
+    let mut config = state.config();
+    config.proxy_mode = ProxyMode::Direct;
+    state.set_config(config).unwrap();
+    let now = Utc::now();
+    let provider_id = uuid::Uuid::new_v4().to_string();
+    let runtime = crate::dynamic::DynamicProviderRuntime {
+        preset_id: None,
+        id: provider_id.clone(),
+        name: "Lab".into(),
+        endpoint_url: default_url.clone(),
+        upstream_protocol: UpstreamProtocolKind::ChatCompletions,
+        auth_kind: ocg_domain::dynamic::DynamicAuthKind::Bearer,
+        mappings: vec![ocg_domain::dynamic::DynamicModelMapping {
+            public_model: "lab".into(),
+            upstream_model: "vendor/lab".into(),
+            upstream_override: Some(ocg_domain::dynamic::DynamicModelUpstreamOverride {
+                protocol: UpstreamProtocolKind::ChatCompletions,
+                endpoint_url: foreign_url.clone(),
+            }),
+        }],
+        created_at: now,
+        updated_at: now,
+        origin: crate::provider::ProviderOrigin::Custom,
+        offering: "api".into(),
+    };
+    let mut account = custom_account(&state);
+    account.id = "dyn-live".into();
+    account.provider_id = provider_id.clone();
+    account.name = "dyn".into();
+    state
+        .db
+        .lock()
+        .create_dynamic_provider(&runtime, &account)
+        .unwrap();
+
+    let plan = chat_plan("vendor/lab", None);
+    let selection = live_send_selection(&state, &account, &plan);
+    let ungranted = forward_once(
+        &state,
+        &account,
+        &plan,
+        &selection,
+        std::slice::from_ref(&runtime),
+    )
+    .await;
+    assert_eq!(
+        foreign_hits.load(Ordering::SeqCst),
+        0,
+        "{:?}",
+        ungranted.error_message
+    );
+    assert_eq!(granted_hits.load(Ordering::SeqCst), 0);
+
+    grant_binding(
+        &state,
+        &account.id,
+        &[
+            RouteSpec {
+                operation: EndpointOperation::ChatCreate,
+                url: Some(default_url.clone()),
+            },
+            RouteSpec {
+                operation: EndpointOperation::ChatCreate,
+                url: Some(foreign_url.clone()),
+            },
+        ],
+        LegacyConnectionKind::DynamicProvider,
+        &provider_id,
+    );
+    let granted = forward_once(
+        &state,
+        &account,
+        &plan,
+        &selection,
+        std::slice::from_ref(&runtime),
+    )
+    .await;
+    assert_eq!(
+        foreign_hits.load(Ordering::SeqCst),
+        1,
+        "{:?}",
+        granted.error_message
+    );
+    assert_eq!(granted_hits.load(Ordering::SeqCst), 0);
+
+    let _ = foreign_stop.send(());
+    let _ = granted_stop.send(());
+    drop(state);
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn r06_selected_then_rotate_disable_or_narrow_does_not_emit_old_key() {
+    let old_key = "sk-test-live-old";
+    let new_key = "sk-test-live-new";
+    let (addr, hits, stop_tx) = spawn_hit_counter().await;
+    let endpoint = format!("http://{addr}/v1/chat/completions");
+    let (dir, state) = test_state("r06-rotate-disable");
+    let mut config = state.config();
+    config.proxy_mode = ProxyMode::Direct;
+    state.set_config(config).unwrap();
+    let mut account = custom_account(&state);
+    account.id = "custom-r06".into();
+    account.key_cipher = state.encrypt_key(old_key).unwrap();
+    persist_custom_at(&state, &account, &endpoint);
+    grant_binding(
+        &state,
+        &account.id,
+        &[RouteSpec {
+            operation: EndpointOperation::ChatCreate,
+            url: Some(endpoint.clone()),
+        }],
+        LegacyConnectionKind::CustomAccount,
+        &account.id,
+    );
+    let plan = chat_plan("local-custom", Some(&endpoint));
+    let selection = live_send_selection(&state, &account, &plan);
+
+    let rotated_cipher = state.encrypt_key(new_key).unwrap();
+    state
+        .db
+        .lock()
+        .rotate_account_credential(&account.id, &rotated_cipher)
+        .unwrap();
+    let rotated = forward_once(&state, &account, &plan, &selection, &[]).await;
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        0,
+        "{:?}",
+        rotated.error_message
+    );
+    assert_no_secret_leak(
+        &rotated.error_message.unwrap_or_default(),
+        &[old_key, new_key],
+    );
+    assert_eq!(
+        state
+            .db
+            .lock()
+            .query_request_logs(&Default::default())
+            .unwrap()
+            .summary
+            .total_attempts,
+        0
+    );
+
+    let live_account = state.db.lock().get_account(&account.id).unwrap().unwrap();
+    let fresh = live_send_selection(&state, &live_account, &plan);
+    let first = forward_once(&state, &live_account, &plan, &fresh, &[]).await;
+    assert_eq!(hits.load(Ordering::SeqCst), 1, "{:?}", first.error_message);
+    assert_eq!(
+        state
+            .db
+            .lock()
+            .query_request_logs(&Default::default())
+            .unwrap()
+            .summary
+            .total_attempts,
+        1
+    );
+
+    let binding_id = state
+        .db
+        .lock()
+        .list_inference_bindings()
+        .unwrap()
+        .into_iter()
+        .find(|row| row.account_id == account.id)
+        .unwrap()
+        .binding_id;
+    state
+        .db
+        .lock()
+        .update_credential_binding(&binding_id, None, Some(false), None, None)
+        .unwrap();
+    let disabled_binding = forward_once(&state, &live_account, &plan, &fresh, &[]).await;
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        1,
+        "{:?}",
+        disabled_binding.error_message
+    );
+    state
+        .db
+        .lock()
+        .update_credential_binding(&binding_id, None, Some(true), None, None)
+        .unwrap();
+    crate::account_control::set_account_enabled(&state, &account.id, false).unwrap();
+    let disabled_row = state.db.lock().get_account(&account.id).unwrap().unwrap();
+    let disabled_account = forward_once(&state, &disabled_row, &plan, &fresh, &[]).await;
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        1,
+        "{:?}",
+        disabled_account.error_message
+    );
+    crate::account_control::set_account_enabled(&state, &account.id, true).unwrap();
+    state
+        .db
+        .lock()
+        .update_credential_binding(
+            &binding_id,
+            Some(&ModelScope::Only {
+                models: vec!["other-model".into()],
+            }),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+    let enabled_row = state.db.lock().get_account(&account.id).unwrap().unwrap();
+    let narrowed = forward_once(&state, &enabled_row, &plan, &fresh, &[]).await;
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        1,
+        "{:?}",
+        narrowed.error_message
+    );
+    assert_no_secret_leak(
+        &narrowed.error_message.unwrap_or_default(),
+        &[old_key, new_key],
+    );
+
+    let _ = stop_tx.send(());
+    drop(state);
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn r06_same_account_retry_repeats_live_checks_after_rotation() {
+    let old_key = "sk-test-retry-old";
+    let new_key = "sk-test-retry-new";
+    let (addr, hits, stop_tx) = spawn_hit_counter().await;
+    let endpoint = format!("http://{addr}/v1/chat/completions");
+    let (dir, state) = test_state("r06-retry");
+    let mut config = state.config();
+    config.proxy_mode = ProxyMode::Direct;
+    state.set_config(config).unwrap();
+    let mut account = custom_account(&state);
+    account.id = "custom-retry".into();
+    account.key_cipher = state.encrypt_key(old_key).unwrap();
+    persist_custom_at(&state, &account, &endpoint);
+    grant_binding(
+        &state,
+        &account.id,
+        &[RouteSpec {
+            operation: EndpointOperation::ChatCreate,
+            url: Some(endpoint.clone()),
+        }],
+        LegacyConnectionKind::CustomAccount,
+        &account.id,
+    );
+    let plan = chat_plan("local-custom", Some(&endpoint));
+    let selection = live_send_selection(&state, &account, &plan);
+    let first = forward_once(&state, &account, &plan, &selection, &[]).await;
+    assert_eq!(hits.load(Ordering::SeqCst), 1, "{:?}", first.error_message);
+
+    let rotated = state.encrypt_key(new_key).unwrap();
+    state
+        .db
+        .lock()
+        .rotate_account_credential(&account.id, &rotated)
+        .unwrap();
+    let second = forward_once(&state, &account, &plan, &selection, &[]).await;
+    assert_eq!(hits.load(Ordering::SeqCst), 1, "{:?}", second.error_message);
+    assert_no_secret_leak(
+        &second.error_message.unwrap_or_default(),
+        &[old_key, new_key],
+    );
+
+    let _ = stop_tx.send(());
+    drop(state);
+    let _ = fs::remove_dir_all(dir);
+}
+
+fn sealed_chat_endpoint_id() -> String {
+    endpoint_id_for(
+        &connection_id_for_legacy(LegacyConnectionKind::BuiltinProvider, OPENCODE_PROVIDER_ID),
+        EndpointOperation::ChatCreate,
+    )
+    .to_string()
+}
+
+fn persist_go_account(state: &CoreState, account: &Account) {
+    let db = state.db.lock();
+    db.create_account(account).unwrap();
+    let now = Utc::now();
+    db.set_contract_catalog(
+        &crate::provider_contracts::ContractScope::provider(OPENCODE_PROVIDER_ID),
+        &["deepseek-v4-flash".into()],
+        Some(now),
+        crate::provider_contracts::CATALOG_SOURCE_OPENCODE_MODELS,
+        crate::provider::OPENCODE_GO_BASE_URL,
+        now,
+    )
+    .unwrap();
+}
+
+fn clear_binding_grants(state: &CoreState, account_id: &str) {
+    let db = state.db.lock();
+    let binding = db
+        .list_inference_bindings()
+        .unwrap()
+        .into_iter()
+        .find(|row| row.account_id == account_id)
+        .expect("stored binding");
+    db.update_credential_binding(&binding.binding_id, None, None, Some(&[]), Some(&[]))
+        .unwrap();
+}
+
+#[tokio::test]
+async fn r06_equivalent_custom_base_and_full_endpoint_sends() {
+    let (addr, hits, stop_tx) = spawn_hit_counter().await;
+    let base = format!("http://{addr}/v1");
+    let (dir, state) = test_state("r06-equivalent-url");
+    let mut config = state.config();
+    config.proxy_mode = ProxyMode::Direct;
+    state.set_config(config).unwrap();
+    let mut account = custom_account(&state);
+    account.id = "custom-equiv".into();
+    persist_custom_at(&state, &account, &base);
+    grant_binding(
+        &state,
+        &account.id,
+        &[RouteSpec {
+            operation: EndpointOperation::ChatCreate,
+            url: Some(base.clone()),
+        }],
+        LegacyConnectionKind::CustomAccount,
+        &account.id,
+    );
+    let plan = chat_plan("local-custom", Some(&base));
+    let selection = live_send_selection(&state, &account, &plan);
+    let result = forward_once(&state, &account, &plan, &selection, &[]).await;
+    assert_eq!(hits.load(Ordering::SeqCst), 1, "{:?}", result.error_message);
+    let _ = stop_tx.send(());
+    drop(state);
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn r06_same_origin_path_edit_does_not_authorize_captured_url() {
+    let (addr, hits, stop_tx) = spawn_hit_counter().await;
+    let original = format!("http://{addr}/v1/chat/completions");
+    let edited = format!("http://{addr}/other/v1/chat/completions");
+    let (dir, state) = test_state("r06-path-edit");
+    let mut config = state.config();
+    config.proxy_mode = ProxyMode::Direct;
+    state.set_config(config).unwrap();
+    let mut account = custom_account(&state);
+    account.id = "custom-path".into();
+    persist_custom_at(&state, &account, &original);
+    grant_binding(
+        &state,
+        &account.id,
+        &[RouteSpec {
+            operation: EndpointOperation::ChatCreate,
+            url: Some(original.clone()),
+        }],
+        LegacyConnectionKind::CustomAccount,
+        &account.id,
+    );
+    let plan = chat_plan("local-custom", Some(&original));
+    let selection = live_send_selection(&state, &account, &plan);
+    state
+        .db
+        .lock()
+        .upsert_account_custom_config(
+            &account.id,
+            &AccountCustomConfigInput {
+                endpoint_url: edited.clone(),
+                upstream_protocol: UpstreamProtocolKind::ChatCompletions,
+            },
+        )
+        .unwrap();
+    grant_binding(
+        &state,
+        &account.id,
+        &[RouteSpec {
+            operation: EndpointOperation::ChatCreate,
+            url: Some(edited),
+        }],
+        LegacyConnectionKind::CustomAccount,
+        &account.id,
+    );
+    let result = forward_once(&state, &account, &plan, &selection, &[]).await;
+    assert_eq!(hits.load(Ordering::SeqCst), 0, "{:?}", result.error_message);
+    let message = result.error_message.unwrap_or_default();
+    assert!(
+        message.contains("not the current granted route") || message.contains("refusing"),
+        "{message}"
+    );
+    let _ = stop_tx.send(());
+    drop(state);
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn r06_cleared_sealed_endpoint_grant_zero_sends_until_restored() {
+    let (addr, hits, stop_tx) = spawn_hit_counter().await;
+    let (dir, state) = test_state("r06-sealed-grant");
+    let mut config = state.config();
+    config.proxy_mode = ProxyMode::Direct;
+    config.upstream_base_url = format!("http://{addr}");
+    state.set_config(config).unwrap();
+    let mut account = custom_account(&state);
+    account.id = "go-sealed".into();
+    account.provider_id = OPENCODE_PROVIDER_ID.into();
+    persist_go_account(&state, &account);
+    clear_binding_grants(&state, &account.id);
+    let plan = chat_plan("deepseek-v4-flash", None);
+    let selection = live_send_selection(&state, &account, &plan);
+    let revoked = forward_once(&state, &account, &plan, &selection, &[]).await;
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        0,
+        "{:?}",
+        revoked.error_message
+    );
+
+    grant_binding(
+        &state,
+        &account.id,
+        &[RouteSpec {
+            operation: EndpointOperation::ChatCreate,
+            url: None,
+        }],
+        LegacyConnectionKind::BuiltinProvider,
+        OPENCODE_PROVIDER_ID,
+    );
+    let restored = forward_once(&state, &account, &plan, &selection, &[]).await;
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        1,
+        "{:?}",
+        restored.error_message
+    );
+    assert_eq!(sealed_chat_endpoint_id().len(), 36);
+
+    let _ = stop_tx.send(());
+    drop(state);
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn r06_persisted_draft_does_not_send_from_captured_configured_snapshot() {
+    let (addr, hits, stop_tx) = spawn_hit_counter().await;
+    let default_url = format!("http://{addr}/v1");
+    let (dir, state) = test_state("r06-draft");
+    let mut config = state.config();
+    config.proxy_mode = ProxyMode::Direct;
+    state.set_config(config).unwrap();
+    let now = Utc::now();
+    let provider_id = uuid::Uuid::new_v4().to_string();
+    let runtime = crate::dynamic::DynamicProviderRuntime {
+        preset_id: None,
+        id: provider_id.clone(),
+        name: "Lab".into(),
+        endpoint_url: default_url.clone(),
+        upstream_protocol: UpstreamProtocolKind::ChatCompletions,
+        auth_kind: ocg_domain::dynamic::DynamicAuthKind::Bearer,
+        mappings: vec![ocg_domain::dynamic::DynamicModelMapping {
+            public_model: "lab".into(),
+            upstream_model: "vendor/lab".into(),
+            upstream_override: None,
+        }],
+        created_at: now,
+        updated_at: now,
+        origin: crate::provider::ProviderOrigin::Custom,
+        offering: "api".into(),
+    };
+    let mut account = custom_account(&state);
+    account.id = "dyn-draft".into();
+    account.provider_id = provider_id.clone();
+    account.name = "dyn".into();
+    state
+        .db
+        .lock()
+        .create_dynamic_provider(&runtime, &account)
+        .unwrap();
+    grant_binding(
+        &state,
+        &account.id,
+        &[RouteSpec {
+            operation: EndpointOperation::ChatCreate,
+            url: Some(default_url.clone()),
+        }],
+        LegacyConnectionKind::DynamicProvider,
+        &provider_id,
+    );
+    let plan = chat_plan("vendor/lab", None);
+    let selection = live_send_selection(&state, &account, &plan);
+    state
+        .db
+        .lock()
+        .commit_onboarding_resume(
+            &runtime,
+            true,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &crate::db::NewDashboardOperation {
+                operation_id: uuid::Uuid::new_v4().to_string(),
+                kind: "onboarding_commit".into(),
+                payload_digest: "0".repeat(64),
+                result_json: "{}".into(),
+            },
+        )
+        .unwrap();
+    let result = forward_once(
+        &state,
+        &account,
+        &plan,
+        &selection,
+        std::slice::from_ref(&runtime),
+    )
+    .await;
+    assert_eq!(hits.load(Ordering::SeqCst), 0, "{:?}", result.error_message);
+
+    let _ = stop_tx.send(());
+    drop(state);
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn official_price_history_survives_unpriced_insert_and_stream_finalization() {
+    use crate::official_api::{OfficialApiKind, pricing};
+    for (kind, model) in [
+        (OfficialApiKind::Deepseek, "deepseek-flash"),
+        (OfficialApiKind::Zhipu, "glm-5.3"),
+    ] {
+        let (dir, state) = test_state("official-api-history");
+        let runtime = crate::official_api::tests::runtime(kind);
+        let mut account = custom_account(&state);
+        account.provider_id = runtime.id.clone();
+        let sheet = pricing::seed(kind);
+        let historical_json = serde_json::to_string(&sheet).unwrap();
+        state.db.lock().conn.execute(
+            "INSERT INTO provider_pricing_snapshots (provider_id,revision,activated_at,document_updated_at,source_url,content_hash,snapshot_json)
+             VALUES (?1,?2,?3,?3,?4,?5,?6)",
+            rusqlite::params![runtime.id, sheet.revision, sheet.observed_at.to_rfc3339(), sheet.source_url,
+                sheet.revision.rsplit(':').next().unwrap(), historical_json],
+        ).unwrap();
+        let plan = chat_plan(model, Some(&runtime.endpoint_url));
+        let price = capture_execution_pricing(
+            &state,
+            &(&account).into(),
+            ProviderAdapterKind::ConfigurableHttp,
+            &plan,
+        );
+        assert!(matches!(price, RequestPricingSnapshot::Unpriced));
+        let metrics = pricing_metrics(&price, model, 1000, 1000, 0, 0, None);
+        assert_usd_and_quota_null(&metrics);
+        assert_eq!(metrics.cost_state, "unknown");
+        let mut context = attempt_context(model);
+        context.provider_id = Some(runtime.id.clone());
+        let id = DbAttemptSink::new(&state.db.lock())
+            .insert(
+                &(&account).into(),
+                model,
+                "streaming",
+                Some(200),
+                metadata_metrics(&price, None, "not_applicable"),
+                None,
+                &context,
+                None,
+            )
+            .unwrap();
+        DbAttemptSink::new(&state.db.lock())
+            .finalize(id, "success", Some(200), metrics, None, None, &context)
+            .unwrap();
+        let db = state.db.lock();
+        let native = db.forward_log_native_attribution(id).unwrap().unwrap();
+        assert_eq!(native.native_cost_value, None);
+        assert_eq!(native.native_cost_currency, None);
+        assert_eq!(native.native_cost_unit, None);
+        let log = db.list_forward_logs(1).unwrap().remove(0);
+        assert_eq!(log.cost_state, "unknown");
+        assert_eq!(log.cost, None);
+        assert_eq!(log.pricing_revision_id, None);
+        assert_eq!(
+            db.latest_provider_pricing_snapshot(&runtime.id)
+                .unwrap()
+                .unwrap()
+                .snapshot_json,
+            historical_json
+        );
+        drop(db);
+        drop(state);
+        let reopened = Database::open(dir.clone()).unwrap();
+        assert_eq!(
+            reopened
+                .latest_provider_pricing_snapshot(&runtime.id)
+                .unwrap()
+                .unwrap()
+                .snapshot_json,
+            historical_json
+        );
+        drop(reopened);
+        let _ = fs::remove_dir_all(dir);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn forward_request(
+    client: &Client,
+    route: RouteLabel,
+    state: &CoreState,
+    account: &Account,
+    adapter: ProviderAdapterKind,
+    config: &AppConfig,
+    plan: &RequestPlan,
+    trace: &RequestTrace,
+    client_body: &[u8],
+    attempt: u32,
+    retry: bool,
+    headers: HeaderMap,
+    _pricing: Arc<PricingSnapshot>,
+    key: Option<&str>,
+    _dynamics: &[crate::dynamic::DynamicProviderRuntime],
+    selection: &LiveSendSelection,
+) -> Result<ForwardResult> {
+    let mut execution = ExecutionCredential::from(account);
+    execution.credential_id = selection.credential_id.clone().unwrap();
+    execution.binding_id = selection.binding_id.clone();
+    execution.credential_version = selection.credential_version;
+    let target = selection.target.as_ref().expect("captured test target");
+    let plan = frozen_test_plan(plan, &target.destination, &target.model);
+    let plan = &plan;
+    let spec = crate::gateway::provider_adapter::resolve_execution_route(
+        &execution,
+        &target.destination,
+        config,
+        plan,
+    )
+    .unwrap();
+    let pricing = capture_execution_pricing(state, &execution, adapter, plan);
+    super::forward_request(
+        client,
+        route,
+        state,
+        &execution,
+        adapter,
+        config,
+        plan,
+        trace,
+        client_body,
+        attempt,
+        retry,
+        headers,
+        pricing,
+        key,
+        &spec,
+        selection,
+    )
+    .await
+}
+
+fn frozen_test_plan(
+    plan: &RequestPlan,
+    destination: &ocg_domain::destination::Destination,
+    model: &ocg_domain::destination::CatalogModel,
+) -> RequestPlan {
+    let mut plan = plan.clone();
+    if destination.adapter == ocg_domain::destination::AdapterKind::Http
+        && plan.custom_route.is_none()
+    {
+        plan.custom_route = Some(CustomRouteSpec {
+            endpoint_url: model
+                .upstream_override
+                .as_ref()
+                .map(|r| r.endpoint_url.clone())
+                .or_else(|| destination.base_url.clone())
+                .unwrap(),
+            auth_kind: match destination.auth_scheme {
+                ocg_domain::destination::AuthScheme::Bearer => {
+                    ocg_domain::dynamic::DynamicAuthKind::Bearer
+                }
+                ocg_domain::destination::AuthScheme::XApiKey => {
+                    ocg_domain::dynamic::DynamicAuthKind::XApiKey
+                }
+                ocg_domain::destination::AuthScheme::ApiKey => {
+                    ocg_domain::dynamic::DynamicAuthKind::ApiKey
+                }
+                ocg_domain::destination::AuthScheme::None => {
+                    ocg_domain::dynamic::DynamicAuthKind::None
+                }
+            },
+        });
+    }
+    plan
+}
+
+fn chat_plan_stream(model: &str, custom_endpoint: Option<&str>) -> RequestPlan {
+    let mut plan = chat_plan(model, custom_endpoint);
+    plan.stream = true;
+    plan
+}
+
+fn quota_json() -> &'static str {
+    r#"{"error":{"code":"insufficient_quota","message":"quota exhausted"}}"#
+}
+
+fn recovery_for(
+    state: &CoreState,
+    account_id: &str,
+) -> Option<crate::quota_recovery::PersistedQuotaRecovery> {
+    let db = state.db.lock();
+    crate::db::quota_recovery::load_for_legacy_on(&db.conn, account_id)
+        .unwrap()
+        .and_then(|(_, _, _, recovery)| recovery)
+}
+
+fn seed_due_recovery(state: &CoreState, account_id: &str) -> crate::quota_recovery::QuotaEpisode {
+    let observed_at = Utc::now() - chrono::Duration::hours(1);
+    let evidence = ocg_gateway::quota::QuotaEvidence {
+        reason: ocg_gateway::quota::QuotaReason::QuotaExhausted,
+        window: ocg_gateway::quota::QuotaWindowKind::Unknown,
+        resets_at_rfc3339: None,
+        resets_in_text: None,
+    };
+    let db = state.db.lock();
+    let (credential_id, version, key_cipher, _) =
+        crate::db::quota_recovery::load_for_legacy_on(&db.conn, account_id)
+            .unwrap()
+            .unwrap();
+    let recovery = crate::quota_recovery::PersistedQuotaRecovery::from_evidence(
+        None,
+        &evidence,
+        observed_at,
+        None,
+    );
+    let episode = crate::quota_recovery::QuotaEpisode {
+        credential_id,
+        account_id: account_id.into(),
+        credential_version: version,
+        epoch: recovery.epoch,
+        key_cipher,
+    };
+    assert!(crate::db::quota_recovery::save_on(&db.conn, &episode, &recovery).unwrap());
+    episode
+}
+
+fn share_quota_pool(state: &CoreState, keep_account_id: &str, join_account_id: &str) {
+    let db = state.db.lock();
+    db.conn
+        .execute(
+            "UPDATE quota_pool_members
+             SET pool_id = (SELECT pool_id FROM quota_pool_members WHERE account_id = ?1)
+             WHERE account_id = ?2",
+            [keep_account_id, join_account_id],
+        )
+        .unwrap();
+}
+
+fn persist_granted_custom(state: &CoreState, account: &Account, endpoint: &str) {
+    persist_custom_at(state, account, endpoint);
+    grant_binding(
+        state,
+        &account.id,
+        &[RouteSpec {
+            operation: EndpointOperation::ChatCreate,
+            url: Some(endpoint.into()),
+        }],
+        LegacyConnectionKind::CustomAccount,
+        &account.id,
+    );
+}
+
+async fn spawn_json_upstream(
+    status: axum::http::StatusCode,
+    body: &'static str,
+    content_type: &'static str,
+    retry_after: Option<&'static str>,
+) -> (
+    std::net::SocketAddr,
+    Arc<AtomicUsize>,
+    tokio::sync::oneshot::Sender<()>,
+) {
+    #[derive(Clone)]
+    struct JsonUpstream {
+        hits: Arc<AtomicUsize>,
+        status: u16,
+        body: &'static str,
+        content_type: &'static str,
+        retry_after: Option<&'static str>,
+    }
+
+    async fn handle(
+        axum::extract::State(cfg): axum::extract::State<JsonUpstream>,
+    ) -> axum::response::Response {
+        cfg.hits.fetch_add(1, Ordering::SeqCst);
+        let mut builder = axum::http::Response::builder()
+            .status(cfg.status)
+            .header("content-type", cfg.content_type);
+        if let Some(retry_after) = cfg.retry_after {
+            builder = builder.header("retry-after", retry_after);
+        }
+        builder.body(axum::body::Body::from(cfg.body)).unwrap()
+    }
+
+    let hits = Arc::new(AtomicUsize::new(0));
+    let app = axum::Router::new()
+        .fallback(axum::routing::any(handle))
+        .with_state(JsonUpstream {
+            hits: hits.clone(),
+            status: status.as_u16(),
+            body,
+            content_type,
+            retry_after,
+        });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app)
+            .with_graceful_shutdown(async {
+                let _ = stop_rx.await;
+            })
+            .await;
+    });
+    (addr, hits, stop_tx)
+}
+
+async fn spawn_sse_upstream(
+    chunks: Vec<(u64, &'static [u8])>,
+) -> (
+    std::net::SocketAddr,
+    Arc<AtomicUsize>,
+    tokio::sync::oneshot::Sender<()>,
+) {
+    spawn_sse_upstream_with(chunks, false).await
+}
+
+async fn spawn_sse_upstream_with(
+    chunks: Vec<(u64, &'static [u8])>,
+    cut_after: bool,
+) -> (
+    std::net::SocketAddr,
+    Arc<AtomicUsize>,
+    tokio::sync::oneshot::Sender<()>,
+) {
+    #[derive(Clone)]
+    struct SseUpstream {
+        hits: Arc<AtomicUsize>,
+        chunks: Arc<Vec<(u64, &'static [u8])>>,
+        cut_after: bool,
+    }
+
+    async fn handle(
+        axum::extract::State(cfg): axum::extract::State<SseUpstream>,
+    ) -> axum::response::Response {
+        cfg.hits.fetch_add(1, Ordering::SeqCst);
+        let chunks = cfg.chunks.clone();
+        let cut_after = cfg.cut_after;
+        let stream = futures_util::stream::unfold(0usize, move |index| {
+            let chunks = chunks.clone();
+            async move {
+                if let Some((delay_ms, bytes)) = chunks.get(index).copied() {
+                    if delay_ms > 0 {
+                        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                    }
+                    return Some((
+                        Ok::<bytes::Bytes, std::io::Error>(bytes::Bytes::from_static(bytes)),
+                        index + 1,
+                    ));
+                }
+                if cut_after && index == chunks.len() {
+                    return Some((
+                        Err(std::io::Error::other("upstream cut the stream")),
+                        index + 1,
+                    ));
+                }
+                None
+            }
+        });
+        axum::http::Response::builder()
+            .status(axum::http::StatusCode::OK)
+            .header("content-type", "text/event-stream")
+            .body(axum::body::Body::from_stream(stream))
+            .unwrap()
+    }
+
+    let hits = Arc::new(AtomicUsize::new(0));
+    let app = axum::Router::new()
+        .fallback(axum::routing::any(handle))
+        .with_state(SseUpstream {
+            hits: hits.clone(),
+            chunks: Arc::new(chunks),
+            cut_after,
+        });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app)
+            .with_graceful_shutdown(async {
+                let _ = stop_rx.await;
+            })
+            .await;
+    });
+    (addr, hits, stop_tx)
+}
+
+async fn drain_forward(
+    result: crate::gateway::forwarder::ForwardResult,
+) -> (ForwardAction, bytes::Bytes) {
+    let action = result.action;
+    let body = axum::body::to_bytes(result.response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    (action, body)
+}
+
+async fn drain_forward_bounded(
+    result: crate::gateway::forwarder::ForwardResult,
+) -> (ForwardAction, bytes::Bytes) {
+    tokio::time::timeout(std::time::Duration::from_secs(5), drain_forward(result))
+        .await
+        .expect("stream finalizer exceeded 5s; DB lock likely held across settle_quota")
+}
+
+fn prepare_custom_forward(
+    label: &str,
+    endpoint: &str,
+) -> (
+    PathBuf,
+    CoreState,
+    Account,
+    RequestPlan,
+    crate::gateway::forwarder::LiveSendSelection,
+) {
+    let (dir, state) = test_state(label);
+    let mut config = state.config();
+    config.proxy_mode = ProxyMode::Direct;
+    state.set_config(config).unwrap();
+    let account = custom_account(&state);
+    persist_granted_custom(&state, &account, endpoint);
+    let plan = chat_plan("local-custom", Some(endpoint));
+    let selection = live_send_selection(&state, &account, &plan);
+    (dir, state, account, plan, selection)
+}
+
+#[test]
+fn split_sse_frames_mark_only_complete_protocol_errors() {
+    let mut state = StreamState::default();
+    let content = b"data: {\"choices\":[{\"delta\":{\"content\":\"insufficient_quota\"}}]}\n\n";
+    process_chunk_for_usage(
+        &mut state,
+        ApiFormat::ChatCompletions,
+        &Bytes::from_static(content),
+        None,
+    );
+    assert!(
+        !state.error,
+        "assistant content quoting quota text is not an error"
+    );
+
+    let full = b"data: {\"error\":{\"code\":\"insufficient_quota\"}}\n\n";
+    let split = 18;
+    process_chunk_for_usage(
+        &mut state,
+        ApiFormat::ChatCompletions,
+        &Bytes::copy_from_slice(&full[..split]),
+        None,
+    );
+    assert!(!state.error, "incomplete frame is not an error");
+    process_chunk_for_usage(
+        &mut state,
+        ApiFormat::ChatCompletions,
+        &Bytes::copy_from_slice(&full[split..]),
+        None,
+    );
+    assert!(
+        state.error,
+        "complete assembled error event must be recognized"
+    );
+}
+
+#[test]
+fn quota_trial_guard_ignores_old_version_on_release() {
+    let (dir, state) = test_state("quota-guard-stale");
+    let account = custom_account(&state);
+    persist_custom_at(
+        &state,
+        &account,
+        "https://api.example.com/v1/chat/completions",
+    );
+    let old = seed_due_recovery(&state, &account.id);
+    let current = recovery_for(&state, &account.id).unwrap();
+    let later = crate::quota_recovery::PersistedQuotaRecovery::from_evidence(
+        Some(&current),
+        &ocg_gateway::quota::QuotaEvidence {
+            reason: ocg_gateway::quota::QuotaReason::QuotaExhausted,
+            window: ocg_gateway::quota::QuotaWindowKind::Unknown,
+            resets_at_rfc3339: None,
+            resets_in_text: None,
+        },
+        Utc::now(),
+        None,
+    );
+    let mut new_lease = old.clone();
+    new_lease.epoch = later.epoch;
+    {
+        let db = state.db.lock();
+        assert!(crate::db::quota_recovery::save_on(&db.conn, &new_lease, &later).unwrap());
+    }
+    state
+        .quota_probes
+        .lock()
+        .insert(new_lease.credential_id.clone(), new_lease.clone());
+
+    let old_version = old.credential_version;
+    let mut stale = QuotaTrialGuard::new(state.clone(), old);
+    stale.succeed();
+    assert_eq!(
+        state.quota_probes.lock().get(&new_lease.credential_id),
+        Some(&new_lease),
+        "old guard must not erase a newer lease"
+    );
+    let kept = recovery_for(&state, &account.id).unwrap();
+    assert_eq!(kept.epoch, new_lease.epoch);
+
+    let mut stale_drop = QuotaTrialGuard::new(
+        state.clone(),
+        crate::quota_recovery::QuotaEpisode {
+            credential_version: old_version.saturating_add(9),
+            ..new_lease.clone()
+        },
+    );
+    stale_drop.fail_nonquota(Utc::now());
+    assert_eq!(
+        state.quota_probes.lock().get(&new_lease.credential_id),
+        Some(&new_lease)
+    );
+    assert_eq!(
+        recovery_for(&state, &account.id).unwrap().epoch,
+        new_lease.epoch
+    );
+
+    drop(state);
+    let _ = fs::remove_dir_all(dir);
+}
+
+fn install_matching_probe(state: &CoreState, episode: &crate::quota_recovery::QuotaEpisode) {
+    state
+        .quota_probes
+        .lock()
+        .insert(episode.credential_id.clone(), episode.clone());
+}
+
+fn snapshot_revision_and_probe(
+    state: &CoreState,
+    episode: &crate::quota_recovery::QuotaEpisode,
+) -> (u64, bool) {
+    let _settings = state.settings_update.lock();
+    let revision = state.settings_revision();
+    let probing = state.quota_probes.lock().get(&episode.credential_id) == Some(episode);
+    (revision, probing)
+}
+
+fn live_execution(state: &CoreState, account_id: &str) -> ExecutionCredential {
+    let snapshot = crate::routing_snapshot::RoutingSnapshot::load(&state.db.lock()).unwrap();
+    snapshot
+        .credentials
+        .into_iter()
+        .find(|credential| credential.id == account_id)
+        .expect("stored execution credential")
+}
+
+#[test]
+fn probe_release_shares_settings_snapshot_with_settlement() {
+    let evidence = ocg_gateway::quota::QuotaEvidence {
+        reason: ocg_gateway::quota::QuotaReason::QuotaExhausted,
+        window: ocg_gateway::quota::QuotaWindowKind::Unknown,
+        resets_at_rfc3339: None,
+        resets_in_text: None,
+    };
+
+    let (dir, state) = test_state("quota-probe-succeed");
+    let account = custom_account(&state);
+    persist_custom_at(
+        &state,
+        &account,
+        "https://api.example.com/v1/chat/completions",
+    );
+    let episode = seed_due_recovery(&state, &account.id);
+    install_matching_probe(&state, &episode);
+    let (before_rev, before_probe) = snapshot_revision_and_probe(&state, &episode);
+    assert!(before_probe);
+    QuotaTrialGuard::new(state.clone(), episode.clone()).succeed();
+    let (after_rev, after_probe) = snapshot_revision_and_probe(&state, &episode);
+    assert!(!after_probe);
+    assert!(after_rev > before_rev);
+    drop(state);
+    let _ = fs::remove_dir_all(dir);
+
+    let (dir, state) = test_state("quota-probe-nonquota");
+    let mut account = custom_account(&state);
+    account.id = "custom-nonquota".into();
+    persist_custom_at(
+        &state,
+        &account,
+        "https://api.example.com/v1/chat/completions",
+    );
+    let episode = seed_due_recovery(&state, &account.id);
+    install_matching_probe(&state, &episode);
+    let (before_rev, _) = snapshot_revision_and_probe(&state, &episode);
+    QuotaTrialGuard::new(state.clone(), episode.clone()).fail_nonquota(Utc::now());
+    let (after_rev, after_probe) = snapshot_revision_and_probe(&state, &episode);
+    assert!(!after_probe);
+    assert!(after_rev > before_rev);
+    drop(state);
+    let _ = fs::remove_dir_all(dir);
+
+    let (dir, state) = test_state("quota-probe-fail-quota");
+    let mut account = custom_account(&state);
+    account.id = "custom-fail-quota".into();
+    persist_custom_at(
+        &state,
+        &account,
+        "https://api.example.com/v1/chat/completions",
+    );
+    let episode = seed_due_recovery(&state, &account.id);
+    install_matching_probe(&state, &episode);
+    let execution = live_execution(&state, &account.id);
+    let (before_rev, _) = snapshot_revision_and_probe(&state, &episode);
+    QuotaTrialGuard::new(state.clone(), episode.clone()).fail_quota(
+        &execution,
+        &evidence,
+        Utc::now(),
+    );
+    let (after_rev, after_probe) = snapshot_revision_and_probe(&state, &episode);
+    assert!(!after_probe);
+    assert!(after_rev > before_rev);
+    drop(state);
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn concurrent_settings_reader_never_sees_probe_flip_at_same_revision() {
+    let (dir, state) = test_state("quota-probe-interleave");
+    let account = custom_account(&state);
+    persist_custom_at(
+        &state,
+        &account,
+        "https://api.example.com/v1/chat/completions",
+    );
+    let episode = seed_due_recovery(&state, &account.id);
+    install_matching_probe(&state, &episode);
+    let start_rev = state.settings_revision();
+    let stop = Arc::new(AtomicBool::new(false));
+    let samples = Arc::new(std::sync::Mutex::new(Vec::<(u64, bool)>::new()));
+    let observer = {
+        let state = state.clone();
+        let episode = episode.clone();
+        let stop = stop.clone();
+        let samples = samples.clone();
+        thread::spawn(move || {
+            while !stop.load(Ordering::SeqCst) {
+                samples
+                    .lock()
+                    .unwrap()
+                    .push(snapshot_revision_and_probe(&state, &episode));
+            }
+            samples
+                .lock()
+                .unwrap()
+                .push(snapshot_revision_and_probe(&state, &episode));
+        })
+    };
+
+    QuotaTrialGuard::new(state.clone(), episode.clone()).fail_nonquota(Utc::now());
+    stop.store(true, Ordering::SeqCst);
+    observer.join().unwrap();
+
+    let (final_rev, probing) = snapshot_revision_and_probe(&state, &episode);
+    assert!(!probing);
+    assert!(final_rev > start_rev);
+
+    let observed = samples.lock().unwrap().clone();
+    assert!(
+        !observed.is_empty(),
+        "settings-update reader must sample the interleaving"
+    );
+    let mut probing_by_rev: std::collections::BTreeMap<u64, Option<bool>> =
+        std::collections::BTreeMap::new();
+    for (revision, probing) in observed {
+        match probing_by_rev.get(&revision) {
+            None => {
+                probing_by_rev.insert(revision, Some(probing));
+            }
+            Some(Some(previous)) if *previous != probing => {
+                panic!(
+                    "revision {revision} observed as both probing and waiting; delayed quota-retry can restore probing"
+                );
+            }
+            _ => {}
+        }
+    }
+
+    drop(state);
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn quota_shaped_429_body_sets_only_a_per_key_runtime_wait() {
+    let (addr, hits, stop_tx) = spawn_json_upstream(
+        axum::http::StatusCode::TOO_MANY_REQUESTS,
+        quota_json(),
+        "application/json",
+        Some("120"),
+    )
+    .await;
+    let endpoint = format!("http://{addr}/v1/chat/completions");
+    let (dir, state, account, plan, selection) =
+        prepare_custom_forward("quota-no-fanout", &endpoint);
+
+    let mut sibling = custom_account(&state);
+    sibling.id = "custom-pool-sibling".into();
+    sibling.name = "sibling".into();
+    sibling.key_cipher = state.encrypt_key("sk-sibling").unwrap();
+    persist_granted_custom(&state, &sibling, &endpoint);
+    share_quota_pool(&state, &account.id, &sibling.id);
+
+    let result = forward_once(&state, &account, &plan, &selection, &[]).await;
+    assert_eq!(hits.load(Ordering::SeqCst), 1, "{:?}", result.error_message);
+    assert_eq!(result.action, ForwardAction::TryNextAccount);
+    assert!(recovery_for(&state, &account.id).is_none());
+    assert!(recovery_for(&state, &sibling.id).is_none());
+
+    let sibling_selection = live_send_selection(&state, &sibling, &plan);
+    let sibling_result = forward_once(&state, &sibling, &plan, &sibling_selection, &[]).await;
+    assert_eq!(sibling_result.action, ForwardAction::TryNextAccount);
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        2,
+        "a declared quota-pool sibling must not inherit the first Key's temporary wait"
+    );
+
+    let blocked = forward_once(&state, &account, &plan, &selection, &[]).await;
+    assert_eq!(blocked.action, ForwardAction::TryNextAccount);
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        2,
+        "the originating Key must wait before another upstream request"
+    );
+
+    let primary = state.db.lock().get_account(&account.id).unwrap().unwrap();
+    let other = state.db.lock().get_account(&sibling.id).unwrap().unwrap();
+    assert!(primary.cooldown_generic_until.is_none());
+    assert!(primary.cooldown_until.is_none());
+    assert!(other.cooldown_generic_until.is_none());
+    assert!(other.cooldown_until.is_none());
+    assert!(primary.auth_error.is_none());
+
+    let _ = stop_tx.send(());
+    drop(state);
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn retry_after_429_keeps_temporary_wait_without_durable_quota() {
+    let (addr, hits, stop_tx) = spawn_json_upstream(
+        axum::http::StatusCode::TOO_MANY_REQUESTS,
+        r#"{"error":{"message":"slow down"}}"#,
+        "application/json",
+        Some("120"),
+    )
+    .await;
+    let endpoint = format!("http://{addr}/v1/chat/completions");
+    let (dir, state, account, plan, selection) =
+        prepare_custom_forward("quota-unrecognized-429", &endpoint);
+
+    let result = forward_once(&state, &account, &plan, &selection, &[]).await;
+    assert_eq!(hits.load(Ordering::SeqCst), 1, "{:?}", result.error_message);
+    assert!(recovery_for(&state, &account.id).is_none());
+    let primary = state.db.lock().get_account(&account.id).unwrap().unwrap();
+    assert!(primary.cooldown_generic_until.is_none());
+
+    let blocked = forward_once(&state, &account, &plan, &selection, &[]).await;
+    assert_eq!(blocked.action, ForwardAction::TryNextAccount);
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        1,
+        "the same Key must remain waiting until Retry-After"
+    );
+    assert!(
+        state
+            .db
+            .lock()
+            .list_forward_logs(10)
+            .unwrap()
+            .iter()
+            .any(|row| row.error_stage.as_deref() == Some("resource_wait")
+                && row.http_status.is_none())
+    );
+    let _ = stop_tx.send(());
+    drop(state);
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn quota_shaped_403_does_not_persist_quota_or_auth_error() {
+    let (addr, hits, stop_tx) = spawn_json_upstream(
+        axum::http::StatusCode::FORBIDDEN,
+        quota_json(),
+        "application/json",
+        None,
+    )
+    .await;
+    let endpoint = format!("http://{addr}/v1/chat/completions");
+    let (dir, state, account, plan, selection) =
+        prepare_custom_forward("quota-403-auth", &endpoint);
+    let result = forward_once(&state, &account, &plan, &selection, &[]).await;
+    assert_eq!(hits.load(Ordering::SeqCst), 1, "{:?}", result.error_message);
+    assert!(recovery_for(&state, &account.id).is_none());
+    let row = state.db.lock().get_account(&account.id).unwrap().unwrap();
+    assert!(row.auth_error.is_none());
+    assert!(row.cooldown_generic_until.is_none());
+
+    let _ = stop_tx.send(());
+    drop(state);
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn minimax_200_status_envelope_is_an_error_without_durable_quota() {
+    let (addr, hits, stop_tx) = spawn_json_upstream(
+        axum::http::StatusCode::OK,
+        r#"{"base_resp":{"status_code":1008,"status_msg":"insufficient balance"}}"#,
+        "application/json",
+        None,
+    )
+    .await;
+    let endpoint = format!("http://{addr}/v1/chat/completions");
+    let (dir, state, account, plan, selection) =
+        prepare_custom_forward("minimax-status-envelope", &endpoint);
+    let mut minimax_account = account.clone();
+    minimax_account.provider_id = crate::provider::MINIMAX_PROVIDER_ID.into();
+
+    let result = forward_once(&state, &minimax_account, &plan, &selection, &[]).await;
+    assert_eq!(hits.load(Ordering::SeqCst), 1, "{:?}", result.error_message);
+    assert_eq!(result.action, ForwardAction::TryNextAccount);
+    assert!(!result.response.status().is_success());
+    assert!(recovery_for(&state, &account.id).is_none());
+    assert_eq!(
+        state.db.lock().list_forward_logs(10).unwrap()[0].status,
+        "client_error"
+    );
+
+    let _ = stop_tx.send(());
+    drop(state);
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn delayed_split_sse_error_after_output_has_no_replay_or_durable_quota() {
+    const CONTENT: &[u8] = b"data: {\"id\":\"x\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\n\n";
+    const QUOTA_A: &[u8] = b"data: {\"error\":{\"code\":\"insuff";
+    const QUOTA_B: &[u8] = b"icient_quota\"}}\n\n";
+    const DONE: &[u8] = b"data: [DONE]\n\n";
+    let (addr, hits, stop_tx) =
+        spawn_sse_upstream(vec![(0, CONTENT), (40, QUOTA_A), (0, QUOTA_B), (0, DONE)]).await;
+    let endpoint = format!("http://{addr}/v1/chat/completions");
+    let (dir, state) = test_state("quota-sse-late");
+    let mut config = state.config();
+    config.proxy_mode = ProxyMode::Direct;
+    state.set_config(config).unwrap();
+    let account = custom_account(&state);
+    persist_granted_custom(&state, &account, &endpoint);
+    let plan = chat_plan_stream("local-custom", Some(&endpoint));
+    let selection = live_send_selection(&state, &account, &plan);
+    let result = forward_once(&state, &account, &plan, &selection, &[]).await;
+    let (action, body) = drain_forward(result).await;
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+    assert_eq!(action, ForwardAction::Return);
+    let text = String::from_utf8_lossy(&body);
+    assert!(text.contains("hi"), "{text}");
+    assert!(
+        recovery_for(&state, &account.id).is_none(),
+        "a post-output SSE error cannot create durable quota state"
+    );
+
+    let _ = stop_tx.send(());
+    drop(state);
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn complete_incomplete_and_no_usage_responses_restore_or_retain_trial() {
+    let success_usage = r#"{"id":"ok","object":"chat.completion","model":"local-custom","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}"#;
+    let success_no_usage = r#"{"id":"ok","object":"chat.completion","model":"local-custom","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}"#;
+
+    let (addr, _, stop_tx) = spawn_json_upstream(
+        axum::http::StatusCode::OK,
+        success_usage,
+        "application/json",
+        None,
+    )
+    .await;
+    let endpoint = format!("http://{addr}/v1/chat/completions");
+    let (dir, state, account, plan, selection) =
+        prepare_custom_forward("quota-restore-usage", &endpoint);
+    seed_due_recovery(&state, &account.id);
+    let result = forward_once(&state, &account, &plan, &selection, &[]).await;
+    assert!(result.error_message.is_none(), "{:?}", result.error_message);
+    assert!(
+        recovery_for(&state, &account.id).is_none(),
+        "complete JSON with usage restores the trial"
+    );
+    let _ = stop_tx.send(());
+    drop(state);
+    let _ = fs::remove_dir_all(dir);
+
+    let (addr, _, stop_tx) = spawn_json_upstream(
+        axum::http::StatusCode::OK,
+        success_no_usage,
+        "application/json",
+        None,
+    )
+    .await;
+    let endpoint = format!("http://{addr}/v1/chat/completions");
+    let (dir, state, account, plan, selection) =
+        prepare_custom_forward("quota-restore-nouse", &endpoint);
+    seed_due_recovery(&state, &account.id);
+    let result = forward_once(&state, &account, &plan, &selection, &[]).await;
+    assert!(result.error_message.is_none(), "{:?}", result.error_message);
+    assert!(
+        recovery_for(&state, &account.id).is_none(),
+        "complete JSON without usage still restores"
+    );
+    let _ = stop_tx.send(());
+    drop(state);
+    let _ = fs::remove_dir_all(dir);
+
+    let (addr, _, stop_tx) = spawn_json_upstream(
+        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+        "upstream failed",
+        "text/plain",
+        None,
+    )
+    .await;
+    let endpoint = format!("http://{addr}/v1/chat/completions");
+    let (dir, state, account, plan, selection) =
+        prepare_custom_forward("quota-retain-5xx", &endpoint);
+    seed_due_recovery(&state, &account.id);
+    let _ = forward_once(&state, &account, &plan, &selection, &[]).await;
+    assert!(
+        recovery_for(&state, &account.id).is_some(),
+        "5xx must not clear captured exhaustion"
+    );
+    let _ = stop_tx.send(());
+    drop(state);
+    let _ = fs::remove_dir_all(dir);
+
+    const CONTENT: &[u8] = b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n";
+    let (addr, _, stop_tx) = spawn_sse_upstream_with(vec![(0, CONTENT)], true).await;
+    let endpoint = format!("http://{addr}/v1/chat/completions");
+    let (dir, state) = test_state("quota-retain-incomplete");
+    let mut config = state.config();
+    config.proxy_mode = ProxyMode::Direct;
+    state.set_config(config).unwrap();
+    let account = custom_account(&state);
+    persist_granted_custom(&state, &account, &endpoint);
+    seed_due_recovery(&state, &account.id);
+    let plan = chat_plan_stream("local-custom", Some(&endpoint));
+    let selection = live_send_selection(&state, &account, &plan);
+    let result = forward_once(&state, &account, &plan, &selection, &[]).await;
+    let _ = drain_forward(result).await;
+    assert!(
+        recovery_for(&state, &account.id).is_some(),
+        "incomplete SSE must not restore the trial"
+    );
+    let _ = stop_tx.send(());
+    drop(state);
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn generic_http_error_envelope_is_root_object_only() {
+    assert!(explicit_nonquota_application_error(&json!({
+        "error": {"type": "server_error", "message": "temporarily unavailable"}
+    })));
+    assert!(explicit_nonquota_application_error(
+        &json!({"type": "error", "error": {"type": "api_error", "message": "x"}})
+    ));
+    assert!(!explicit_nonquota_application_error(&json!({
+        "error": null,
+        "choices": [{"message": {"role": "assistant", "content": "ok"}}]
+    })));
+    assert!(!explicit_nonquota_application_error(&json!({
+        "choices": [{
+            "message": {
+                "role": "assistant",
+                "content": "{\"error\":{\"type\":\"server_error\"}}"
+            }
+        }]
+    })));
+    assert!(!explicit_nonquota_application_error(
+        &json!({"choices": [{"message": {"error": {"type": "server_error"}}}]})
+    ));
+}
+
+#[tokio::test]
+async fn completed_sse_trial_restores_after_finalizer() {
+    const CONTENT: &[u8] = b"data: {\"id\":\"x\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":null}]}\n\n";
+    const STOP: &[u8] = b"data: {\"id\":\"x\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1}}\n\n";
+    const DONE: &[u8] = b"data: [DONE]\n\n";
+    let (addr, hits, stop_tx) = spawn_sse_upstream(vec![(0, CONTENT), (0, STOP), (0, DONE)]).await;
+    let endpoint = format!("http://{addr}/v1/chat/completions");
+    let (dir, state) = test_state("quota-sse-complete");
+    let mut config = state.config();
+    config.proxy_mode = ProxyMode::Direct;
+    state.set_config(config).unwrap();
+    let account = custom_account(&state);
+    persist_granted_custom(&state, &account, &endpoint);
+    seed_due_recovery(&state, &account.id);
+    let plan = chat_plan_stream("local-custom", Some(&endpoint));
+    let selection = live_send_selection(&state, &account, &plan);
+    let result = forward_once(&state, &account, &plan, &selection, &[]).await;
+    let (action, _) = drain_forward_bounded(result).await;
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+    assert_eq!(action, ForwardAction::Return);
+    assert!(
+        recovery_for(&state, &account.id).is_none(),
+        "completed SSE success must restore the trial"
+    );
+    let _ = stop_tx.send(());
+    drop(state);
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn nonquota_sse_error_finalizer_retains_trial() {
+    const CONTENT: &[u8] = b"data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n";
+    let (addr, hits, stop_tx) = spawn_sse_upstream_with(vec![(0, CONTENT)], true).await;
+    let endpoint = format!("http://{addr}/v1/chat/completions");
+    let (dir, state) = test_state("quota-sse-eof");
+    let mut config = state.config();
+    config.proxy_mode = ProxyMode::Direct;
+    state.set_config(config).unwrap();
+    let account = custom_account(&state);
+    persist_granted_custom(&state, &account, &endpoint);
+    seed_due_recovery(&state, &account.id);
+    let before = recovery_for(&state, &account.id).unwrap();
+    let plan = chat_plan_stream("local-custom", Some(&endpoint));
+    let selection = live_send_selection(&state, &account, &plan);
+    let result = forward_once(&state, &account, &plan, &selection, &[]).await;
+    let _ = drain_forward_bounded(result).await;
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+    let after = recovery_for(&state, &account.id).expect("EOF must retain exhaustion");
+    assert_eq!(after.epoch, before.epoch);
+    assert_eq!(after.failure_count, before.failure_count);
+    assert!(after.next_retry_at >= Utc::now() + chrono::Duration::minutes(14));
+    let _ = stop_tx.send(());
+    drop(state);
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn http_200_generic_error_envelope_does_not_clear_due_trial() {
+    let (addr, hits, stop_tx) = spawn_json_upstream(
+        axum::http::StatusCode::OK,
+        r#"{"error":{"type":"server_error","message":"temporarily unavailable"}}"#,
+        "application/json",
+        None,
+    )
+    .await;
+    let endpoint = format!("http://{addr}/v1/chat/completions");
+    let (dir, state, account, plan, selection) =
+        prepare_custom_forward("quota-http200-error-envelope", &endpoint);
+    seed_due_recovery(&state, &account.id);
+    let before = recovery_for(&state, &account.id).unwrap();
+    let started = Utc::now();
+    let result = forward_once(&state, &account, &plan, &selection, &[]).await;
+    assert_eq!(hits.load(Ordering::SeqCst), 1, "{:?}", result.error_message);
+    assert_eq!(result.action, ForwardAction::Return);
+    assert_eq!(result.response.status(), axum::http::StatusCode::OK);
+    let after = recovery_for(&state, &account.id)
+        .expect("generic 200 error envelope must not restore the Key");
+    assert_eq!(after.epoch, before.epoch);
+    assert_eq!(after.failure_count, before.failure_count);
+    assert!(after.next_retry_at >= started + chrono::Duration::minutes(14));
+    let _ = stop_tx.send(());
+    drop(state);
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn metered_http_rejections_settle_without_debit_or_uncertainty() {
+    for (status, body) in [
+        (
+            axum::http::StatusCode::BAD_REQUEST,
+            r#"{"error":{"message":"invalid request"}}"#,
+        ),
+        (axum::http::StatusCode::TOO_MANY_REQUESTS, quota_json()),
+    ] {
+        let (addr, hits, stop) = spawn_json_upstream(status, body, "application/json", None).await;
+        let endpoint = format!("http://{addr}/v1/chat/completions");
+        let (dir, state) = test_state("credit-http-rejection");
+        let account = credit_test_account(&state, &endpoint);
+        let plan = chat_plan("local-custom", Some(&endpoint));
+        let selected = live_send_selection(&state, &account, &plan);
+        let result = forward_once(&state, &account, &plan, &selected, &[]).await;
+        assert!(!result.response.status().is_success());
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        let view = test_credit_view(&state);
+        assert_eq!(view.pending_requests, 0);
+        assert_eq!(
+            view.unpriced_requests, 0,
+            "rejected {status} must settle as zero use"
+        );
+        assert_eq!(view.remaining, 100_000_000.0);
+        assert_eq!(state.db.lock().list_forward_logs(10).unwrap().len(), 1);
+        let _ = stop.send(());
+        drop(state);
+        let _ = fs::remove_dir_all(dir);
+    }
+}
+
+#[tokio::test]
+async fn late_rejections_cannot_cross_route_edits_or_operator_reset() {
+    for (reset, status, stream, trial) in [
+        (false, StatusCode::TOO_MANY_REQUESTS, false, false),
+        (false, StatusCode::OK, false, false),
+        (false, StatusCode::OK, true, false),
+        (true, StatusCode::TOO_MANY_REQUESTS, false, false),
+        (false, StatusCode::UNAUTHORIZED, false, false),
+        (true, StatusCode::UNAUTHORIZED, false, false),
+        (false, StatusCode::SERVICE_UNAVAILABLE, false, true),
+        (false, StatusCode::TOO_MANY_REQUESTS, false, true),
+    ] {
+        let received = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let received_server = received.clone();
+        let release_server = release.clone();
+        let app = axum::Router::new().fallback(axum::routing::post(move || {
+            let received = received_server.clone();
+            let release = release_server.clone();
+            async move {
+                received.notify_one();
+                release.notified().await;
+                let (content_type, body) = if stream {
+                    (
+                        "text/event-stream",
+                        format!("data: {}\n\ndata: [DONE]\n\n", quota_json()),
+                    )
+                } else if status == StatusCode::UNAUTHORIZED {
+                    (
+                        "application/json",
+                        r#"{"error":{"message":"invalid key"}}"#.to_string(),
+                    )
+                } else {
+                    ("application/json", quota_json().to_string())
+                };
+                (status, [("content-type", content_type)], body)
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!(
+            "http://{}/v1/chat/completions",
+            listener.local_addr().unwrap()
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let (dir, state, account, mut plan, selected) =
+            prepare_custom_forward("quota-late-route", &endpoint);
+        plan.stream = stream;
+        if trial {
+            seed_due_recovery(&state, &account.id);
+        }
+        let mut request = Box::pin(forward_once(&state, &account, &plan, &selected, &[]));
+        tokio::select! {
+            result = &mut request => panic!("request finished before observation barrier: {:?}", result.error_message),
+            waited = tokio::time::timeout(StdDuration::from_secs(10), received.notified()) => waited.unwrap(),
+        }
+        let trial_before_edit = recovery_for(&state, &account.id);
+        if reset {
+            let _settings = state.settings_update.lock();
+            let db = state.db.lock();
+            db.clear_account_cooldown(&account.id).unwrap();
+            state.recovery.reset_account(&account.id);
+        } else {
+            let changed = endpoint.replace("/v1/", "/v2/");
+            state
+                .db
+                .lock()
+                .upsert_account_custom_config(
+                    &account.id,
+                    &AccountCustomConfigInput {
+                        endpoint_url: changed,
+                        upstream_protocol: UpstreamProtocolKind::ChatCompletions,
+                    },
+                )
+                .unwrap();
+            let live = state
+                .db
+                .lock()
+                .list_inference_bindings()
+                .unwrap()
+                .into_iter()
+                .find(|binding| binding.account_id == account.id)
+                .unwrap();
+            assert_eq!(
+                live.credential_version, selected.credential_version,
+                "the regression must keep the same Key version across the route edit"
+            );
+        }
+        release.notify_one();
+        let result = request.await;
+        let _ = drain_forward(result).await;
+        if trial {
+            assert_eq!(
+                recovery_for(&state, &account.id),
+                trial_before_edit,
+                "stale trial must release its lease without changing persistent retry"
+            );
+            assert!(state.quota_probes.lock().is_empty());
+        } else {
+            assert!(
+                recovery_for(&state, &account.id).is_none(),
+                "stale evidence survived: reset={reset}, status={status}, stream={stream}"
+            );
+        }
+        assert!(
+            state
+                .db
+                .lock()
+                .get_account(&account.id)
+                .unwrap()
+                .unwrap()
+                .auth_error
+                .is_none(),
+            "stale auth rejection invalidated the current route"
+        );
+        server.abort();
+        drop(state);
+        let _ = fs::remove_dir_all(dir);
+    }
+}
+
+#[tokio::test]
+async fn quota_sse_after_output_cannot_cross_a_route_edit() {
+    let release = Arc::new(tokio::sync::Notify::new());
+    let release_server = release.clone();
+    let app = axum::Router::new().fallback(axum::routing::post(move || {
+        let release = release_server.clone();
+        async move {
+            let stream = futures_util::stream::unfold((0, release), |(step, release)| async move {
+                let bytes = match step {
+                    0 => bytes::Bytes::from_static(
+                        b"data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n\n",
+                    ),
+                    1 => {
+                        release.notified().await;
+                        bytes::Bytes::from(format!("data: {}\n\ndata: [DONE]\n\n", quota_json()))
+                    }
+                    _ => return None,
+                };
+                Some((Ok::<_, std::io::Error>(bytes), (step + 1, release)))
+            });
+            (
+                [("content-type", "text/event-stream")],
+                axum::body::Body::from_stream(stream),
+            )
+        }
+    }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!(
+        "http://{}/v1/chat/completions",
+        listener.local_addr().unwrap()
+    );
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let (dir, state, account, mut plan, _) =
+        prepare_custom_forward("quota-after-output-route", &endpoint);
+    plan.stream = true;
+    let selected = live_send_selection(&state, &account, &plan);
+    let result = forward_once(&state, &account, &plan, &selected, &[]).await;
+    assert_eq!(result.action, ForwardAction::Return);
+    state
+        .db
+        .lock()
+        .upsert_account_custom_config(
+            &account.id,
+            &AccountCustomConfigInput {
+                endpoint_url: endpoint.replace("/v1/", "/v2/"),
+                upstream_protocol: UpstreamProtocolKind::ChatCompletions,
+            },
+        )
+        .unwrap();
+    release.notify_one();
+    let _ = drain_forward(result).await;
+    assert!(recovery_for(&state, &account.id).is_none());
+    server.abort();
+    drop(state);
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn metered_malformed_accepted_json_stays_uncertain_without_replay() {
+    let (addr, hits, stop) =
+        spawn_json_upstream(StatusCode::OK, "not-json", "application/json", None).await;
+    let endpoint = format!("http://{addr}/v1/chat/completions");
+    let (dir, state) = test_state("credit-invalid-json");
+    let account = credit_test_account(&state, &endpoint);
+    let plan = chat_plan("local-custom", Some(&endpoint));
+    let selected = live_send_selection(&state, &account, &plan);
+    let result = forward_once(&state, &account, &plan, &selected, &[]).await;
+    assert_eq!(result.response.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(result.action, ForwardAction::Return);
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+    let view = test_credit_view(&state);
+    assert_eq!(view.pending_requests, 0);
+    assert_eq!(view.unpriced_requests, 0);
+    assert_eq!(view.remaining, 100_000_000.0);
+    let logs = state.db.lock().list_forward_logs(10).unwrap();
+    assert_eq!(logs.len(), 1);
+    assert_eq!(logs[0].http_status, Some(200));
+    assert_eq!(logs[0].status, "error");
+    let _ = stop.send(());
+    drop(state);
+    let _ = fs::remove_dir_all(dir);
+}
+
+fn bound_replay_plan(format: ApiFormat) -> RequestPlan {
+    let mut plan = chat_plan("test-model", None);
+    plan.client = format;
+    plan.upstream = format;
+    plan.replay_domain =
+        Some(ocg_gateway::protocol::ReplayDomain::parse(&"ab".repeat(32)).unwrap());
+    plan
+}
+
+fn assert_redaction_conflict(plan: &RequestPlan, mut body: Value) {
+    let error = prepare_redacted_response(plan, &mut body, Some("SECRET")).unwrap_err();
+    assert!(
+        error
+            .message
+            .contains("signed native history cannot be preserved by secret redaction"),
+        "{}",
+        error.message
+    );
+    assert!(!error.message.contains("SECRET"), "{}", error.message);
+    assert!(
+        body.to_string().contains("SECRET"),
+        "conflict must be reported before redaction mutates the document"
+    );
+}
+
+#[test]
+fn bound_json_rejects_secret_redaction_of_signed_native_history() {
+    let messages = bound_replay_plan(ApiFormat::Messages);
+    assert_redaction_conflict(
+        &messages,
+        json!({
+            "id": "msg_1",
+            "type": "message",
+            "role": "assistant",
+            "content": [{
+                "type": "thinking",
+                "thinking": "hello",
+                "signature": "pre-SECRET-post"
+            }]
+        }),
+    );
+    assert_redaction_conflict(
+        &messages,
+        json!({
+            "id": "msg_1",
+            "type": "message",
+            "role": "assistant",
+            "content": [{
+                "type": "thinking",
+                "thinking": "see SECRET",
+                "signature": "sig-1"
+            }]
+        }),
+    );
+    assert_redaction_conflict(
+        &messages,
+        json!({
+            "id": "msg_1",
+            "type": "message",
+            "role": "assistant",
+            "content": [{
+                "type": "redacted_thinking",
+                "data": "pre-SECRET-post"
+            }]
+        }),
+    );
+    assert_redaction_conflict(
+        &bound_replay_plan(ApiFormat::Responses),
+        json!({
+            "id": "resp_1",
+            "output": [{
+                "type": "reasoning",
+                "id": "rs1",
+                "summary": [],
+                "encrypted_content": "pre-SECRET-post"
+            }]
+        }),
+    );
+}
+
+#[test]
+fn bound_json_still_redacts_unsigned_text_and_keeps_one_signature_marker() {
+    let plan = bound_replay_plan(ApiFormat::Messages);
+    let prefix = ocg_gateway::protocol::replay_marker_prefix(plan.replay_domain.unwrap());
+    let mut body = json!({
+        "id": "msg_1",
+        "type": "message",
+        "role": "assistant",
+        "model": "test-model",
+        "content": [
+            {"type": "thinking", "thinking": "safe", "signature": "sig-1"},
+            {"type": "text", "text": "hello SECRET"}
+        ],
+        "stop_reason": "end_turn"
+    });
+    let value = prepare_redacted_response(&plan, &mut body, Some("SECRET")).unwrap();
+    let encoded = value.to_string();
+    assert!(!encoded.contains("SECRET"), "{encoded}");
+    assert!(encoded.contains("hello"), "{encoded}");
+    assert!(encoded.contains(&format!("{prefix}sig-1")), "{encoded}");
+    assert_eq!(encoded.matches(prefix.as_str()).count(), 1, "{encoded}");
+
+    let mut unsigned = json!({
+        "id": "msg_1",
+        "type": "message",
+        "role": "assistant",
+        "content": [{
+            "type": "thinking",
+            "thinking": "hello SECRET",
+            "signature": null
+        }]
+    });
+    let unsigned = prepare_redacted_response(&plan, &mut unsigned, Some("SECRET")).unwrap();
+    let encoded = unsigned.to_string();
+    assert!(!encoded.contains("SECRET"), "{encoded}");
+    assert!(!encoded.contains("ocg-replay-"), "{encoded}");
+
+    let mut empty_encrypted = json!({
+        "id": "resp_1",
+        "output": [{
+            "type": "reasoning",
+            "id": "rs1",
+            "summary": [],
+            "encrypted_content": ""
+        }]
+    });
+    let responses = bound_replay_plan(ApiFormat::Responses);
+    let empty_encrypted =
+        prepare_redacted_response(&responses, &mut empty_encrypted, Some("SECRET")).unwrap();
+    let encoded = empty_encrypted.to_string();
+    assert!(encoded.contains("\"encrypted_content\":\"\""), "{encoded}");
+    assert!(!encoded.contains("ocg-replay-"), "{encoded}");
+}
+
+fn assert_bound_opaque(value: &str, domain: ocg_gateway::protocol::ReplayDomain, raw: &str) {
+    let prefix = ocg_gateway::protocol::replay_marker_prefix(domain);
+    assert_eq!(value, format!("{prefix}{raw}"));
+    match ocg_gateway::protocol::restore_replay_opaque(domain, value).unwrap() {
+        ocg_gateway::protocol::RestoredReplay::Bound(restored) => assert_eq!(restored, raw),
+        other => panic!("opaque did not restore to {raw}: {other:?} from {value}"),
+    }
+}
+
+fn assert_not_marker(value: &str, marker: &str, secret: &str) {
+    assert_ne!(value, marker, "{secret}");
+    assert!(!value.contains(secret), "{secret} stayed in {value}");
+}
+
+#[test]
+fn bound_json_keeps_native_opaque_for_scaffold_secrets() {
+    for secret in ["ocg", "replay", "abababab"] {
+        let plan = bound_replay_plan(ApiFormat::Messages);
+        let domain = plan.replay_domain.unwrap();
+        let marker = format!(
+            "{}safe",
+            ocg_gateway::protocol::replay_marker_prefix(domain)
+        );
+        let mut body = json!({
+            "id": "msg_1",
+            "type": "message",
+            "role": "assistant",
+            "model": "test-model",
+            "content": [
+                {"type": "thinking", "thinking": "why", "signature": "sig-1"},
+                {"type": "redacted_thinking", "data": "opaque-data"},
+                {"type": "text", "text": format!("see {secret}")},
+                {"type": "text", "text": marker},
+                {"type": "tool_use", "id": "toolu_1", "name": "search", "input": {
+                    "type": "thinking",
+                    "signature": marker,
+                    "data": marker,
+                    "q": format!("see {secret}"),
+                    "nested": {"arg": secret}
+                }}
+            ],
+            "stop_reason": "tool_use"
+        });
+        let value = prepare_redacted_response(&plan, &mut body, Some(secret))
+            .unwrap_or_else(|error| panic!("{secret}: {}", error.message));
+        let content = value["content"].as_array().unwrap();
+        assert_bound_opaque(content[0]["signature"].as_str().unwrap(), domain, "sig-1");
+        assert_eq!(content[0]["thinking"].as_str(), Some("why"));
+        assert_bound_opaque(content[1]["data"].as_str().unwrap(), domain, "opaque-data");
+        assert_eq!(content[2]["text"].as_str(), Some("see <redacted>"));
+        assert_not_marker(content[3]["text"].as_str().unwrap(), &marker, secret);
+        let input = &content[4]["input"];
+        assert_eq!(input["type"].as_str(), Some("thinking"));
+        assert_not_marker(input["signature"].as_str().unwrap(), &marker, secret);
+        assert_not_marker(input["data"].as_str().unwrap(), &marker, secret);
+        assert_eq!(input["q"].as_str(), Some("see <redacted>"));
+        assert_eq!(input["nested"]["arg"].as_str(), Some("<redacted>"));
+    }
+}
+
+#[test]
+fn bound_responses_json_keeps_distinct_summary_content_and_cipher() {
+    for secret in ["ocg", "replay", "abababab"] {
+        let plan = bound_replay_plan(ApiFormat::Responses);
+        let domain = plan.replay_domain.unwrap();
+        let mut body = json!({
+            "id": "resp_1",
+            "output": [{
+                "type": "reasoning",
+                "id": "rs_echo",
+                "summary": [{"type": "summary_text", "text": "S"}],
+                "content": [{"type": "reasoning_text", "text": "R"}],
+                "encrypted_content": "cipher-1"
+            }, {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": format!("see {secret}")}]
+            }]
+        });
+        let value = prepare_redacted_response(&plan, &mut body, Some(secret))
+            .unwrap_or_else(|error| panic!("{secret}: {}", error.message));
+        let item = &value["output"][0];
+        assert_bound_opaque(
+            item["encrypted_content"].as_str().unwrap(),
+            domain,
+            "cipher-1",
+        );
+        assert_eq!(item["summary"][0]["type"].as_str(), Some("summary_text"));
+        assert_eq!(item["summary"][0]["text"].as_str(), Some("S"));
+        assert_eq!(item["content"][0]["type"].as_str(), Some("reasoning_text"));
+        assert_eq!(item["content"][0]["text"].as_str(), Some("R"));
+        assert_eq!(
+            value["output"][1]["content"][0]["text"].as_str(),
+            Some("see <redacted>")
+        );
+    }
+}
+
+#[test]
+fn bound_messages_to_responses_json_keeps_codec_and_redacts_restored_tools() {
+    for secret in ["ocg", "replay", "abababab"] {
+        let mut plan = bound_replay_plan(ApiFormat::Messages);
+        plan.client = ApiFormat::Responses;
+        let domain = plan.replay_domain.unwrap();
+        let marker = format!(
+            "{}safe",
+            ocg_gateway::protocol::replay_marker_prefix(domain)
+        );
+        plan.response_tools = vec![json!({
+            "type": "function",
+            "name": "f",
+            "description": marker,
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "type": {"type": "string", "enum": ["thinking"]},
+                    "signature": {"type": "string", "description": marker},
+                    "data": {"type": "string", "description": marker},
+                    "q": {"type": "string"}
+                }
+            }
+        })];
+        let mut body = json!({
+            "id": "msg_1",
+            "type": "message",
+            "role": "assistant",
+            "model": "test-model",
+            "content": [
+                {"type": "thinking", "thinking": "why", "signature": "sig-1"},
+                {"type": "redacted_thinking", "data": "opaque-data"},
+                {"type": "text", "text": "ordinary"},
+                {"type": "tool_use", "id": "toolu_1", "name": "f", "input": {
+                    "type": "thinking",
+                    "signature": marker,
+                    "data": marker,
+                    "q": format!("see {secret}"),
+                    "payload": serde_json::to_string(&json!({
+                        "type": "thinking",
+                        "signature": marker,
+                        "data": marker,
+                        "q": format!("see {secret}")
+                    })).unwrap()
+                }}
+            ],
+            "stop_reason": "tool_use"
+        });
+        let value = prepare_redacted_response(&plan, &mut body, Some(secret))
+            .unwrap_or_else(|error| panic!("{secret}: {}", error.message));
+        let tools = value["tools"].as_array().expect("restored tools");
+        assert_not_marker(tools[0]["description"].as_str().unwrap(), &marker, secret);
+        assert_eq!(tools[0]["parameters"]["type"].as_str(), Some("object"));
+        assert_eq!(
+            tools[0]["parameters"]["properties"]["type"]["enum"][0].as_str(),
+            Some("thinking")
+        );
+        assert_not_marker(
+            tools[0]["parameters"]["properties"]["signature"]["description"]
+                .as_str()
+                .unwrap(),
+            &marker,
+            secret,
+        );
+        assert_not_marker(
+            tools[0]["parameters"]["properties"]["data"]["description"]
+                .as_str()
+                .unwrap(),
+            &marker,
+            secret,
+        );
+        let output = value["output"].as_array().unwrap();
+        let thinking = output
+            .iter()
+            .find(|item| {
+                item["encrypted_content"].as_str().is_some_and(|text| {
+                    crate::gateway::protocol::decode_anthropic_thinking_block(text)
+                        .is_some_and(|block| block["type"].as_str() == Some("thinking"))
+                })
+            })
+            .unwrap_or_else(|| panic!("{secret}: missing thinking codec"));
+        let block = crate::gateway::protocol::decode_anthropic_thinking_block(
+            thinking["encrypted_content"].as_str().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(block["thinking"].as_str(), Some("why"));
+        assert_bound_opaque(block["signature"].as_str().unwrap(), domain, "sig-1");
+        assert_eq!(thinking["summary"][0]["text"].as_str(), Some("why"));
+        assert!(
+            thinking
+                .get("content")
+                .is_none_or(|content| { content.as_array().is_none_or(Vec::is_empty) })
+        );
+        let redacted = output
+            .iter()
+            .find(|item| {
+                item["encrypted_content"].as_str().is_some_and(|text| {
+                    crate::gateway::protocol::decode_anthropic_thinking_block(text)
+                        .is_some_and(|block| block["type"].as_str() == Some("redacted_thinking"))
+                })
+            })
+            .unwrap_or_else(|| panic!("{secret}: missing redacted codec"));
+        let redacted_block = crate::gateway::protocol::decode_anthropic_thinking_block(
+            redacted["encrypted_content"].as_str().unwrap(),
+        )
+        .unwrap();
+        assert_bound_opaque(
+            redacted_block["data"].as_str().unwrap(),
+            domain,
+            "opaque-data",
+        );
+        let call = output
+            .iter()
+            .find(|item| item["type"].as_str() == Some("function_call"))
+            .unwrap_or_else(|| panic!("{secret}: missing tool call"));
+        let arguments: serde_json::Value =
+            serde_json::from_str(call["arguments"].as_str().unwrap()).unwrap();
+        assert_eq!(arguments["type"].as_str(), Some("thinking"));
+        assert_not_marker(arguments["signature"].as_str().unwrap(), &marker, secret);
+        assert_not_marker(arguments["data"].as_str().unwrap(), &marker, secret);
+        assert_eq!(arguments["q"].as_str(), Some("see <redacted>"));
+        let payload: serde_json::Value =
+            serde_json::from_str(arguments["payload"].as_str().unwrap()).unwrap();
+        assert_eq!(payload["type"].as_str(), Some("thinking"));
+        assert_not_marker(payload["signature"].as_str().unwrap(), &marker, secret);
+        assert_not_marker(payload["data"].as_str().unwrap(), &marker, secret);
+        assert_eq!(payload["q"].as_str(), Some("see <redacted>"));
+        let message = output
+            .iter()
+            .find(|item| item["type"].as_str() == Some("message"))
+            .unwrap();
+        assert_eq!(message["content"][0]["text"].as_str(), Some("ordinary"));
+    }
+}
+
+#[test]
+fn bound_json_rejects_a_real_secret_inside_signed_history() {
+    for (secret, signature, thinking) in [
+        ("ocg", "sig-ocg", "why"),
+        ("replay", "sig-1", "see replay"),
+        ("abababab", "sig-1", "see abababab"),
+    ] {
+        let plan = bound_replay_plan(ApiFormat::Messages);
+        let mut body = json!({
+            "id": "msg_1",
+            "type": "message",
+            "role": "assistant",
+            "content": [{
+                "type": "thinking",
+                "thinking": thinking,
+                "signature": signature
+            }]
+        });
+        let error = prepare_redacted_response(&plan, &mut body, Some(secret)).unwrap_err();
+        assert!(
+            error
+                .message
+                .contains("signed native history cannot be preserved by secret redaction"),
+            "{}",
+            error.message
+        );
+        assert!(!error.message.contains(secret), "{}", error.message);
+        assert!(body.to_string().contains(secret), "{secret}");
+    }
+    let plan = bound_replay_plan(ApiFormat::Responses);
+    let mut body = json!({
+        "output": [{
+            "type": "reasoning",
+            "summary": [],
+            "encrypted_content": "cipher-ocg"
+        }]
+    });
+    let error = prepare_redacted_response(&plan, &mut body, Some("ocg")).unwrap_err();
+    assert!(
+        error
+            .message
+            .contains("signed native history cannot be preserved by secret redaction"),
+        "{}",
+        error.message
+    );
+    assert!(!error.message.contains("ocg"), "{}", error.message);
+    assert!(body.to_string().contains("cipher-ocg"));
+}
+
+#[test]
+fn unbound_json_still_redacts_signature_text_without_a_marker() {
+    let mut plan = bound_replay_plan(ApiFormat::Messages);
+    plan.replay_domain = None;
+    let mut body = json!({
+        "id": "msg_1",
+        "type": "message",
+        "role": "assistant",
+        "content": [
+            {"type": "thinking", "thinking": "why", "signature": "pre-replay-post"},
+            {"type": "text", "text": "see replay"}
+        ]
+    });
+    let value = prepare_redacted_response(&plan, &mut body, Some("replay")).unwrap();
+    assert_eq!(
+        value["content"][0]["signature"].as_str(),
+        Some("pre-<redacted>-post")
+    );
+    assert_eq!(value["content"][1]["text"].as_str(), Some("see <redacted>"));
+    assert!(!value.to_string().contains("ocg-replay-"));
+}
+
+#[test]
+fn responses_encrypted_history_is_not_dropped_for_a_messages_client() {
+    let mut plan = bound_replay_plan(ApiFormat::Responses);
+    plan.client = ApiFormat::Messages;
+    let mut body = json!({
+        "id": "resp_1",
+        "output": [{
+            "type": "reasoning",
+            "id": "rs1",
+            "summary": [{"type": "summary_text", "text": "S"}],
+            "content": [{"type": "reasoning_text", "text": "R"}],
+            "encrypted_content": "cipher-1"
+        }]
+    });
+    let error = prepare_redacted_response(&plan, &mut body, Some("ocg")).unwrap_err();
+    assert!(
+        error.message.contains("cannot be preserved"),
+        "{}",
+        error.message
+    );
+    assert!(body.to_string().contains("cipher-1"));
+    assert!(!error.message.contains("ocg"), "{}", error.message);
 }

@@ -1,12 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
-  CUSTOM_ENDPOINT_URL_ISSUE_KEYS,
   customEndpointUrlIssue,
-  customApiUrlPlaceholder,
   customApiUrlSupportsModelDiscovery,
   customApiUrlNeedsManualModels,
-  expandCustomModelCapabilities,
+  legacyCustomAccountDestinationId,
   normalizeCustomCapabilities,
   CustomCapabilityError,
 } from "./custom-account.ts";
@@ -20,11 +18,11 @@ test("trusted Endpoint validation permits LAN, localhost, and HTTP", () => {
   ]) assert.equal(customEndpointUrlIssue(endpoint), null, endpoint);
   assert.equal(customEndpointUrlIssue("ftp://api.example.com"), "not_http");
   assert.equal(customEndpointUrlIssue("https://user:pass@api.example.com"), "with_credentials");
-  assert.equal(CUSTOM_ENDPOINT_URL_ISSUE_KEYS.empty, "请填写 API 地址");
+  assert.equal(customEndpointUrlIssue(""), "empty");
+  assert.equal(customEndpointUrlIssue("   "), "empty");
 });
 
 test("common API bases and legacy standard paths enable model discovery", () => {
-  assert.equal(customApiUrlPlaceholder(), "https://api.example.com");
   assert.ok(customApiUrlSupportsModelDiscovery("https://api.example.com", "chat_completions"));
   assert.ok(customApiUrlSupportsModelDiscovery("https://api.example.com/v1", "chat_completions"));
   assert.ok(customApiUrlSupportsModelDiscovery("https://api.example.com/openai/v1/", "responses"));
@@ -39,13 +37,11 @@ test("common API bases and legacy standard paths enable model discovery", () => 
   assert.ok(customApiUrlNeedsManualModels("https://api.example.com/custom/infer", "messages"));
 });
 
-test("one protocol expands each model once and rejects mismatched rows", () => {
-  const rows = expandCustomModelCapabilities(["m1", "m2"], "messages");
-  assert.deepEqual(rows, [
+test("one protocol normalizes each model once and rejects mismatched rows", () => {
+  assert.deepEqual(normalizeCustomCapabilities([
     { public_model: "m1", upstream_model: "m1", protocol: "messages" },
     { public_model: "m2", upstream_model: "m2", protocol: "messages" },
-  ]);
-  assert.deepEqual(normalizeCustomCapabilities(rows, "messages"), [
+  ], "messages"), [
     { public_model: "m1", upstream_model: "m1", protocol: "messages", source: "manual" },
     { public_model: "m2", upstream_model: "m2", protocol: "messages", source: "manual" },
   ]);
@@ -70,4 +66,28 @@ test("public models are case-insensitively unique while upstream IDs are reusabl
     ], "messages"),
     (error) => error instanceof CustomCapabilityError && error.issue === "duplicate_public_model",
   );
+});
+
+test("a legacy Custom account resolves its destination through the credential row", () => {
+  const credentialsByLegacyAccountId = new Map([
+    ["acc-1", { destination_id: "dest-shared" }],
+  ]);
+  const destinations = [
+    { id: "dest-shared", legacy: { kind: "custom_account" as const, id: "acc-1" } },
+    { id: "dest-other", legacy: { kind: "custom_account" as const, id: "acc-2" } },
+  ];
+  assert.equal(
+    legacyCustomAccountDestinationId("acc-1", credentialsByLegacyAccountId, destinations),
+    "dest-shared",
+  );
+});
+
+test("destination resolution falls back to the account-owned Custom destination", () => {
+  const destinations = [
+    { id: "dest-builtin", legacy: { kind: "builtin" as const, id: "opencode" } },
+    { id: "dest-owned", legacy: { kind: "custom_account" as const, id: "acc-9" } },
+  ];
+  assert.equal(legacyCustomAccountDestinationId("acc-9", new Map(), destinations), "dest-owned");
+  assert.equal(legacyCustomAccountDestinationId("acc-missing", new Map(), destinations), null);
+  assert.equal(legacyCustomAccountDestinationId("acc-9", new Map(), []), null);
 });

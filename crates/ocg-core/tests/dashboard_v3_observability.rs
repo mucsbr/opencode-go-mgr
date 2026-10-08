@@ -1,4 +1,4 @@
-//! Dashboard V3 read-only observability: auth, secrecy, local-only reads, V2 parity.
+//! Dashboard V3 read-only observability: auth, secrecy, local-only reads, and retired V2 paths.
 
 use chrono::{Duration, Utc};
 use ocg_core::dashboard_v3::{
@@ -20,6 +20,8 @@ use serde_json::{Value, json};
 
 #[path = "fixtures/dashboard_v3/harness.rs"]
 mod harness;
+#[path = "fixtures/refreshed_go_catalog.rs"]
+mod refreshed_go_catalog;
 
 use harness::{V3Harness, start_loopback, start_public};
 
@@ -205,6 +207,11 @@ fn forward_log(account_id: &str, model: &str, cost: Option<f64>, cost_state: &st
 #[tokio::test]
 async fn dashboard_summary_counts_routable_goat_and_custom_accounts() {
     let harness = start_loopback("obs-summary-all-plans").await;
+    refreshed_go_catalog::persist_provider_catalog(
+        &harness.state,
+        COMMAND_CODE_PROVIDER_ID,
+        ocg_core::provider::COMMAND_CODE_GOAT_INCLUDED_MODEL_IDS,
+    );
     let (_, before_body) = harness
         .get_json(&format!("{}/dashboard/summary", harness.v3_base))
         .await;
@@ -327,6 +334,7 @@ async fn dashboard_v3_v2_login_cookie_authorizes_observability_routes() {
 #[tokio::test]
 async fn dashboard_v3_observability_gets_are_local_secret_free_and_share_one_snapshot() {
     let harness = start_loopback("obs-local").await;
+    refreshed_go_catalog::persist_refreshed_go_catalog(&harness.state);
     let _guard =
         install_official_pricing_fetch_for_tests(harness.state.process_generation(), |_| {
             panic!("observability GET must not fetch official pricing")
@@ -386,7 +394,7 @@ async fn dashboard_v3_observability_gets_are_local_secret_free_and_share_one_sna
 }
 
 #[tokio::test]
-async fn dashboard_v3_stopped_gateway_status_redacts_account_secret_from_last_error() {
+async fn dashboard_v3_gateway_status_uses_current_listener_failure_and_ignores_history() {
     let harness = start_loopback("obs-last-error").await;
     let primary = harness.state.config().gateway_key.clone();
     harness
@@ -419,18 +427,27 @@ async fn dashboard_v3_stopped_gateway_status_redacts_account_secret_from_last_er
     assert_eq!(status, StatusCode::OK, "{body}");
     let parsed: GatewayStatus = serde_json::from_value(body.clone()).unwrap();
     assert!(!parsed.running);
+    assert!(
+        parsed.last_error.is_none(),
+        "historical mixed errors are not current listener failures"
+    );
+
+    let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    assert!(
+        ocg_core::gateway::start_gateway_on(harness.state.clone(), occupied.local_addr().unwrap(),)
+            .await
+            .is_err()
+    );
+    let (status, body) = harness
+        .get_json(&format!("{}/gateway/status", harness.v3_base))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let parsed: GatewayStatus = serde_json::from_value(body.clone()).unwrap();
     let last_error = parsed
         .last_error
         .as_deref()
-        .expect("stopped gateway must surface lastError");
-    assert!(
-        last_error.contains("listener failed"),
-        "lastError should keep the persisted gateway error text: {last_error}"
-    );
-    assert!(
-        last_error.contains("<redacted>"),
-        "lastError should apply known-secret redaction: {last_error}"
-    );
+        .expect("current bind failure must surface lastError");
+    assert!(!last_error.contains("listener failed with"));
     assert!(!last_error.contains(ACCOUNT_SECRET));
     assert!(!last_error.contains(&primary));
     assert!(body.as_object().unwrap().contains_key("lastError"));
@@ -438,12 +455,22 @@ async fn dashboard_v3_stopped_gateway_status_redacts_account_secret_from_last_er
     assert_secret_free(&body, &[ACCOUNT_SECRET, primary.as_str()]);
     assert_snapshot_tokens(&body, &harness);
 
+    drop(occupied);
+    let replacement =
+        ocg_core::gateway::start_gateway_on(harness.state.clone(), "127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+    assert!(harness.state.gateway_last_error().is_none());
+    ocg_core::gateway::stop_gateway_and_wait(replacement).await;
+
     harness.stop();
 }
 
 #[tokio::test]
-async fn dashboard_v3_and_v2_observability_coexist_with_stable_v2_shapes() {
-    let harness = start_loopback("obs-coexist").await;
+async fn v3_observability_stays_camel_case_after_v2_retirement() {
+    let harness = start_loopback("obs-v2-retired").await;
+    refreshed_go_catalog::persist_refreshed_go_catalog(&harness.state);
+    refreshed_go_catalog::persist_enabled_zen_catalog(&harness.state);
     harness
         .state
         .db
@@ -494,7 +521,7 @@ async fn dashboard_v3_and_v2_observability_coexist_with_stable_v2_shapes() {
     let parsed: DashboardSummary = serde_json::from_value(v3_summary).unwrap();
     assert!(parsed.total_accounts >= 2);
     assert!(parsed.available_accounts >= 2);
-    assert!((parsed.today_cost - 1.25).abs() < 1e-9);
+    assert!(parsed.today_cost.is_none());
 
     harness
         .assert_v2_path_removed(
@@ -519,8 +546,9 @@ async fn dashboard_v3_and_v2_observability_coexist_with_stable_v2_shapes() {
 }
 
 #[tokio::test]
-async fn dashboard_v3_application_models_follow_current_routeable_intersection() {
+async fn dashboard_v3_application_models_follow_enabled_go_catalog_independently_of_pricing() {
     let harness = start_loopback("obs-app-models").await;
+    refreshed_go_catalog::persist_refreshed_go_catalog(&harness.state);
     let _guard =
         install_official_pricing_fetch_for_tests(harness.state.process_generation(), |_| {
             panic!("GET /application-models must not fetch official pricing")
@@ -533,7 +561,7 @@ async fn dashboard_v3_application_models_follow_current_routeable_intersection()
     let models: ApplicationModels = serde_json::from_value(body).unwrap();
     assert!(models.models.contains(&"minimax-m2.7".into()));
     assert!(!models.models.contains(&"minimax-m2.7-highspeed".into()));
-    assert!(!models.models.contains(&"glm-5".into()));
+    assert!(models.models.contains(&"glm-5".into()));
 
     let mut pricing = harness.state.pricing_snapshot().as_ref().clone();
     pricing.models.retain(|model| model.model_id == "grok-4.5");
@@ -544,7 +572,7 @@ async fn dashboard_v3_application_models_follow_current_routeable_intersection()
         .get_json(&format!("{}/application-models", harness.v3_base))
         .await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["models"], json!(["grok-4.5"]));
+    assert_eq!(body["models"], json!(models.models));
 
     let mut empty = harness.state.pricing_snapshot().as_ref().clone();
     empty.models.clear();
@@ -555,11 +583,7 @@ async fn dashboard_v3_application_models_follow_current_routeable_intersection()
         .get_json(&format!("{}/application-models", harness.v3_base))
         .await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["models"], json!([]));
-
-    harness
-        .assert_v2_path_removed(reqwest::Method::GET, "/application-models", None)
-        .await;
+    assert_eq!(body["models"], json!(models.models));
 
     harness.stop();
 }
@@ -592,15 +616,13 @@ async fn dashboard_v3_summary_and_daily_cost_match_seeded_logs() {
         db.log_forward(&skipped).unwrap();
     }
 
-    harness
-        .assert_v2_path_removed(reqwest::Method::GET, "/dashboard/summary", None)
-        .await;
     let (v3_status, v3_summary) = harness
         .get_json(&format!("{}/dashboard/summary", harness.v3_base))
         .await;
     assert_eq!(v3_status, StatusCode::OK, "{v3_summary}");
-    assert!((v3_summary["todayCost"].as_f64().unwrap() - 3.0).abs() < 1e-9);
-    assert!((v3_summary["weekCost"].as_f64().unwrap() - 6.0).abs() < 1e-9);
+    assert!(v3_summary["todayCost"].is_null(), "{v3_summary}");
+    assert!(v3_summary["weekCost"].is_null(), "{v3_summary}");
+    assert!(v3_summary["monthCost"].is_null(), "{v3_summary}");
 
     let (status, daily) = harness
         .get_json(&format!(

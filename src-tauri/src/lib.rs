@@ -25,7 +25,14 @@ use tauri::Manager;
 const GATEWAY_PORT_ENV: &str = "OCG_GATEWAY_PORT";
 
 pub fn run() {
+    ocg_core::process_log::init();
     ocg_core::cpa_runtime::host::run_internal_supervisor_if_requested();
+    if let Some(found) = newer_schema_version() {
+        if startup_ui::prompt_update_for_newer_schema(found, ocg_core::db::CURRENT_SCHEMA_VERSION) {
+            updater::run_standalone_update(&data_dir());
+        }
+        return;
+    }
     let application = tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
             if !args.iter().any(|arg| arg == "--startup")
@@ -42,6 +49,7 @@ pub fn run() {
         .setup(|app| {
             // Plugin setup (including single-instance ownership) precedes this
             // callback, so a secondary process never opens data or binds ports.
+            ocg_core::process_log::activate_file_sink(&data_dir());
             let mut app_state = initialize_host()?;
             if startup_recovery::prepare(&app_state.core)? {
                 // The old CLI could have written while its recovery prompt was
@@ -51,6 +59,28 @@ pub fn run() {
                 app_state = initialize_host()?;
             }
             let core = &app_state.core;
+            if !cfg!(debug_assertions) {
+                match ocg_core::skill_install::sync_user_skill() {
+                    Ok(result)
+                        if result.status != ocg_core::skill_install::SkillSyncStatus::UpToDate =>
+                    {
+                        let status = match result.status {
+                            ocg_core::skill_install::SkillSyncStatus::Installed => "installed",
+                            ocg_core::skill_install::SkillSyncStatus::Updated => "updated",
+                            ocg_core::skill_install::SkillSyncStatus::UpToDate => "up to date",
+                        };
+                        core.log_runtime_event("info", "skill", &format!("Codex skill {status}"));
+                    }
+                    Ok(_) => {}
+                    Err(_) => {
+                        core.log_runtime_event(
+                            "warn",
+                            "skill",
+                            "Codex skill synchronization failed",
+                        );
+                    }
+                }
+            }
             if let Ok(resource_dir) = app.path().resource_dir() {
                 core.set_dashboard_dir(Some(resource_dir.join("dist")));
             }
@@ -59,6 +89,10 @@ pub fn run() {
             host::register_dock_visibility(core, app);
             updater::configure(app.handle(), core.clone())?;
             host::gateway::start_on_configured_port(core)?;
+            let restorer = core.clone();
+            tauri::async_runtime::spawn(async move {
+                restorer.restore_owned_cpa_runtime_on_startup().await;
+            });
             if !autostart::is_startup_launch() {
                 tray::open_dashboard(app.handle());
             }
@@ -86,12 +120,28 @@ pub fn run() {
             host::close_native_browsers(&state.browser_processes, &core.data_dir());
             host::cpa_runtime::stop_on_exit(core);
             host::gateway::stop_listener(core);
-            let _ = core
-                .db
-                .lock()
-                .log_gateway("info", "gateway", "application exiting");
+            core.log_runtime_event("info", "gateway", "application exiting");
         }
     });
+}
+
+/// The Tauri builder panics on setup-hook errors, so a newer-than-supported
+/// database is intercepted before it to give the user an actionable dialog.
+/// Probe failures fall through: the normal open path reports its own error.
+/// Development builds skip the interception (set OCG_DEV_STARTUP_GUARD=1 to
+/// exercise it): they are expected to run against any local schema.
+fn newer_schema_version() -> Option<i32> {
+    if cfg!(debug_assertions) && std::env::var_os("OCG_DEV_STARTUP_GUARD").is_none() {
+        return None;
+    }
+    match ocg_core::db::peek_schema_version(&data_dir()) {
+        Ok(Some(found)) if found > ocg_core::db::CURRENT_SCHEMA_VERSION => Some(found),
+        Ok(_) => None,
+        Err(error) => {
+            tracing::warn!("failed to probe the database schema version: {error:#}");
+            None
+        }
+    }
 }
 
 fn initialize_host() -> Result<state::AppState> {
@@ -104,7 +154,8 @@ fn initialize_host() -> Result<state::AppState> {
     }
 
     host::register_desktop_settings(&core_state);
-    host::application_connectors::register(&core_state, cipher);
+    ocg_core::dsh_application_host::register(&core_state);
+    ocg_core::byok_application_host::register(&core_state);
     host::cpa_runtime::register(&core_state);
 
     let browser_processes = Arc::new(Mutex::new(BrowserProcessState::default()));

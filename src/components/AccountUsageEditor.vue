@@ -8,28 +8,26 @@
     </p>
     <template v-for="limit in limits" :key="limit.key">
       <div
-        v-if="!isUsageLimitReached(account, limit.key, now)"
+        v-if="limit.editable"
         class="usage-editor-row"
       >
         <div class="usage-editor-label">
           <span>{{ limit.label }}</span>
           <span class="usage-editor-value">
-            {{ formatCost(usage[limit.key]) }} /
-            {{ formatCost(limit.limit) }} ·
-            {{ edits[limit.key].draft }}%
+            {{ percentLabel(usage[limit.key]) }}
           </span>
         </div>
         <div class="usage-editor">
           <n-input-number
-            :value="edits[limit.key].draft"
+            :value="draftValue(limit.key)"
             :min="0"
             :max="100"
             :step="0.1"
             :precision="1"
             size="tiny"
             :show-button="false"
-            :disabled="loading || edits[limit.key].saving"
-            :status="edits[limit.key].error ? 'error' : undefined"
+            :disabled="editSaving(limit.key)"
+            :status="editError(limit.key) ? 'error' : undefined"
             :input-props="{
               'aria-label': t('{name} {period} 当前用量百分比', {
                 name: account.name,
@@ -43,15 +41,16 @@
             <template #suffix>%</template>
           </n-input-number>
           <n-slider
+            v-if="draftValue(limit.key) !== null"
             v-usage-slider-label="t('{name} {period} 当前用量百分比', {
               name: account.name,
               period: limit.label,
             })"
-            :value="edits[limit.key].draft"
+            :value="draftValue(limit.key) ?? 0"
             :min="0"
             :max="100"
             :step="0.1"
-            :disabled="loading || edits[limit.key].saving"
+            :disabled="editSaving(limit.key)"
             @update:value="emit('update-draft', limit.key, $event)"
             @dragend="emit('save', limit.key)"
             @focusout="emit('save', limit.key)"
@@ -67,7 +66,7 @@
               :step="1"
               size="tiny"
               :show-button="false"
-              :disabled="loading || edits[limit.key].saving"
+              :disabled="editSaving(limit.key)"
               :input-props="{
                 'aria-label': t('{name} {period} 距上游重置还剩{unit}', {
                   name: account.name,
@@ -88,7 +87,7 @@
               :step="1"
               size="tiny"
               :show-button="false"
-              :disabled="loading || edits[limit.key].saving"
+              :disabled="editSaving(limit.key)"
               :input-props="{
                 'aria-label': t('{name} {period} 距上游重置还剩{unit}', {
                   name: account.name,
@@ -108,12 +107,12 @@
           </span>
         </div>
         <span
-          v-if="edits[limit.key].error"
+          v-if="editError(limit.key)"
           class="usage-save-error"
           role="alert"
         >
-          {{ t("用量保存失败: {error}", {
-            error: edits[limit.key].error || "",
+          {{ t("用量保存失败：{error}", {
+            error: editError(limit.key) || "",
           }) }}
         </span>
       </div>
@@ -125,7 +124,6 @@
 import { NInputNumber, NSlider } from "naive-ui";
 import type { Account, UsageWindow } from "../api/dashboard";
 import {
-  isUsageLimitReached,
   resetsFirstFieldMax,
   resetsFirstFieldValue,
   resetsSecondFieldMax,
@@ -135,16 +133,32 @@ import {
 import type { UsageKey } from "../domain/accounts-usage.ts";
 import type { AccountUsageEdits, UsageLimitView } from "../domain/useAccountUsage.ts";
 import { t } from "../i18n/index.ts";
-import { formatCost } from "../utils/format.ts";
 
-defineProps<{
+const props = defineProps<{
   account: Account;
   usage: UsageWindow;
   limits: UsageLimitView[];
   edits: AccountUsageEdits;
-  loading: boolean;
   now: number;
 }>();
+
+function percentLabel(value: number | null | undefined): string {
+  if (typeof value !== "number" || !Number.isFinite(value)) return t("未知");
+  return `${Math.round(value * 10) / 10}%`;
+}
+
+function draftValue(key: UsageKey): number | null {
+  const draft = props.edits[key]?.draft;
+  return typeof draft === "number" && Number.isFinite(draft) ? draft : null;
+}
+
+function editSaving(key: UsageKey): boolean {
+  return props.edits[key]?.saving === true;
+}
+
+function editError(key: UsageKey): string | null {
+  return props.edits[key]?.error ?? null;
+}
 
 const emit = defineEmits<{
   "update-draft": [key: UsageKey, value: number | null];
@@ -175,7 +189,7 @@ function resetsSecondLabel(key: UsageKey): string {
 .usage-editor-popover {
   display: grid;
   width: 100%;
-  gap: 12px;
+  gap: var(--ocg-space-md);
 }
 
 .usage-editor-caption {
@@ -187,11 +201,11 @@ function resetsSecondLabel(key: UsageKey): string {
 
 .usage-editor-row {
   display: grid;
-  gap: 8px;
+  gap: var(--ocg-space-sm);
 }
 
 .usage-editor-row + .usage-editor-row {
-  padding-top: 12px;
+  padding-top: var(--ocg-space-md);
   border-top: 1px solid var(--ocg-divider);
 }
 
@@ -199,7 +213,7 @@ function resetsSecondLabel(key: UsageKey): string {
   display: flex;
   align-items: baseline;
   justify-content: space-between;
-  gap: 12px;
+  gap: var(--ocg-space-md);
   color: var(--ocg-ink);
   font-size: var(--ocg-font-sm);
   font-weight: 600;

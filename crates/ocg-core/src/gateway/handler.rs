@@ -1,25 +1,23 @@
-use crate::alias;
 use crate::gateway::diagnostics::{
     ErrorDiagnostic, REQUEST_ID_HEADER, RequestTrace, emit_failure, log_request_failure,
     serialize_diagnostic,
 };
 use crate::gateway::executor::GatewayExecutor;
 use crate::gateway::forwarder::UpstreamPayloadTooLargeResponse;
-use crate::gateway::materialize::protocol_error_from_resolve;
+use crate::gateway::materialize::{mapping_adapter_kind, mapping_is_custom_http_catalog};
 use crate::gateway::protocol::{ProtocolError, parse_client_request, parse_gemini_request};
 use crate::gateway::response::{
     local_protocol_failure, protocol_error_from, protocol_error_response,
 };
 use crate::kernel::protocol::ApiFormat;
-use crate::models::{
-    CLAUDE_DESKTOP_HAIKU_ALIAS, CLAUDE_DESKTOP_OPUS_ALIAS, CLAUDE_DESKTOP_SONNET_ALIAS,
-};
+use crate::provider::ProviderAdapterKind;
 use crate::state::CoreState;
 use axum::body::{Body, Bytes};
 use axum::extract::{Extension, Path, State};
 use axum::http::{HeaderMap, HeaderValue, Request, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
+use std::sync::OnceLock;
 
 pub async fn request_trace_middleware(
     State(state): State<CoreState>,
@@ -27,20 +25,49 @@ pub async fn request_trace_middleware(
     next: Next,
 ) -> Response {
     let credential = extract_client_key(request.headers(), &state);
-    let trace = credential
+    let mut trace = credential
         .as_ref()
         .map(|entry| RequestTrace::new().with_client_key(entry.id.clone(), entry.name.clone()))
         .unwrap_or_default();
     let path = request.uri().path().to_string();
+    trace.path = request.uri().to_string();
     let client_body_bytes = request
         .headers()
         .get(axum::http::header::CONTENT_LENGTH)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.parse::<usize>().ok());
     let authenticated = credential.is_some();
+    let record_events = authenticated && !path.ends_with(":countTokens");
+    if record_events {
+        super::diagnostics::log_event(
+            &trace,
+            "debug",
+            "request",
+            "request_received",
+            None,
+            serde_json::json!({"method": request.method().as_str(), "format": super::diagnostics::api_format_name(client_format_for_path(&path)), "body_bytes": client_body_bytes, "authenticated": authenticated}),
+        );
+    }
     request.extensions_mut().insert(trace.clone());
     let mut response = next.run(request).await;
-
+    if record_events {
+        let level = if response.status().is_server_error() {
+            "error"
+        } else if response.status().is_client_error() {
+            "warn"
+        } else {
+            "info"
+        };
+        super::diagnostics::log_event(
+            &trace,
+            level,
+            "request",
+            "response_ready",
+            None,
+            serde_json::json!({"status": response.status().as_u16(), "authenticated": authenticated,
+            "stream": response.headers().get("content-type").and_then(|v| v.to_str().ok()).is_some_and(|v| v.starts_with("text/event-stream"))}),
+        );
+    }
     if response.status() == StatusCode::PAYLOAD_TOO_LARGE
         && authenticated
         && response
@@ -50,7 +77,7 @@ pub async fn request_trace_middleware(
     {
         let mut diagnostic = ErrorDiagnostic::new(
             &trace,
-            1,
+            0,
             "client",
             "body_limit",
             client_format_for_path(&path),
@@ -117,56 +144,6 @@ pub async fn messages(
     proxy_handler(state, trace, headers, body, ApiFormat::Messages).await
 }
 
-pub async fn claude_desktop_messages(
-    State(state): State<CoreState>,
-    Extension(trace): Extension<RequestTrace>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> axum::response::Response {
-    proxy_handler_inner(state, trace, headers, body, ApiFormat::Messages, true).await
-}
-
-pub async fn claude_desktop_models(
-    State(state): State<CoreState>,
-    headers: HeaderMap,
-) -> axum::response::Response {
-    if !check_auth(&headers, &state) {
-        return protocol_error_response(
-            ApiFormat::Messages,
-            StatusCode::UNAUTHORIZED,
-            "invalid gateway key",
-            None,
-        );
-    }
-
-    axum::Json(serde_json::json!({
-        "data": [
-            {
-                "type": "model",
-                "id": CLAUDE_DESKTOP_SONNET_ALIAS,
-                "display_name": "Claude Sonnet 4.6",
-                "created_at": "2026-02-17T00:00:00Z"
-            },
-            {
-                "type": "model",
-                "id": CLAUDE_DESKTOP_OPUS_ALIAS,
-                "display_name": "Claude Opus 4.6",
-                "created_at": "2026-02-05T00:00:00Z"
-            },
-            {
-                "type": "model",
-                "id": CLAUDE_DESKTOP_HAIKU_ALIAS,
-                "display_name": "Claude Haiku 4.5",
-                "created_at": "2025-10-01T00:00:00Z"
-            }
-        ],
-        "has_more": false,
-        "first_id": CLAUDE_DESKTOP_SONNET_ALIAS,
-        "last_id": CLAUDE_DESKTOP_HAIKU_ALIAS
-    }))
-    .into_response()
-}
-
 pub async fn gemini_model_action(
     State(state): State<CoreState>,
     Extension(trace): Extension<RequestTrace>,
@@ -227,12 +204,11 @@ pub async fn gemini_model_action(
     }
 }
 
-/// GET /v1/models —authenticated local Alias registry list.
+/// GET /v1/models: authenticated, local public model inventory.
 ///
-/// Returns OpenAI list JSON for routeable code-owned aliases, then eligible
-/// Custom capability IDs, de-duplicated and in deterministic order. Refreshed
-/// built-in catalogs can activate sealed names or add an exact raw pin, but
-/// cannot create arbitrary aliases. It never calls upstream.
+/// Includes curated aliases, exact Go catalog pins, and eligible Custom,
+/// CPA and dynamic names. Protocol and publication switches still apply.
+/// Catalog discovery never creates arbitrary shared aliases. No upstream I/O.
 pub async fn models(
     State(state): State<CoreState>,
     headers: HeaderMap,
@@ -249,66 +225,90 @@ pub async fn models(
 }
 
 fn published_alias_models_response(state: &CoreState) -> axum::response::Response {
-    let zen_catalog = state.zen_free_model_catalog();
-    let contracts = state.provider_contracts();
-    let go_ids = provider_catalog_model_ids(&contracts, crate::provider::OPENCODE_PROVIDER_ID);
-    let goat_ids =
-        provider_catalog_model_ids(&contracts, crate::provider::COMMAND_CODE_PROVIDER_ID);
-    let minimax_ids = provider_catalog_model_ids(&contracts, crate::provider::MINIMAX_PROVIDER_ID);
-    let kimi_ids = provider_catalog_model_ids(&contracts, crate::provider::KIMI_PROVIDER_ID);
-    let cpa_ids = active_cpa_model_ids(state);
-    let ollama_ids = provider_catalog_model_ids(&contracts, crate::provider::OLLAMA_PROVIDER_ID);
-    let ollama_pinned_ids = crate::provider_contracts::ollama_cloud_pinned_model_ids(&contracts);
-    let user_aliases = contracts.routeable_user_alias_bindings();
-    let custom_ids = match eligible_custom_public_models(state, &contracts) {
-        Ok(ids) => ids,
-        Err(error) => {
-            return protocol_error_response(
-                ApiFormat::ChatCompletions,
-                StatusCode::INTERNAL_SERVER_ERROR,
-                &format!("failed to load Custom accounts: {error}"),
-                None,
-            );
-        }
+    // Auth already ran against the credential snapshot. Capture routing,
+    // publication, models.dev, and metadata under the existing
+    // `settings_update` + DB locks, then release before registry construction,
+    // per-row enrichment, and JSON encoding.
+    let data = published_models_data(state);
+    match data {
+        Ok(data) => axum::Json(serde_json::json!({"object": "list", "data": data})).into_response(),
+        Err(error) => protocol_error_response(
+            ApiFormat::ChatCompletions,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &error,
+            None,
+        ),
+    }
+}
+
+struct PublishedModelsInputs {
+    routing: crate::routing_snapshot::RoutingSnapshot,
+    wall: chrono::DateTime<chrono::Utc>,
+    unpublished: std::sync::Arc<std::collections::HashSet<String>>,
+    modelsdev: std::sync::Arc<crate::modelsdev::ModelsDevCatalog>,
+    metadata: crate::model_metadata::CapturedModelMetadata,
+}
+
+/// Caller already holds `settings_update`. Load DB facts without taking that
+/// gate again so BYOK can reuse the same builder.
+fn capture_published_models_inputs(state: &CoreState) -> Result<PublishedModelsInputs, String> {
+    let (mut routing, metadata) = {
+        let db = state.db.lock();
+        let routing = crate::routing_snapshot::RoutingSnapshot::load(&db)
+            .map_err(|error| format!("failed to load routing configuration: {error}"))?;
+        let metadata = crate::model_metadata::CapturedModelMetadata::load(&db)
+            .map_err(|error| format!("failed to load model metadata: {error}"))?;
+        (routing, metadata)
     };
-    let dynamics = state.dynamic_providers();
-    let extra: Vec<_> = dynamics
-        .iter()
-        .map(crate::dynamic::DynamicProviderRuntime::alias_catalog)
-        .collect();
-    let catalogs = crate::alias::RuntimeCatalogs {
-        go: &go_ids,
-        zen_free: &zen_catalog.models,
-        custom: &custom_ids,
-        command_code: &goat_ids,
-        minimax: &minimax_ids,
-        kimi: &kimi_ids,
-        cpa: &cpa_ids,
-        ollama: &ollama_ids,
-        ollama_pinned: &ollama_pinned_ids,
-        user_aliases: &user_aliases,
-        extra: &extra,
-    };
-    let published = crate::alias::published_routeable_aliases_with_runtime_catalogs(catalogs);
+    {
+        let probes = state.quota_probes.lock();
+        routing.apply_quota_probes(&probes);
+    }
+    Ok(PublishedModelsInputs {
+        routing,
+        wall: state.sample_gateway_clock().0,
+        unpublished: state.unpublished_public_models(),
+        modelsdev: state.modelsdev_catalog(),
+        metadata,
+    })
+}
+
+fn build_published_models(
+    state: &CoreState,
+    inputs: PublishedModelsInputs,
+) -> Result<Vec<serde_json::Value>, String> {
+    let snapshot = RuntimeCatalogSnapshot::from_routing(inputs.routing, inputs.wall);
+    let unpublished = inputs.unpublished;
+    let custom_ids = &snapshot.custom;
+    let cpa_ids = &snapshot.cpa;
+    let published = snapshot.published_routeable_models();
     let mut data: Vec<serde_json::Value> = published
         .iter()
-        .filter(|item| published_alias_has_enabled_protocol(item, catalogs, &contracts, &dynamics))
+        .filter(|item| {
+            crate::alias_publication::is_downstream_visible(&item.alias, &unpublished)
+                && snapshot.model_has_enabled_protocol(&item.alias)
+        })
         .map(|item| {
             serde_json::json!({
                 "id": item.alias,
                 "object": "model",
                 "created": 0,
-                "owned_by": item.owned_by
+                "owned_by": snapshot.output_provider_id(&item.owned_by)
             })
         })
         .collect();
-    for id in &custom_ids {
+    for id in custom_ids {
         let routeable_custom_alias = matches!(
-            crate::alias::resolve_with_runtime_catalogs(id, catalogs),
+            snapshot.resolve(id),
             Ok(crate::alias::ResolvedModel::Alias { mappings, .. })
-                if mappings.iter().any(|mapping| mapping.is_custom_api() && mapping.routeable)
+                if mappings.iter().any(|mapping| {
+                    mapping.routeable && mapping_is_custom_http_catalog(mapping)
+                })
         );
         if !routeable_custom_alias {
+            continue;
+        }
+        if !crate::alias_publication::is_downstream_visible(id, &unpublished) {
             continue;
         }
         if data.iter().any(|item| {
@@ -327,11 +327,13 @@ fn published_alias_models_response(state: &CoreState) -> axum::response::Respons
     }
     for id in cpa_ids.iter() {
         let exact_cpa_raw = matches!(
-            crate::alias::resolve_with_runtime_catalogs(id, catalogs),
+            snapshot.resolve(id),
             Ok(crate::alias::ResolvedModel::PinnedRaw { mapping, .. })
-                if mapping.provider_id == crate::provider::CPA_PROVIDER_ID && mapping.routeable
+                if mapping.routeable
+                    && mapping_adapter_kind(&mapping) == Some(ProviderAdapterKind::Cpa)
         );
         if exact_cpa_raw
+            && crate::alias_publication::is_downstream_visible(id, &unpublished)
             && !data
                 .iter()
                 .any(|item| item.get("id").and_then(|value| value.as_str()) == Some(id))
@@ -344,27 +346,90 @@ fn published_alias_models_response(state: &CoreState) -> axum::response::Respons
             }));
         }
     }
-    for catalog in &extra {
+    for catalog in &snapshot.extra {
         for (public_model, _upstream_model) in &catalog.mappings {
             if published_model_ids_contain(&data, public_model) {
                 continue;
             }
-            if !model_has_enabled_protocol(public_model, catalogs, &contracts, &dynamics) {
+            if !crate::alias_publication::is_downstream_visible(public_model, &unpublished) {
+                continue;
+            }
+            if !snapshot.model_has_enabled_protocol(public_model) {
                 continue;
             }
             data.push(serde_json::json!({
                 "id": public_model,
                 "object": "model",
                 "created": 0,
-                "owned_by": catalog.provider_id
+                "owned_by": snapshot.output_provider_id(&catalog.provider_id)
             }));
         }
     }
-    axum::Json(serde_json::json!({
-        "object": "list",
-        "data": data
-    }))
-    .into_response()
+    crate::modelsdev::ensure_fresh(state);
+    crate::model_metadata::enrich_captured(
+        &inputs.metadata,
+        &inputs.modelsdev,
+        &snapshot,
+        &mut data,
+    )
+    .map_err(|_| "failed to load model metadata".to_string())?;
+    data.retain(|row| {
+        crate::model_metadata::read_published_protocol_profile(
+            row.get("ocg").and_then(|value| value.get("protocols")),
+        )
+        .is_ok()
+    });
+    Ok(data)
+}
+
+/// Authenticated client inventory from captured DB routing facts.
+///
+/// BYOK callers already hold `settings_update`. This path must not take that
+/// gate again; GET `/v1/models` captures under the gate, then builds after
+/// release.
+pub(crate) fn published_models_data_locked(
+    state: &CoreState,
+) -> Result<Vec<serde_json::Value>, String> {
+    build_published_models(state, capture_published_models_inputs(state)?)
+}
+
+fn published_models_data(state: &CoreState) -> Result<Vec<serde_json::Value>, String> {
+    let inputs = {
+        let _settings_update = state.settings_update.lock();
+        capture_published_models_inputs(state)?
+    };
+    #[cfg(test)]
+    notify_after_published_models_capture();
+    build_published_models(state, inputs)
+}
+
+#[cfg(test)]
+thread_local! {
+    static AFTER_PUBLISHED_MODELS_CAPTURE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
+}
+
+#[cfg(test)]
+pub(crate) fn set_after_published_models_capture(hook: Box<dyn FnOnce()>) {
+    AFTER_PUBLISHED_MODELS_CAPTURE.with(|slot| {
+        *slot.borrow_mut() = Some(hook);
+    });
+}
+
+#[cfg(test)]
+pub(crate) fn clear_after_published_models_capture() {
+    AFTER_PUBLISHED_MODELS_CAPTURE.with(|slot| {
+        slot.borrow_mut().take();
+    });
+}
+
+#[cfg(test)]
+fn notify_after_published_models_capture() {
+    AFTER_PUBLISHED_MODELS_CAPTURE.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().take() {
+            hook();
+        }
+    });
 }
 
 fn published_model_ids_contain(data: &[serde_json::Value], id: &str) -> bool {
@@ -375,103 +440,293 @@ fn published_model_ids_contain(data: &[serde_json::Value], id: &str) -> bool {
     })
 }
 
-fn published_alias_has_enabled_protocol(
-    item: &alias::PublishedAlias,
-    catalogs: alias::RuntimeCatalogs<'_>,
-    contracts: &crate::provider_contracts::EffectiveContractSet,
-    dynamics: &[crate::dynamic::DynamicProviderRuntime],
-) -> bool {
-    model_has_enabled_protocol(
-        &item.alias,
-        alias::RuntimeCatalogs {
-            custom: &[],
-            ..catalogs
-        },
-        contracts,
-        dynamics,
-    )
+/// Owned runtime catalog inputs used by live send and the read-only explain
+/// path. Callers borrow [`Self::catalogs`] for alias resolution.
+pub(crate) struct RuntimeCatalogSnapshot {
+    pub routing: crate::routing_snapshot::RoutingSnapshot,
+    pub go: Vec<String>,
+    pub zen_free: Vec<String>,
+    pub custom: Vec<String>,
+    pub command_code: Vec<String>,
+    pub minimax: Vec<String>,
+    pub kimi: Vec<String>,
+    pub cpa: Vec<String>,
+    pub ollama: Vec<String>,
+    pub ollama_pinned: Vec<String>,
+    pub extra: Vec<crate::alias::ExtraProviderCatalog>,
+    pub builtin_aliases: Vec<crate::alias::ExtraProviderCatalog>,
+    index: OnceLock<crate::alias::RuntimeCatalogIndex>,
 }
 
-fn model_has_enabled_protocol(
-    model: &str,
-    catalogs: alias::RuntimeCatalogs<'_>,
-    contracts: &crate::provider_contracts::EffectiveContractSet,
-    dynamics: &[crate::dynamic::DynamicProviderRuntime],
-) -> bool {
-    match crate::alias::resolve_with_runtime_catalogs(model, catalogs) {
-        Ok(alias::ResolvedModel::Alias { mappings, .. }) => mappings.iter().any(|mapping| {
-            mapping.routeable
-                && (mapping.provider_id == crate::provider::CPA_PROVIDER_ID
-                    || crate::dynamic::find_runtime(dynamics, &mapping.provider_id).is_some()
-                    || contracts.mapping_has_enabled_protocol(mapping))
-        }),
-        Ok(alias::ResolvedModel::PinnedRaw { mapping, .. }) => {
-            mapping.routeable
-                && (mapping.provider_id == crate::provider::CPA_PROVIDER_ID
-                    || crate::dynamic::find_runtime(dynamics, &mapping.provider_id).is_some()
-                    || contracts.mapping_has_enabled_protocol(&mapping))
+impl RuntimeCatalogSnapshot {
+    pub(crate) fn catalogs(&self) -> crate::alias::RuntimeCatalogs<'_> {
+        crate::alias::RuntimeCatalogs {
+            go: &self.go,
+            zen_free: &self.zen_free,
+            custom: &self.custom,
+            command_code: &self.command_code,
+            minimax: &self.minimax,
+            kimi: &self.kimi,
+            cpa: &self.cpa,
+            ollama: &self.ollama,
+            ollama_pinned: &self.ollama_pinned,
+            extra: &self.extra,
+            builtin_aliases: &self.builtin_aliases,
         }
-        Err(_) => false,
+    }
+
+    fn index(&self) -> &crate::alias::RuntimeCatalogIndex {
+        self.index
+            .get_or_init(|| crate::alias::RuntimeCatalogIndex::from_catalogs(self.catalogs()))
+    }
+
+    fn published_routeable_models(&self) -> Vec<crate::alias::PublishedAlias> {
+        self.index().published_models()
     }
 }
 
-fn provider_catalog_model_ids(
-    contracts: &crate::provider_contracts::EffectiveContractSet,
-    provider_id: &str,
-) -> Vec<String> {
-    contracts
-        .provider_offering(provider_id)
-        .filter(|scope| {
-            provider_id != crate::provider::OPENCODE_PROVIDER_ID
-                || scope.catalog.source == crate::provider_contracts::CATALOG_SOURCE_OPENCODE_MODELS
-        })
-        .map(|scope| scope.catalog.models.clone())
-        .unwrap_or_default()
-}
-
-fn eligible_custom_public_models(
+pub(crate) fn runtime_catalog_snapshot(
     state: &CoreState,
-    contracts: &crate::provider_contracts::EffectiveContractSet,
-) -> anyhow::Result<Vec<String>> {
-    let runtimes = state.db.lock().list_custom_account_runtimes()?;
-    Ok(crate::custom::eligible_custom_public_models(&runtimes)
-        .into_iter()
-        .filter(|id| {
-            runtimes.iter().any(|runtime| {
-                runtime.eligible()
-                    && runtime.capability_matching_public(id).is_some()
-                    && contracts
-                        .scope(&crate::provider_contracts::ContractScope::custom_endpoint(
-                            &runtime.account_id,
-                        ))
-                        .is_some_and(|contract| contract.model_has_enabled_protocol(id))
-            })
-        })
-        .collect())
+) -> anyhow::Result<RuntimeCatalogSnapshot> {
+    let mut routing = crate::routing_snapshot::RoutingSnapshot::load(&state.db.lock())?;
+    {
+        let probes = state.quota_probes.lock();
+        routing.apply_quota_probes(&probes);
+    }
+    Ok(RuntimeCatalogSnapshot::from_routing(
+        routing,
+        state.sample_gateway_clock().0,
+    ))
 }
 
-/// A disabled, cooling, auth-failed, or disconnected CPA must not inject raw
-/// identities before the ordinary selector can fall back to existing routes.
-fn active_cpa_model_ids(state: &CoreState) -> std::sync::Arc<Vec<String>> {
-    let active = {
-        let db = state.db.lock();
-        db.cpa_integration().ok().flatten().is_some_and(|_| {
-            db.get_account(crate::provider::CPA_ACCOUNT_ID)
-                .ok()
-                .flatten()
-                .is_some_and(|account| {
-                    crate::routing_runtime::account_is_available_for(
-                        &account,
-                        crate::models::UpstreamChannel::Go,
-                        &[],
+impl RuntimeCatalogSnapshot {
+    pub(crate) fn from_routing(
+        routing: crate::routing_snapshot::RoutingSnapshot,
+        wall: chrono::DateTime<chrono::Utc>,
+    ) -> Self {
+        use ocg_domain::destination::{AdapterKind, AuthScheme, ModelResolution};
+        let mut result = Self {
+            go: vec![],
+            zen_free: vec![],
+            custom: vec![],
+            command_code: vec![],
+            minimax: vec![],
+            kimi: vec![],
+            cpa: vec![],
+            ollama: vec![],
+            ollama_pinned: vec![],
+            extra: vec![],
+            builtin_aliases: vec![],
+            routing,
+            index: OnceLock::new(),
+        };
+        for d in &result.routing.projection.destinations {
+            let active = d.enabled
+                && result.routing.credentials.iter().any(|c| {
+                    c.destination_id == d.id
+                        && c.enabled
+                        && c.ready
+                        && c.binding_enabled
+                        && (d.auth_scheme == AuthScheme::None || !c.key_cipher.is_empty())
+                        && (d.adapter != AdapterKind::Cpa
+                            || (c.auth_error.is_none()
+                                && !c.is_cooling_for(crate::models::UpstreamChannel::Go, wall)))
+                });
+            let ids = d
+                .catalog
+                .iter()
+                .map(|m| m.upstream_model.clone())
+                .collect::<Vec<_>>();
+            if d.adapter != AdapterKind::Http
+                && d.adapter != AdapterKind::Cpa
+                && let ocg_domain::destination::LegacyDestinationRef::Builtin(provider_id) =
+                    &d.legacy
+            {
+                let mappings = d
+                    .catalog
+                    .iter()
+                    .filter(|m| m.public_model != m.upstream_model)
+                    .map(|m| (m.public_model.clone(), m.upstream_model.clone()))
+                    .collect::<Vec<_>>();
+                if !mappings.is_empty() {
+                    result
+                        .builtin_aliases
+                        .push(crate::alias::ExtraProviderCatalog {
+                            provider_id: provider_id.clone(),
+                            mappings,
+                        });
+                }
+            }
+            match d.adapter {
+                AdapterKind::OpencodeGo => result.go.extend(ids),
+                AdapterKind::Zen => result.zen_free.extend(ids),
+                AdapterKind::Goat => result.command_code.extend(ids),
+                AdapterKind::Minimax => result.minimax.extend(ids),
+                AdapterKind::Kimi => result.kimi.extend(ids),
+                AdapterKind::Ollama => {
+                    result.ollama.extend(ids);
+                    result
+                        .ollama_pinned
+                        .extend(result.routing.ollama_pinned.iter().cloned());
+                }
+                AdapterKind::Cpa if active => result.cpa.extend(
+                    d.catalog
+                        .iter()
+                        .filter(|m| m.enabled && !m.protocols.is_empty())
+                        .map(|m| m.upstream_model.clone()),
+                ),
+                AdapterKind::Http => {
+                    if d.model_resolution == ModelResolution::PublicOnly {
+                        if active {
+                            result.custom.extend(
+                                d.catalog
+                                    .iter()
+                                    .filter(|m| m.enabled && !m.protocols.is_empty())
+                                    .map(|m| m.public_model.clone()),
+                            );
+                        }
+                    } else {
+                        result.extra.push(crate::alias::ExtraProviderCatalog {
+                            provider_id: d.id.clone(),
+                            mappings: d
+                                .catalog
+                                .iter()
+                                .map(|m| (m.public_model.clone(), m.upstream_model.clone()))
+                                .collect(),
+                        });
+                    }
+                }
+                AdapterKind::Cpa => {}
+            }
+        }
+        result
+    }
+
+    /// Preserve public-name precedence, then require a raw pin to identify
+    /// one transport within its destination as well as one destination.
+    pub(crate) fn resolve(
+        &self,
+        requested: &str,
+    ) -> Result<crate::alias::ResolvedModel, crate::alias::ResolveError> {
+        let resolved = self.index().resolve(requested)?;
+        let crate::alias::ResolvedModel::PinnedRaw { mapping, .. } = &resolved else {
+            return Ok(resolved);
+        };
+        use ocg_domain::destination::{AdapterKind, ModelResolution};
+        if let Some(destination) = self.routing.projection.destinations.iter().find(|d| {
+            d.id == mapping.provider_id
+                && d.adapter == AdapterKind::Http
+                && d.model_resolution == ModelResolution::PublicAndUpstream
+        }) && !destination
+            .catalog
+            .iter()
+            .any(|row| crate::custom::custom_model_id_matches(&row.public_model, requested))
+        {
+            let rows = destination
+                .catalog
+                .iter()
+                .filter(|row| {
+                    crate::custom::custom_model_id_matches(
+                        &row.upstream_model,
+                        &mapping.upstream_model,
                     )
                 })
+                .collect::<Vec<_>>();
+            if let Some(first) = rows.first()
+                && rows
+                    .iter()
+                    .skip(1)
+                    .any(|row| !same_http_transport(destination, first, row))
+            {
+                return Err(crate::alias::ResolveError::Ambiguous {
+                    requested: requested.into(),
+                    mappings: rows.iter().map(|_| mapping.clone()).collect(),
+                });
+            }
+        }
+        Ok(resolved)
+    }
+
+    /// Compatibility attribution only; never used for resolution or dispatch.
+    pub(crate) fn output_provider_id(&self, identity: &str) -> String {
+        let Some(destination) = self
+            .routing
+            .projection
+            .destinations
+            .iter()
+            .find(|d| d.id == identity)
+        else {
+            return identity.into();
+        };
+        self.routing
+            .credentials
+            .iter()
+            .find(|c| c.destination_id == destination.id)
+            .map(|c| c.provider_id.clone())
+            .unwrap_or_else(|| match &destination.legacy {
+                ocg_domain::destination::LegacyDestinationRef::Dynamic(id)
+                | ocg_domain::destination::LegacyDestinationRef::Builtin(id) => id.clone(),
+                _ => crate::provider::CUSTOM_PROVIDER_ID.into(),
+            })
+    }
+
+    pub(crate) fn model_has_enabled_protocol(&self, name: &str) -> bool {
+        self.resolve(name).is_ok_and(|resolved| {
+            self.routing.projection.destinations.iter().any(|d| {
+                d.enabled
+                    && d.catalog.iter().any(|m| {
+                        m.enabled
+                            && !m.protocols.is_empty()
+                            && crate::gateway::materialize::resolved_contains_model(
+                                &resolved, d, m, name,
+                            )
+                            && (d.adapter != ocg_domain::destination::AdapterKind::Http
+                                || m.protocols.iter().any(|protocol| {
+                                    let Some(route) =
+                                        ocg_domain::destination::http_model_route(d, m, *protocol)
+                                    else {
+                                        return false;
+                                    };
+                                    self.routing.credentials.iter().any(|c| {
+                                        c.destination_id == d.id
+                                            && c.enabled
+                                            && c.ready
+                                            && c.binding_enabled
+                                            && (route.auth_scheme
+                                                == ocg_domain::destination::AuthScheme::None
+                                                || !c.key_cipher.is_empty())
+                                    })
+                                }))
+                    })
+            })
         })
+    }
+}
+
+fn same_http_transport(
+    destination: &ocg_domain::destination::Destination,
+    first: &ocg_domain::destination::CatalogModel,
+    second: &ocg_domain::destination::CatalogModel,
+) -> bool {
+    let route = |model: &ocg_domain::destination::CatalogModel| {
+        let mut routes = Vec::new();
+        for protocol in &model.protocols {
+            let saved = ocg_domain::destination::http_model_route(destination, model, *protocol)?;
+            let resolved =
+                crate::custom_http::resolve_custom_endpoints(&saved.endpoint_url, *protocol)
+                    .ok()?;
+            routes.push((
+                protocol.as_str(),
+                resolved.inference.to_string(),
+                saved.auth_scheme.as_str(),
+            ));
+        }
+        routes.sort_unstable();
+        Some(routes)
     };
-    if active {
-        state.cpa_model_catalog()
-    } else {
-        std::sync::Arc::new(Vec::new())
+    match (route(first), route(second)) {
+        (Some(first), Some(second)) => first == second,
+        _ => false,
     }
 }
 
@@ -482,7 +737,7 @@ async fn proxy_handler(
     body: Bytes,
     client_format: ApiFormat,
 ) -> axum::response::Response {
-    proxy_handler_inner(state, trace, headers, body, client_format, false).await
+    proxy_handler_inner(state, trace, headers, body, client_format).await
 }
 
 async fn proxy_handler_inner(
@@ -491,9 +746,7 @@ async fn proxy_handler_inner(
     headers: HeaderMap,
     body: Bytes,
     client_format: ApiFormat,
-    claude_desktop: bool,
 ) -> axum::response::Response {
-    let config = state.config();
     let client_body_bytes = body.len();
 
     let Some(client_key_id) = extract_client_key_id(&headers, &state) else {
@@ -505,6 +758,7 @@ async fn proxy_handler_inner(
         );
     };
 
+    super::debug_capture::capture_client(&state, &trace, &headers, body.clone()).await;
     let client_body = body.clone();
     let parsed = match parse_client_request(client_format, body) {
         Ok(parsed) => parsed,
@@ -520,86 +774,7 @@ async fn proxy_handler_inner(
         }
     };
     let client_model = parsed.requested_model.clone();
-    let routing_model = if claude_desktop {
-        match config
-            .claude_desktop_models
-            .model_for_alias(&parsed.requested_model)
-        {
-            Some(model) => model.to_string(),
-            None => {
-                return local_protocol_failure(
-                    &state,
-                    &trace,
-                    ApiFormat::Messages,
-                    ProtocolError::new(format!(
-                        "unsupported Claude Desktop model alias `{}`",
-                        parsed.requested_model
-                    )),
-                    Some(client_body_bytes),
-                    Some(&client_body),
-                );
-            }
-        }
-    } else {
-        parsed.requested_model.clone()
-    };
-    let contracts = state.provider_contracts();
-    let go_model_ids =
-        provider_catalog_model_ids(&contracts, crate::provider::OPENCODE_PROVIDER_ID);
-    let custom_model_ids = match eligible_custom_public_models(&state, &contracts) {
-        Ok(ids) => ids,
-        Err(error) => {
-            return protocol_error_response(
-                client_format,
-                StatusCode::INTERNAL_SERVER_ERROR,
-                &format!("failed to load Custom accounts: {error}"),
-                None,
-            );
-        }
-    };
-    let goat_model_ids =
-        provider_catalog_model_ids(&contracts, crate::provider::COMMAND_CODE_PROVIDER_ID);
-    let minimax_model_ids =
-        provider_catalog_model_ids(&contracts, crate::provider::MINIMAX_PROVIDER_ID);
-    let kimi_model_ids = provider_catalog_model_ids(&contracts, crate::provider::KIMI_PROVIDER_ID);
-    let cpa_model_ids = active_cpa_model_ids(&state);
-    let ollama_model_ids =
-        provider_catalog_model_ids(&contracts, crate::provider::OLLAMA_PROVIDER_ID);
-    let ollama_pinned_ids = crate::provider_contracts::ollama_cloud_pinned_model_ids(&contracts);
-    let user_aliases = contracts.routeable_user_alias_bindings();
-    let zen_catalog = state.zen_free_model_catalog();
-    let dynamics = state.dynamic_providers();
-    let extra: Vec<_> = dynamics
-        .iter()
-        .map(crate::dynamic::DynamicProviderRuntime::alias_catalog)
-        .collect();
-    let catalogs = crate::alias::RuntimeCatalogs {
-        go: &go_model_ids,
-        zen_free: &zen_catalog.models,
-        custom: &custom_model_ids,
-        command_code: &goat_model_ids,
-        minimax: &minimax_model_ids,
-        kimi: &kimi_model_ids,
-        cpa: &cpa_model_ids,
-        ollama: &ollama_model_ids,
-        ollama_pinned: &ollama_pinned_ids,
-        user_aliases: &user_aliases,
-        extra: &extra,
-    };
-    let resolved = match crate::alias::resolve_with_runtime_catalogs(&routing_model, catalogs) {
-        Ok(resolved) => resolved,
-        Err(error) => {
-            return local_protocol_failure(
-                &state,
-                &trace,
-                client_format,
-                protocol_error_from_resolve(error),
-                Some(client_body_bytes),
-                Some(&client_body),
-            );
-        }
-    };
-
+    let routing_model = parsed.requested_model.clone();
     GatewayExecutor::run(
         state,
         trace,
@@ -607,42 +782,11 @@ async fn proxy_handler_inner(
         headers,
         client_format,
         parsed,
-        resolved,
         client_model,
         routing_model,
-        config,
         Some(client_key_id),
-        contracts,
-        dynamics,
     )
     .await
-}
-
-#[cfg(test)]
-fn rewrite_claude_desktop_model(
-    body: &Bytes,
-    models: &crate::models::ClaudeDesktopModels,
-) -> Result<Bytes, ProtocolError> {
-    let mut request: serde_json::Value = serde_json::from_slice(body)
-        .map_err(|error| ProtocolError::new(format!("invalid JSON request: {error}")))?;
-    let object = request
-        .as_object_mut()
-        .ok_or_else(|| ProtocolError::new("request must be a JSON object"))?;
-    let alias = object
-        .get("model")
-        .and_then(serde_json::Value::as_str)
-        .filter(|model| !model.is_empty())
-        .ok_or_else(|| ProtocolError::new("request model is required"))?;
-    let model = models
-        .model_for_alias(alias)
-        .ok_or_else(|| {
-            ProtocolError::new(format!("unsupported Claude Desktop model alias `{alias}`"))
-        })?
-        .to_string();
-    object.insert("model".to_string(), serde_json::Value::String(model));
-    serde_json::to_vec(&request)
-        .map(Bytes::from)
-        .map_err(|error| ProtocolError::new(format!("failed to encode request: {error}")))
 }
 
 async fn gemini_proxy_handler(
@@ -653,7 +797,6 @@ async fn gemini_proxy_handler(
     model: String,
     stream: bool,
 ) -> axum::response::Response {
-    let config = state.config();
     let client_body_bytes = body.len();
     let Some(client_key_id) = extract_client_key_id(&headers, &state) else {
         return protocol_error_response(
@@ -663,6 +806,7 @@ async fn gemini_proxy_handler(
             None,
         );
     };
+    super::debug_capture::capture_client(&state, &trace, &headers, body.clone()).await;
     let parsed = match parse_gemini_request(model, stream, body.clone()) {
         Ok(parsed) => parsed,
         Err(error) => {
@@ -678,62 +822,6 @@ async fn gemini_proxy_handler(
     };
     let client_model = parsed.requested_model.clone();
     let routing_model = parsed.requested_model.clone();
-    let contracts = state.provider_contracts();
-    let go_model_ids =
-        provider_catalog_model_ids(&contracts, crate::provider::OPENCODE_PROVIDER_ID);
-    let custom_model_ids = match eligible_custom_public_models(&state, &contracts) {
-        Ok(ids) => ids,
-        Err(error) => {
-            return protocol_error_response(
-                ApiFormat::Gemini,
-                StatusCode::INTERNAL_SERVER_ERROR,
-                &format!("failed to load Custom accounts: {error}"),
-                None,
-            );
-        }
-    };
-    let goat_model_ids =
-        provider_catalog_model_ids(&contracts, crate::provider::COMMAND_CODE_PROVIDER_ID);
-    let minimax_model_ids =
-        provider_catalog_model_ids(&contracts, crate::provider::MINIMAX_PROVIDER_ID);
-    let kimi_model_ids = provider_catalog_model_ids(&contracts, crate::provider::KIMI_PROVIDER_ID);
-    let cpa_model_ids = active_cpa_model_ids(&state);
-    let ollama_model_ids =
-        provider_catalog_model_ids(&contracts, crate::provider::OLLAMA_PROVIDER_ID);
-    let ollama_pinned_ids = crate::provider_contracts::ollama_cloud_pinned_model_ids(&contracts);
-    let user_aliases = contracts.routeable_user_alias_bindings();
-    let zen_catalog = state.zen_free_model_catalog();
-    let dynamics = state.dynamic_providers();
-    let extra: Vec<_> = dynamics
-        .iter()
-        .map(crate::dynamic::DynamicProviderRuntime::alias_catalog)
-        .collect();
-    let catalogs = crate::alias::RuntimeCatalogs {
-        go: &go_model_ids,
-        zen_free: &zen_catalog.models,
-        custom: &custom_model_ids,
-        command_code: &goat_model_ids,
-        minimax: &minimax_model_ids,
-        kimi: &kimi_model_ids,
-        cpa: &cpa_model_ids,
-        ollama: &ollama_model_ids,
-        ollama_pinned: &ollama_pinned_ids,
-        user_aliases: &user_aliases,
-        extra: &extra,
-    };
-    let resolved = match crate::alias::resolve_with_runtime_catalogs(&routing_model, catalogs) {
-        Ok(resolved) => resolved,
-        Err(error) => {
-            return local_protocol_failure(
-                &state,
-                &trace,
-                ApiFormat::Gemini,
-                protocol_error_from_resolve(error),
-                Some(client_body_bytes),
-                Some(&body),
-            );
-        }
-    };
     GatewayExecutor::run(
         state,
         trace,
@@ -741,13 +829,9 @@ async fn gemini_proxy_handler(
         headers,
         ApiFormat::Gemini,
         parsed,
-        resolved,
         client_model,
         routing_model,
-        config,
         Some(client_key_id),
-        contracts,
-        dynamics,
     )
     .await
 }
@@ -861,7 +945,7 @@ fn local_failure_response(
     client_body_bytes: Option<usize>,
     summary_body: Option<&[u8]>,
 ) -> axum::response::Response {
-    let mut diagnostic = ErrorDiagnostic::new(trace, 1, error_source, error_stage, format);
+    let mut diagnostic = ErrorDiagnostic::new(trace, 0, error_source, error_stage, format);
     diagnostic.client_body_bytes = client_body_bytes;
     diagnostic.downstream_status = Some(status.as_u16());
     if let Some(body) = summary_body {
@@ -877,21 +961,20 @@ fn local_failure_response(
 }
 
 #[cfg(test)]
+fn active_cpa_model_ids(state: &CoreState) -> std::sync::Arc<Vec<String>> {
+    std::sync::Arc::new(runtime_catalog_snapshot(state).unwrap().cpa)
+}
+
+#[cfg(test)]
+mod local_receipt_tests;
+
+#[cfg(test)]
 mod tests {
-    use super::{
-        active_cpa_model_ids, check_auth, extract_client_key_id, rewrite_claude_desktop_model,
-    };
-    use crate::gateway::materialize::resolved_alias_from_model;
-    use crate::gateway::protocol::{
-        ApiFormat, MaterializeSpec, materialize_parsed_request, parse_client_request,
-        prepare_request,
-    };
+    use super::{active_cpa_model_ids, check_auth, extract_client_key_id};
     use crate::gateway_keys::{CredentialEntry, CredentialSnapshot, PRIMARY_KEY_ID};
-    use crate::models::{AppConfig, CLAUDE_DESKTOP_OPUS_ALIAS, ClaudeDesktopModels};
+    use crate::models::AppConfig;
     use crate::state::{CoreState, CoreStateInner};
-    use axum::body::Bytes;
     use axum::http::{HeaderMap, HeaderValue};
-    use serde_json::json;
     use std::collections::HashMap;
 
     /// Owns the temp data dir and releases the SQLite connection (and thus
@@ -1046,68 +1129,6 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("x-api-key", HeaderValue::from_static("ocg-laptop"));
         assert!(!check_auth(&headers, &state));
-    }
-
-    #[test]
-    fn claude_desktop_alias_is_rewritten_before_messages_preparation() {
-        let models = ClaudeDesktopModels {
-            sonnet: "glm-5.2".to_string(),
-            opus: String::new(),
-            haiku: String::new(),
-        };
-        let body = Bytes::from(
-            serde_json::to_vec(&json!({
-                "model": CLAUDE_DESKTOP_OPUS_ALIAS,
-                "max_tokens": 1,
-                "messages": [{"role":"user","content":"hi"}]
-            }))
-            .expect("test request should serialize"),
-        );
-
-        let rewritten =
-            rewrite_claude_desktop_model(&body, &models).expect("known alias should be rewritten");
-        let plan = prepare_request(ApiFormat::Messages, rewritten)
-            .expect("rewritten request should use the existing preparation path");
-
-        assert_eq!(plan.model, "glm-5.2");
-        // The current protocol snapshot exposes glm-5.2 through Chat only, so
-        // the Claude Desktop Messages request is converted after alias rewrite.
-        assert_eq!(plan.upstream, ApiFormat::ChatCompletions);
-
-        let parsed = parse_client_request(ApiFormat::Messages, body).expect("parse once");
-        assert_eq!(parsed.requested_model, CLAUDE_DESKTOP_OPUS_ALIAS);
-        let mapped = models
-            .model_for_alias(&parsed.requested_model)
-            .expect("opus inherits sonnet");
-        let resolved = crate::alias::resolve(mapped).expect("mapped Go alias");
-        assert!(matches!(
-            resolved,
-            crate::alias::ResolvedModel::Alias { ref alias, .. } if alias == "glm-5.2"
-        ));
-        let plan = materialize_parsed_request(
-            &parsed,
-            &MaterializeSpec {
-                client_model: parsed.requested_model.clone(),
-                upstream_model: mapped.to_string(),
-                resolved_alias: resolved_alias_from_model(&resolved),
-                channel: crate::models::UpstreamChannel::Go,
-                upstream_base_override: None,
-                original_model: None,
-                allow_go_fallback: false,
-                forced_upstream: None,
-                custom_route: None,
-            },
-        )
-        .expect("Claude Desktop keeps the original alias as client_model");
-        assert_eq!(plan.model, "glm-5.2");
-        assert_eq!(plan.client_model, CLAUDE_DESKTOP_OPUS_ALIAS);
-        assert_eq!(
-            crate::gateway::materialize::native_log_identity(&plan)
-                .resolved_alias
-                .as_deref(),
-            Some("glm-5.2")
-        );
-        assert_eq!(plan.upstream, ApiFormat::ChatCompletions);
     }
 
     #[test]

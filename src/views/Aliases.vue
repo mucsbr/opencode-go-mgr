@@ -1,15 +1,5 @@
 <template>
   <div class="aliases-page">
-    <header class="aliases-header">
-      <div>
-        <h1>{{ t("别名") }}</h1>
-        <p>{{ t("汇总当前供应商合同、Custom 账号映射与人工确认的跨供应商绑定。") }}</p>
-      </div>
-      <n-button type="primary" :disabled="!contracts" @click="openNewAlias">
-        {{ t("配置 Alias") }}
-      </n-button>
-    </header>
-
     <div
       v-if="initialLoading"
       class="aliases-state"
@@ -21,9 +11,9 @@
     </div>
 
     <n-alert
-      v-else-if="loadError && !contracts"
+      v-else-if="loadError && !pageStore.page"
       type="error"
-      :title="t('加载供应商失败: {error}', { error: loadError })"
+      :title="t('加载供应商失败：{error}', { error: loadError })"
     >
       <n-button size="small" secondary :loading="loading" @click="loadAliases()">
         {{ t("重试") }}
@@ -32,374 +22,208 @@
 
     <section v-else class="aliases-section" aria-labelledby="alias-table-title">
       <h2 id="alias-table-title" class="sr-only">{{ t("别名") }}</h2>
+      <n-input v-model:value="search" clearable :input-props="{ 'aria-label': t('搜索模型或供应商') }" :placeholder="t('搜索模型或供应商')" class="aliases-search" />
       <n-alert
-        v-if="loadError && contracts"
+        v-if="loadError && pageStore.page"
         type="warning"
-        :title="t('加载供应商失败: {error}', { error: loadError })"
+        :title="t('加载供应商失败：{error}', { error: loadError })"
       >
         <n-button size="small" secondary :loading="loading" @click="loadAliases({ retain: true })">
           {{ t("重试") }}
         </n-button>
       </n-alert>
-      <n-alert
-        v-if="accountsLoadError"
-        type="warning"
-        :title="t('加载 Custom Alias 账号失败: {error}', { error: accountsLoadError })"
-      >
-        <n-button size="small" secondary :loading="loading" @click="loadAliases({ retain: true })">
-          {{ t("重试") }}
-        </n-button>
-      </n-alert>
-      <n-alert
-        v-if="dynamicLoadError"
-        type="warning"
-        :title="t('加载供应商失败: {error}', { error: dynamicLoadError })"
-      >
-        <n-button size="small" secondary :loading="loading" @click="loadAliases({ retain: true })">
-          {{ t("重试") }}
-        </n-button>
-      </n-alert>
-
-      <n-empty v-if="aliasGroups.length === 0" :description="t('暂无 Alias')" />
-      <div v-else class="aliases-table-wrap">
+      <n-alert v-for="issue in pageStore.page?.errors ?? []" :key="`${issue.resource}:${issue.id}`" type="warning"
+        :title="t(aliasPageIssueKey(issue.resource), { error: issue.code })" />
+      <n-alert v-for="(failure, key) in pageStore.publicationErrors" :key="key" type="warning"
+        :title="t('更新对外展示失败：{error}', { error: failure })" />
+      <n-spin v-if="loading" size="small" />
+      <n-empty v-if="aliasGroups.length === 0" :description="search.trim() ? t('无匹配模型') : t('暂无 Alias')" />
+      <div v-else class="aliases-table-wrap" tabindex="0" role="region" :aria-label="t('模型映射')">
         <table class="aliases-table">
           <thead>
             <tr>
               <th>{{ t("对外模型名") }}</th>
               <th>{{ t("供应商 / 方案") }}</th>
+              <th>{{ t("路由顺位") }}</th>
               <th>{{ t("上游模型 ID") }}</th>
-              <th>{{ t("可路由") }}</th>
-              <th>{{ t("操作") }}</th>
+              <th>{{ t("能力") }}</th>
+              <th><span class="sr-only">{{ t("打开相关目标") }}</span></th>
             </tr>
           </thead>
-          <tbody v-for="group in aliasGroups" :key="group.public_model">
+          <tbody v-for="group in aliasGroups" :key="group.publicModel">
             <tr v-for="(row, index) in group.rows" :key="row.key">
-              <td v-if="index === 0" :rowspan="group.rows.length" class="aliases-name">
-                <code>{{ group.public_model }}</code>
+              <td
+                v-if="index === 0"
+                :rowspan="group.rows.length"
+                class="aliases-name"
+                :class="{ 'aliases-unpublished': !group.published }"
+              >
+                <div class="aliases-name-row">
+                  <!-- Hover hints stay native: an NTooltip per group would
+                       instantiate a Popover/Follower chain per row group, which
+                       dominates first paint on large catalogs. Same copy, same
+                       hover affordance, aria-label unchanged. -->
+                  <n-switch
+                    size="small"
+                    :value="group.published"
+                    :disabled="publicationSaving(group.publicModel)"
+                    :loading="publicationSaving(group.publicModel)"
+                    :aria-label="t('对下游展示此模型')"
+                    :title="t('关闭后下游不再列出此模型，仍可用该名称调用。')"
+                    @update:value="(published) => setPublished(group.publicModel, published)"
+                  />
+                  <code>{{ group.publicModel }}</code>
+                  <span v-if="group.continued" class="aliases-capability-none">{{ t('本页 {shown} / {total} 条映射', { shown: group.rows.length, total: group.matchingRows }) }}</span>
+                </div>
+                <p v-if="group.hasOverlap" class="alias-warning">{{ t('名称与其他上游 ID 重叠，请检查调用名称。') }}</p>
               </td>
-              <td>{{ row.provider_plan }}</td>
-              <td><code>{{ row.upstream_model }}</code></td>
-              <td>{{ row.routable ? t("可用") : t("不可用") }}</td>
-              <td v-if="index === 0" :rowspan="group.rows.length" class="aliases-actions">
-                <n-button
-                  v-if="configuredAliases.has(group.public_model.toLocaleLowerCase())"
-                  size="small"
-                  secondary
-                  @click="openEditAlias(group.public_model)"
+              <td>
+                {{ row.providerPlan }}
+                <n-tag v-if="row.platformLabel" size="tiny" :bordered="false" class="alias-platform-tag">
+                  {{ row.platformLabel }}
+                </n-tag>
+              </td>
+              <td class="aliases-rank">{{ rankText(row) }}</td>
+              <td><code>{{ row.upstreamModel }}</code></td>
+              <td class="aliases-capability">
+                <template v-if="row.capability.state === 'ready'">
+                  <n-tag
+                    v-for="modality in row.capability.inputModalities"
+                    :key="modality"
+                    size="tiny"
+                    :bordered="false"
+                  >
+                    {{ modalityLabel(modality) }}
+                  </n-tag>
+                  <n-tag size="tiny" :bordered="false" class="aliases-capability-source">
+                    {{ sourceLabel(row.capability.source) }}
+                  </n-tag>
+                </template>
+                <template v-else-if="row.capability.state === 'unknown'">
+                  <n-tag size="tiny" type="warning" :bordered="false">{{ t("未知") }}</n-tag>
+                  <n-button
+                    v-if="aliasPageTarget(row.capabilityTarget)"
+                    text
+                    size="tiny"
+                    type="primary"
+                    :aria-label="`${t('去声明')} ${row.publicModel}`"
+                    @click="openCapabilityTarget(row)"
+                  >
+                    {{ t("去声明") }}
+                  </n-button>
+                </template>
+                <n-tag
+                  v-else-if="row.capability.state === 'error'"
+                  size="tiny"
+                  type="error"
+                  :bordered="false"
                 >
-                  {{ t("编辑") }}
+                  {{ t("加载失败") }}
+                </n-tag>
+                <span v-else-if="row.capability.state === 'unavailable'" class="aliases-capability-none">—</span>
+                <span v-else class="aliases-capability-none">{{ t("加载中…") }}</span>
+              </td>
+              <td class="aliases-action">
+                <n-button
+                  v-if="aliasPageTarget(row.target)"
+                  circle
+                  quaternary
+                  size="small"
+                  :aria-label="row.customAccountId ? t('打开相关账号') : t('打开相关供应商模型')"
+                  :title="row.customAccountId ? t('打开相关账号') : t('打开相关供应商模型')"
+                  @click="openAliasRowTarget(row)"
+                >
+                  <template #icon><n-icon :component="LinkOutlined" /></template>
                 </n-button>
               </td>
             </tr>
           </tbody>
         </table>
       </div>
-    </section>
-
-    <n-modal
-      v-model:show="editorOpen"
-      preset="card"
-      :title="editingAlias ? t('编辑 Alias') : t('配置 Alias')"
-      :style="{ width: 'min(720px, calc(100vw - 32px))' }"
-      :mask-closable="!saving"
-    >
-      <n-alert v-if="editorError" type="error" :title="editorError" class="aliases-editor-error" />
-      <n-form-item :label="t('对外模型名')" required>
-        <n-input
-          v-model:value="aliasDraft"
-          :placeholder="t('例如：deepseek-flash')"
-          :disabled="saving"
-        />
-      </n-form-item>
-      <div class="aliases-editor-bindings">
-        <div class="aliases-editor-label">{{ t("供应商映射") }}</div>
-        <div v-for="(binding, index) in bindingDrafts" :key="index" class="aliases-editor-row">
-          <n-select
-            v-model:value="binding.provider_id"
-            :options="providerOptions"
-            :placeholder="t('选择供应商')"
-            :disabled="saving"
-            @update:value="binding.upstream_model = ''"
-          />
-          <n-select
-            v-model:value="binding.upstream_model"
-            :options="modelOptions(binding.provider_id)"
-            :placeholder="t('选择上游模型')"
-            filterable
-            :disabled="saving || !binding.provider_id"
-          />
-          <n-button
-            quaternary
-            type="error"
-            :disabled="saving || bindingDrafts.length <= 1"
-            @click="removeBinding(index)"
-          >
-            {{ t("移除") }}
-          </n-button>
-        </div>
-        <n-button size="small" secondary :disabled="saving" @click="addBinding">
-          {{ t("添加供应商映射") }}
-        </n-button>
+      <div class="aliases-pagination">
+        <span>{{ t('已显示 {shown} 条映射，共 {total} 条', { shown: pageStore.page?.groups.reduce((count, group) => count + group.rows.length, 0) ?? 0, total: pageStore.page?.filteredRows ?? 0 }) }}</span>
+        <n-pagination :page="Math.floor(offset / PAGE_SIZE) + 1" :page-size="PAGE_SIZE"
+          :item-count="pageStore.page?.filteredRows ?? 0" :disabled="loading"
+          @update:page="goToPage">
+          <template #prev>
+            <n-button size="small" quaternary :disabled="loading || offset === 0">{{ t('上一页') }}</n-button>
+          </template>
+          <template #next>
+            <n-button size="small" quaternary :disabled="loading || !pageStore.page?.hasMore">{{ t('下一页') }}</n-button>
+          </template>
+          <template #label="{ type, node, active }">
+            <n-button v-if="type === 'page'" size="small" quaternary :disabled="loading" :aria-current="active ? 'page' : undefined">{{ node }}</n-button>
+            <component :is="() => node" v-else />
+          </template>
+        </n-pagination>
       </div>
-      <template #footer>
-        <div class="aliases-editor-footer">
-          <n-popconfirm
-            v-if="editingAlias"
-            :positive-text="t('删除')"
-            :negative-text="t('取消')"
-            @positive-click="deleteEditingAlias"
-          >
-            <template #trigger>
-              <n-button type="error" secondary :disabled="saving">{{ t("删除 Alias") }}</n-button>
-            </template>
-            {{ t("确定删除这个人工 Alias 绑定吗？内置 Alias 不受影响。") }}
-          </n-popconfirm>
-          <span class="aliases-editor-spacer" />
-          <n-button :disabled="saving" @click="editorOpen = false">{{ t("取消") }}</n-button>
-          <n-button type="primary" :loading="saving" :disabled="!canSaveAlias" @click="saveAlias">
-            {{ t("保存") }}
-          </n-button>
-        </div>
-      </template>
-    </n-modal>
+    </section>
   </div>
 </template>
 
 <script setup lang="ts">
-import { computed, onActivated, onMounted, ref } from "vue";
-import {
-  NAlert,
-  NButton,
-  NEmpty,
-  NFormItem,
-  NInput,
-  NModal,
-  NPopconfirm,
-  NSelect,
-  NSpin,
-} from "naive-ui";
-import type { Account } from "../api/dashboard.ts";
-import type {
-  DynamicProviderView,
-  ProviderCatalogEntry,
-  ProviderContractsResponse,
-} from "../api/providers.ts";
-import { providerApi } from "../api/providers.ts";
-import { isDynamicCatalogEntry } from "../domain/dynamic-provider.ts";
-import { flattenProviderScopes, normalizeProviderContractsResponse } from "../domain/provider-contracts.ts";
-import { mergeProviderAliasRows } from "../domain/provider-aliases.ts";
+import { computed, onActivated, onMounted, onUnmounted, ref, watch } from "vue";
+import { useRouter, useRoute } from "vue-router";
+import { NAlert, NButton, NEmpty, NIcon, NInput, NPagination, NSpin, NSwitch, NTag } from "naive-ui";
+import { LinkOutlined } from "@vicons/antd";
+import { ALIAS_CAPABILITY_SOURCE_KEYS, ALIAS_MODALITY_KEYS } from "../domain/alias-capabilities.ts";
+import { aliasPageTarget, aliasPageIssueKey, aliasPagePublicationKey, aliasPageRankText, type AliasPageRow } from "../domain/alias-page.ts";
+import { useAliasPageStore } from "../stores/aliasPage.ts";
+import { PAGE_READ_MAX_AGE_MS } from "../stores/readLifecycle.ts";
 import { t } from "../i18n/index.ts";
-import { useAccountsStore } from "../stores/accounts.ts";
-import { useProvidersStore } from "../stores/providers.ts";
-import { dashboardErrorDetail } from "../utils/errors.ts";
 
-type AliasBindingDraft = { provider_id: string; upstream_model: string };
+const pageStore = useAliasPageStore();
+const router = useRouter();
+const route = useRoute();
+const search = ref("");
+const offset = ref(0);
+const PAGE_SIZE = 50;
+const loading = computed(() => pageStore.loading);
+const loadError = computed(() => pageStore.error);
+const initialLoading = computed(() => loading.value && !pageStore.page);
+const aliasGroups = computed(() => pageStore.groups);
+let activeOnce = false;
+let searchTimer: ReturnType<typeof setTimeout> | undefined;
 
-const accountsStore = useAccountsStore();
-const providersStore = useProvidersStore();
-const contracts = ref<ProviderContractsResponse | null>(null);
-const catalog = ref<ProviderCatalogEntry[] | null>(null);
-const accounts = ref<Account[]>([]);
-const dynamicProviders = ref<DynamicProviderView[]>([]);
-const loading = ref(false);
-const loadError = ref("");
-const accountsLoadError = ref("");
-const dynamicLoadError = ref("");
-const editorOpen = ref(false);
-const editingAlias = ref("");
-const aliasDraft = ref("");
-const bindingDrafts = ref<AliasBindingDraft[]>([]);
-const editorError = ref("");
-const saving = ref(false);
-let activatedOnce = false;
-
-const initialLoading = computed(() => loading.value && !contracts.value);
-const scopes = computed(() => (
-  contracts.value ? flattenProviderScopes(contracts.value, catalog.value) : []
-));
-const aliasRows = computed(() => (
-  contracts.value
-    ? mergeProviderAliasRows(
-      scopes.value,
-      accounts.value,
-      dynamicProviders.value,
-      contracts.value.alias_bindings,
-    )
-    : []
-));
-const aliasGroups = computed(() => {
-  const groups = new Map<string, typeof aliasRows.value>();
-  for (const row of aliasRows.value) {
-    const key = row.public_model.toLocaleLowerCase();
-    const existing = groups.get(key);
-    if (existing) existing.push(row);
-    else groups.set(key, [row]);
-  }
-  return [...groups.values()]
-    .map((rows) => ({ public_model: rows[0]?.public_model ?? "", rows }))
-    .sort((left, right) => left.public_model.localeCompare(right.public_model));
+function rankText(row: AliasPageRow): string { return aliasPageRankText(row); }
+function modalityLabel(modality: string): string {
+  const key = ALIAS_MODALITY_KEYS[modality];
+  return key ? t(key) : modality;
+}
+function sourceLabel(source: string | null): string {
+  const key = source ? ALIAS_CAPABILITY_SOURCE_KEYS[source] : null;
+  return key ? t(key) : source ?? "";
+}
+function openCapabilityTarget(row: AliasPageRow): void {
+  const target = aliasPageTarget(row.capabilityTarget);
+  if (target) void router.push(target);
+}
+function openAliasRowTarget(row: AliasPageRow): void {
+  const target = aliasPageTarget(row.target);
+  if (target) void router.push(target);
+}
+function publicationSaving(name: string): boolean { return pageStore.pending.includes(aliasPagePublicationKey(name)); }
+function setPublished(name: string, published: boolean): void {
+  void pageStore.setPublished(name, published);
+}
+async function loadAliases(options: { retain?: boolean; maxAgeMs?: number } = {}): Promise<void> {
+  try { await pageStore.load({ search: search.value.trim(), offset: offset.value, limit: PAGE_SIZE }, options); }
+  catch { /* The store retains the last successful page and exposes the failure. */ }
+}
+function goToPage(page: number): void { offset.value = (page - 1) * PAGE_SIZE; void loadAliases(); }
+watch(search, () => {
+  offset.value = 0;
+  pageStore.invalidate();
+  clearTimeout(searchTimer);
+  searchTimer = setTimeout(() => void loadAliases(), 180);
 });
-const configuredAliases = computed(() => new Set(
-  (contracts.value?.alias_bindings ?? []).map((binding) => binding.alias.toLocaleLowerCase()),
-));
-const providerScopes = computed(() => scopes.value.filter((scope) => scope.scope_kind === "provider"));
-const providerOptions = computed(() => providerScopes.value
-  .filter((scope) => scope.models.some((model) => model.routable))
-  .map((scope) => ({ label: scope.label, value: scope.provider_id })));
-const aliasPattern = /^[a-z0-9](?:[a-z0-9.-]{0,126}[a-z0-9])?$/;
-const canSaveAlias = computed(() => {
-  const alias = aliasDraft.value.trim();
-  if (!aliasPattern.test(alias) || bindingDrafts.value.length === 0) return false;
-  const providers = new Set<string>();
-  for (const binding of bindingDrafts.value) {
-    if (!binding.provider_id || !binding.upstream_model || providers.has(binding.provider_id)) {
-      return false;
-    }
-    providers.add(binding.provider_id);
-  }
-  return true;
-});
-
-async function loadAliases(options: { retain?: boolean } = {}): Promise<void> {
-  if (loading.value) return;
-  loading.value = true;
-  if (!options.retain) {
-    loadError.value = "";
-    dynamicLoadError.value = "";
-  }
-  try {
-    const [contractsResult, catalogResult, accountsResult] = await Promise.allSettled([
-      providersStore.loadContracts(),
-      providersStore.loadCatalog(),
-      accountsStore.loadPresented(),
-    ]);
-    if (catalogResult.status === "fulfilled") {
-      catalog.value = catalogResult.value;
-      const entries = catalogResult.value.filter(isDynamicCatalogEntry);
-      if (entries.length === 0) {
-        dynamicProviders.value = [];
-        dynamicLoadError.value = "";
-      } else {
-        const details = await Promise.allSettled(
-          entries.map((entry) => providerApi.getDynamicProvider(entry.provider_id)),
-        );
-        const previous = new Map(dynamicProviders.value.map((provider) => [provider.id, provider]));
-        const next: DynamicProviderView[] = [];
-        const failures: string[] = [];
-        details.forEach((result, index) => {
-          if (result.status === "fulfilled") {
-            next.push(result.value);
-            return;
-          }
-          failures.push(dashboardErrorDetail(result.reason));
-          if (options.retain) {
-            const kept = previous.get(entries[index]?.provider_id ?? "");
-            if (kept) next.push(kept);
-          }
-        });
-        dynamicProviders.value = next;
-        dynamicLoadError.value = failures[0] ?? "";
-      }
-    }
-    if (accountsResult.status === "fulfilled") {
-      accounts.value = accountsResult.value;
-      accountsLoadError.value = "";
-    } else {
-      accountsLoadError.value = dashboardErrorDetail(accountsResult.reason);
-    }
-    if (contractsResult.status === "fulfilled") {
-      contracts.value = normalizeProviderContractsResponse(contractsResult.value);
-      loadError.value = "";
-    } else {
-      loadError.value = dashboardErrorDetail(contractsResult.reason);
-    }
-  } finally {
-    loading.value = false;
-  }
-}
-
-function modelOptions(providerId: string): Array<{ label: string; value: string }> {
-  const scope = providerScopes.value.find((candidate) => candidate.provider_id === providerId);
-  return (scope?.models ?? [])
-    .filter((model) => model.routable)
-    .map((model) => ({ label: model.model_id, value: model.model_id }));
-}
-
-function openNewAlias(): void {
-  editingAlias.value = "";
-  aliasDraft.value = "";
-  bindingDrafts.value = [{ provider_id: "", upstream_model: "" }];
-  editorError.value = "";
-  editorOpen.value = true;
-}
-
-function openEditAlias(alias: string): void {
-  editingAlias.value = alias;
-  aliasDraft.value = alias;
-  bindingDrafts.value = (contracts.value?.alias_bindings ?? [])
-    .filter((binding) => binding.alias.toLocaleLowerCase() === alias.toLocaleLowerCase())
-    .map((binding) => ({
-      provider_id: binding.provider_id,
-      upstream_model: binding.upstream_model,
-    }));
-  editorError.value = "";
-  editorOpen.value = true;
-}
-
-function addBinding(): void {
-  bindingDrafts.value.push({ provider_id: "", upstream_model: "" });
-}
-
-function removeBinding(index: number): void {
-  bindingDrafts.value.splice(index, 1);
-}
-
-async function saveAlias(): Promise<void> {
-  if (!contracts.value || !canSaveAlias.value || saving.value) return;
-  saving.value = true;
-  editorError.value = "";
-  try {
-    const previous = editingAlias.value.toLocaleLowerCase();
-    const retained = contracts.value.alias_bindings.filter((binding) => (
-      !previous || binding.alias.toLocaleLowerCase() !== previous
-    ));
-    const alias = aliasDraft.value.trim();
-    contracts.value = await providerApi.updateModelAliasBindings([
-      ...retained,
-      ...bindingDrafts.value.map((binding) => ({ alias, ...binding })),
-    ]);
-    editorOpen.value = false;
-  } catch (cause) {
-    editorError.value = dashboardErrorDetail(cause);
-  } finally {
-    saving.value = false;
-  }
-}
-
-async function deleteEditingAlias(): Promise<void> {
-  if (!contracts.value || !editingAlias.value || saving.value) return;
-  saving.value = true;
-  editorError.value = "";
-  try {
-    const removed = editingAlias.value.toLocaleLowerCase();
-    contracts.value = await providerApi.updateModelAliasBindings(
-      contracts.value.alias_bindings.filter((binding) => (
-        binding.alias.toLocaleLowerCase() !== removed
-      )),
-    );
-    editorOpen.value = false;
-  } catch (cause) {
-    editorError.value = dashboardErrorDetail(cause);
-  } finally {
-    saving.value = false;
-  }
-}
-
-onMounted(() => void loadAliases());
+function onForeground(): void { if (route.name === "aliases") void loadAliases(); }
+onMounted(() => { void loadAliases(); window.addEventListener("focus", onForeground); });
 onActivated(() => {
-  if (activatedOnce) void loadAliases({ retain: true });
-  else activatedOnce = true;
+  if (activeOnce) void loadAliases({ maxAgeMs: PAGE_READ_MAX_AGE_MS });
+  activeOnce = true;
 });
+onUnmounted(() => { window.removeEventListener("focus", onForeground); clearTimeout(searchTimer); });
 </script>
 
 <style scoped>
@@ -409,23 +233,6 @@ onActivated(() => {
   margin: 0 auto;
   overflow-x: hidden;
 }
-.aliases-header {
-  margin-bottom: 16px;
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 16px;
-}
-.aliases-header h1 {
-  margin: 0;
-  color: var(--ocg-ink);
-  font: 700 var(--ocg-font-xl)/1.3 "Bahnschrift", "Segoe UI Variable Display", sans-serif;
-}
-.aliases-header p {
-  margin: 4px 0 0;
-  color: var(--ocg-muted);
-  font-size: var(--ocg-font-sm);
-}
 .aliases-state {
   min-height: 160px;
   display: grid;
@@ -433,27 +240,42 @@ onActivated(() => {
 }
 .aliases-section {
   min-width: 0;
-  padding: 16px;
+  padding: var(--ocg-space-lg);
   border: 1px solid var(--ocg-border);
-  border-radius: 14px;
+  border-radius: var(--ocg-radius-lg);
   background: var(--ocg-surface);
   box-shadow: var(--ocg-shadow-sm);
 }
 .aliases-section > .n-alert {
-  margin-bottom: 12px;
+  margin-bottom: var(--ocg-space-md);
 }
 .aliases-table-wrap {
   overflow-x: auto;
 }
+.aliases-pagination { display: flex; flex-wrap: wrap; gap: var(--ocg-space-md); align-items: center; justify-content: space-between; margin-top: var(--ocg-space-lg); color: var(--ocg-muted); }
+.aliases-search { margin-bottom: var(--ocg-space-lg); }
+.aliases-name-row {
+  display: flex;
+  align-items: center;
+  gap: var(--ocg-space-sm);
+}
+.aliases-unpublished {
+  opacity: 0.55;
+}
+.alias-warning { color: var(--ocg-warning); margin: var(--ocg-space-xs) 0 0; }
+.alias-platform-tag {
+  margin-left: var(--ocg-space-xs);
+  color: var(--ocg-muted);
+}
 .aliases-table {
   width: 100%;
-  min-width: 840px;
+  min-width: 520px;
   border-collapse: collapse;
   font-size: var(--ocg-font-sm);
 }
 .aliases-table th,
 .aliases-table td {
-  padding: 10px 12px;
+  padding: 10px var(--ocg-space-md);
   border-bottom: 1px solid var(--ocg-border);
   text-align: left;
   vertical-align: middle;
@@ -463,46 +285,33 @@ onActivated(() => {
   font-size: var(--ocg-font-xs);
   font-weight: 600;
 }
-.aliases-table .aliases-name,
-.aliases-actions {
+.aliases-table .aliases-name {
   vertical-align: top;
 }
-.aliases-actions {
-  width: 88px;
-}
-.aliases-editor-error {
-  margin-bottom: 12px;
-}
-.aliases-editor-bindings {
-  display: grid;
-  gap: 10px;
-}
-.aliases-editor-label {
+.aliases-table .aliases-rank {
+  white-space: nowrap;
   color: var(--ocg-muted);
-  font-size: var(--ocg-font-sm);
-  font-weight: 600;
 }
-.aliases-editor-row {
-  display: grid;
-  grid-template-columns: minmax(150px, 0.8fr) minmax(240px, 1.4fr) auto;
-  gap: 8px;
-  align-items: center;
+.aliases-capability {
+  white-space: nowrap;
 }
-.aliases-editor-footer {
-  display: flex;
-  align-items: center;
-  gap: 8px;
+.aliases-capability .n-tag {
+  margin-right: var(--ocg-space-xs);
 }
-.aliases-editor-spacer {
-  flex: 1;
+.aliases-capability-source,
+.aliases-capability-none {
+  color: var(--ocg-muted);
 }
-@media (max-width: 700px) {
-  .aliases-header {
-    align-items: stretch;
-    flex-direction: column;
-  }
-  .aliases-editor-row {
-    grid-template-columns: 1fr;
+@media (max-width: 720px) {
+  .aliases-table th:first-child,
+  .aliases-name {
+    position: sticky;
+    left: 0;
+    z-index: 1;
+    background: var(--ocg-surface);
+    max-width: 140px;
+    overflow-wrap: anywhere;
+    box-shadow: 1px 0 var(--ocg-border);
   }
 }
 </style>

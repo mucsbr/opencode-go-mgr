@@ -1,5 +1,5 @@
 //! Dashboard V3 browser runtime: session protection, CAS, secrecy, Origin,
-//! native/remote wire shape, reset lifecycle, and V2 coexistence.
+//! native/remote wire shape, reset lifecycle, and retired V2 paths.
 
 use axum::Router;
 use axum::extract::ws::{Message as AxumWsMessage, WebSocketUpgrade};
@@ -210,7 +210,7 @@ async fn run_remote_browser_child() {
 
     let origin = format!("http://127.0.0.1:{}", harness.handle.port);
     let display_url = format!(
-        "ws://127.0.0.1:{}/dashboard/api/v3/browser/sessions/{token}/ws",
+        "ws://127.0.0.1:{}/dashboard/api/v4/browser/sessions/{token}/ws",
         harness.handle.port
     );
     let mut request = display_url.into_client_request().unwrap();
@@ -1526,12 +1526,12 @@ async fn dashboard_v3_open_invite_requires_configured_url() {
 }
 
 #[tokio::test]
-async fn dashboard_v3_browser_coexists_with_v2() {
-    let harness = start_loopback("browser-v2-coexist").await;
+async fn retired_v2_browser_does_not_launch_or_reset() {
+    let harness = start_loopback("browser-v2-retired").await;
     let launches = Arc::new(AtomicUsize::new(0));
     let stops = Arc::new(AtomicUsize::new(0));
     register_native(&harness, launches.clone(), stops.clone(), None);
-    let account_id = create_go_account(&harness, "coexist", "sk-v2-coexist").await;
+    let account_id = create_go_account(&harness, "retired-v2", "sk-retired-v2").await;
 
     let v2_caps = harness
         .client
@@ -1598,29 +1598,6 @@ async fn dashboard_v3_browser_coexists_with_v2() {
     assert_eq!(v3_reset.0, StatusCode::OK, "{}", v3_reset.1);
     assert!(!profile.exists());
     assert_eq!(stops.load(Ordering::SeqCst), 1);
-
-    let mut headers = reqwest::header::HeaderMap::new();
-    headers.insert(reqwest::header::CONNECTION, "Upgrade".parse().unwrap());
-    headers.insert(reqwest::header::UPGRADE, "websocket".parse().unwrap());
-    headers.insert("Sec-WebSocket-Version", "13".parse().unwrap());
-    headers.insert(
-        "Sec-WebSocket-Key",
-        "dGhlIHNhbXBsZSBub25jZQ==".parse().unwrap(),
-    );
-    let v2_ws = harness
-        .client
-        .get(format!(
-            "{}/browser/sessions/opaque-token/ws",
-            harness.v2_base
-        ))
-        .headers(headers)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(v2_ws.status(), StatusCode::BAD_REQUEST);
-    let v2_ws_body: Value = v2_ws.json().await.unwrap();
-    assert_eq!(v2_ws_body["error"], "browser WebSocket Origin is required");
-    assert_ne!(v2_ws_body["code"], "dashboardV2Removed");
 
     harness.stop();
 }

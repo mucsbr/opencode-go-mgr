@@ -19,13 +19,15 @@ use super::types::{
 pub(super) async fn get_gateway_status(State(state): State<CoreState>) -> Json<GatewayStatus> {
     let _settings_update = state.settings_update.lock();
     let config = state.config();
-    let running = state.gateway.lock().is_some();
+    let running = state
+        .gateway
+        .lock()
+        .as_ref()
+        .is_some_and(|handle| !handle.task.is_finished());
     let last_error = if running {
         None
     } else {
-        observability::redacted_latest_gateway_error(&state.db.lock(), |cipher| {
-            state.decrypt_key(cipher).ok()
-        })
+        state.gateway_last_error()
     };
     let runtime = observability::gateway_runtime_status(
         running,
@@ -49,16 +51,13 @@ pub(super) async fn get_application_models(
     State(state): State<CoreState>,
 ) -> Json<ApplicationModels> {
     let _settings_update = state.settings_update.lock();
-    let pricing = state.pricing_snapshot();
-    Json(application_models_from_pricing_snapshot(&state, &pricing))
+    Json(application_models_from_state(&state))
 }
 
-fn application_models_from_pricing_snapshot(
-    state: &CoreState,
-    pricing: &crate::kernel::pricing::PricingSnapshot,
-) -> ApplicationModels {
+fn application_models_from_state(state: &CoreState) -> ApplicationModels {
+    let pricing = state.pricing_snapshot();
     ApplicationModels {
-        models: observability::application_models(pricing, Some(&state.provider_contracts())),
+        models: observability::application_models(Some(&state.provider_contracts())),
         revision: state.settings_revision(),
         process_generation: state.process_generation(),
         pricing_revision: pricing.revision.clone(),
@@ -69,15 +68,11 @@ pub(super) async fn get_dashboard_summary(
     State(state): State<CoreState>,
 ) -> Result<Json<DashboardSummary>, V3ApiError> {
     let _settings_update = state.settings_update.lock();
-    let contracts = state.provider_contracts();
     let summary = {
         let db = state.db.lock();
-        observability::dashboard_summary(
-            &db,
-            state.gateway.lock().is_some(),
-            &contracts,
-            |cipher| state.decrypt_key(cipher).ok(),
-        )
+        observability::dashboard_summary(&db, state.gateway.lock().is_some(), |cipher| {
+            state.decrypt_key(cipher).ok()
+        })
         .map_err(|error| map_error(&state, error))?
     };
     let (revision, process_generation, pricing_revision) = snapshot_tokens(&state);
@@ -127,6 +122,8 @@ pub(super) async fn get_gateway_logs(
         GatewayLogReadQuery {
             limit: query.limit,
             request_id: query.request_id,
+            level: query.level,
+            category: query.category,
         },
         |cipher| state.decrypt_key(cipher).ok(),
     )
@@ -258,7 +255,7 @@ fn gateway_log_from_model(log: crate::models::GatewayLog) -> GatewayLog {
     }
 }
 
-fn forward_log_from_enriched(item: EnrichedForwardLog) -> ForwardLog {
+pub(crate) fn forward_log_from_enriched(item: EnrichedForwardLog) -> ForwardLog {
     let log = item.log;
     ForwardLog {
         id: log.id,
@@ -313,7 +310,7 @@ mod tests {
     use std::sync::Arc;
 
     #[test]
-    fn application_models_keeps_revision_and_models_on_the_captured_pricing_snapshot() {
+    fn application_models_keep_the_loaded_revision_when_activation_is_inert() {
         let dir = std::env::temp_dir().join(format!(
             "ocg-v3-observability-pricing-snapshot-{}",
             uuid::Uuid::new_v4()
@@ -325,8 +322,7 @@ mod tests {
         let state = Arc::new(CoreStateInner::new(db, dir.clone(), cipher).unwrap());
 
         let captured = state.pricing_snapshot();
-        let expected_models =
-            observability::application_models(&captured, Some(&state.provider_contracts()));
+        let expected_models = observability::application_models(Some(&state.provider_contracts()));
         let mut concurrent = captured.as_ref().clone();
         concurrent
             .models
@@ -335,10 +331,10 @@ mod tests {
         concurrent.activated_at = "2099-01-01T00:00:00Z".into();
         state.activate_pricing_snapshot(concurrent).unwrap();
 
-        let response = application_models_from_pricing_snapshot(&state, &captured);
+        let response = application_models_from_state(&state);
         assert_eq!(response.pricing_revision, captured.revision);
         assert_eq!(response.models, expected_models);
-        assert_ne!(response.pricing_revision, state.pricing_snapshot().revision);
+        assert_eq!(response.pricing_revision, state.pricing_snapshot().revision);
 
         drop(state);
         let _ = std::fs::remove_dir_all(dir);

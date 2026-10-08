@@ -1,0 +1,225 @@
+//! Shared billing contracts. Amounts are estimates in their explicit native units.
+
+use chrono::{DateTime, Utc};
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+
+pub use ocg_domain::billing::{BillingModel, BillingSource};
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CreditRate {
+    pub model: String,
+    pub input_per_million: f64,
+    pub output_per_million: f64,
+    pub cache_read_per_million: Option<f64>,
+    pub cache_write_per_million: Option<f64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MonthlyCredits {
+    pub amount: f64,
+    /// First renewal boundary and immutable calendar anchor, including its UTC time.
+    pub next_reset_at: DateTime<Utc>,
+    /// Calendar boundaries use this fixed UTC offset, e.g. 480 for China.
+    pub timezone_offset_minutes: i32,
+    pub renewal_ends_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CreditConfiguration {
+    pub name: String,
+    pub currency: String,
+    pub credits_per_currency: f64,
+    pub rates: Vec<CreditRate>,
+    pub monthly: Option<MonthlyCredits>,
+    pub source_url: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CreditBucketKind {
+    Monthly,
+    TopUp,
+    Manual,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CreditBucket {
+    pub id: String,
+    pub kind: CreditBucketKind,
+    pub label: String,
+    pub granted: f64,
+    pub remaining: f64,
+    pub starts_at: DateTime<Utc>,
+    pub expires_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CreditPreset {
+    pub id: String,
+    pub configuration: CreditConfiguration,
+    pub initial_grant: f64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CreditMeterView {
+    pub credential_id: String,
+    pub meter_id: String,
+    pub configuration: CreditConfiguration,
+    pub buckets: Vec<CreditBucket>,
+    /// Saved expired grants remain visible, but do not contribute to available balances.
+    pub expired_buckets: Vec<CreditBucket>,
+    pub scheduled_buckets: Vec<CreditBucket>,
+    pub calibration_block: Option<CreditCalibrationBlock>,
+    pub can_calibrate: bool,
+    pub remaining: f64,
+    pub active_granted: f64,
+    pub spent_since_calibration: f64,
+    pub overdrawn: f64,
+    pub unpriced_requests: u64,
+    pub pending_requests: u64,
+    pub last_calibration_at: Option<DateTime<Utc>>,
+    pub estimated_at: DateTime<Utc>,
+    /// Next actual renewal; configuration.next_reset_at remains the calendar anchor.
+    pub next_reset_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CreditCalibrationBlock {
+    Pending,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum BillingSurfaceKind {
+    Cash,
+    CashBalances,
+    Quota,
+    CreditsMeter,
+    CreditsSetup,
+    CreditsUsdMonth,
+    Empty,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum BillingQuotaWindowKind {
+    FiveHours,
+    Week,
+    Month,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct BillingQuotaEditorLimit {
+    pub window_kind: BillingQuotaWindowKind,
+    pub limit: f64,
+    pub editable: bool,
+    pub editable_at: Option<DateTime<Utc>>,
+}
+
+/// Portable personal-account baseline. Local request receipts and meter identities stay local.
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PortableCreditMeter {
+    pub configuration: CreditConfiguration,
+    pub buckets: Vec<CreditBucket>,
+    pub spent_since_calibration: f64,
+    pub overdrawn: f64,
+    pub unpriced_requests: u64,
+    pub last_calibration_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+    pub monthly_cursor: Option<DateTime<Utc>>,
+    pub exported_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct BillingStatus {
+    pub account_id: String,
+    pub model: BillingModel,
+    pub surface_kind: BillingSurfaceKind,
+    pub source: BillingSource,
+    pub unit: String,
+    pub configurable_credits: bool,
+    pub manual_calibration: bool,
+    pub quota_manual_calibration: bool,
+    pub provider_windows: bool,
+    pub quota_editor_limits: Vec<BillingQuotaEditorLimit>,
+    pub official_refresh: bool,
+    pub usage: Option<crate::dashboard_v3::ProviderUsage>,
+    pub cash: Option<crate::official_api::OfficialApiStatus>,
+    pub credits: Option<CreditMeterView>,
+    pub presets: Vec<CreditPreset>,
+    pub revision: u64,
+    pub process_generation: u64,
+}
+
+/// Manual credit setup. Token rates and the currency conversion factor are not writable.
+/// Stored historical rates stay on the meter and are not replaced by this body.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CreditConfigurationWrite {
+    pub name: String,
+    pub currency: String,
+    pub monthly: Option<MonthlyCredits>,
+    pub source_url: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CreditConfigureRequest {
+    pub configuration: CreditConfigurationWrite,
+    /// Required for initial setup; omitted for a rate/settings edit so balances survive.
+    pub initial_buckets: Option<Vec<CreditBucket>>,
+    #[serde(flatten)]
+    pub expectation: crate::dashboard_v3::MutationExpectation,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CreditBalanceCorrection {
+    pub bucket_id: String,
+    pub remaining: f64,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CreditCalibrationRequest {
+    pub balances: Vec<CreditBalanceCorrection>,
+    #[serde(flatten)]
+    pub expectation: crate::dashboard_v3::MutationExpectation,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CreditGrantRequest {
+    pub label: String,
+    pub amount: f64,
+    pub expires_at: Option<DateTime<Utc>>,
+    #[serde(flatten)]
+    pub expectation: crate::dashboard_v3::MutationExpectation,
+}
+
+/// Bounded, local-only batch read; it is not a control-plane mutation.
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct BillingSnapshotRequest {
+    pub account_ids: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct BillingSnapshots {
+    pub statuses: Vec<BillingStatus>,
+    pub errors: std::collections::BTreeMap<String, crate::dashboard_v3::V3Error>,
+    pub revision: u64,
+    pub process_generation: u64,
+}

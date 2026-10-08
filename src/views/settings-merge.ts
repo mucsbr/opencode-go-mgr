@@ -1,6 +1,6 @@
 import type { AppConfig } from "../api/dashboard";
 
-export const EDITABLE_SETTING_KEYS = [
+const EDITABLE_SETTING_KEYS = [
   "gateway_port",
   "proxy_mode",
   "proxy_url",
@@ -12,8 +12,6 @@ export const EDITABLE_SETTING_KEYS = [
   "connect_timeout_secs",
   "non_stream_timeout_secs",
   "stream_idle_timeout_secs",
-  "routing_mode",
-  "conversation_sticky",
 ] as const satisfies readonly (keyof AppConfig)[];
 
 /**

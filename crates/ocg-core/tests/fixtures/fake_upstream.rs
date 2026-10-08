@@ -15,7 +15,7 @@ use std::collections::{HashMap, VecDeque};
 use std::convert::Infallible;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[derive(Clone)]
@@ -31,6 +31,7 @@ pub(crate) struct FakeCall {
     pub path: String,
     pub authorization: Option<String>,
     pub x_api_key: Option<String>,
+    pub api_key: Option<String>,
     pub x_goog_api_key: Option<String>,
     pub anthropic_version: Option<String>,
     pub body: String,
@@ -54,11 +55,103 @@ pub(crate) type FakeCalls = Arc<Mutex<Vec<FakeCall>>>;
 pub(crate) type DelayedChunks = Vec<(Duration, &'static str)>;
 pub(crate) type DelayedResponses = Arc<Mutex<VecDeque<DelayedChunks>>>;
 
+/// One inbound HTTP hit on a journaled loopback listener.
+///
+/// `seq` is a process-local monotonic index shared by every listener attached
+/// to the same [`SharedJournal`], so arrival order is not reconstructed from
+/// concatenated per-server counts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Arrival {
+    pub seq: u64,
+    pub listener: String,
+    pub elapsed_ms: u128,
+    pub key: String,
+    pub method: Method,
+    pub path: String,
+    pub authorization: Option<String>,
+    pub x_api_key: Option<String>,
+    pub anthropic_version: Option<String>,
+    pub body: String,
+}
+
+/// Chronological journal shared by independent loopback upstreams.
+#[derive(Clone)]
+pub(crate) struct SharedJournal {
+    inner: Arc<Mutex<Vec<Arrival>>>,
+    start: Instant,
+}
+
+impl SharedJournal {
+    pub(crate) fn new() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(Vec::new())),
+            start: Instant::now(),
+        }
+    }
+
+    // Keep each observed request field explicit in the shared test journal.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn record(
+        &self,
+        listener: &str,
+        key: String,
+        method: Method,
+        path: String,
+        authorization: Option<String>,
+        x_api_key: Option<String>,
+        anthropic_version: Option<String>,
+        body: String,
+    ) {
+        let mut arrivals = self.inner.lock().expect("arrival journal lock");
+        let seq = arrivals.len() as u64;
+        arrivals.push(Arrival {
+            seq,
+            listener: listener.to_owned(),
+            elapsed_ms: self.start.elapsed().as_millis(),
+            key,
+            method,
+            path,
+            authorization,
+            x_api_key,
+            anthropic_version,
+            body,
+        });
+    }
+
+    pub(crate) fn snapshot(&self) -> Vec<Arrival> {
+        self.inner.lock().expect("arrival journal lock").clone()
+    }
+
+    pub(crate) fn listeners(&self) -> Vec<String> {
+        self.snapshot()
+            .into_iter()
+            .map(|arrival| arrival.listener)
+            .collect()
+    }
+
+    pub(crate) fn keys(&self) -> Vec<String> {
+        self.snapshot()
+            .into_iter()
+            .map(|arrival| arrival.key)
+            .collect()
+    }
+
+    pub(crate) fn paths(&self) -> Vec<String> {
+        self.snapshot()
+            .into_iter()
+            .map(|arrival| arrival.path)
+            .collect()
+    }
+}
+
 #[derive(Clone)]
 struct FakeState {
     replies: Replies,
     calls: FakeCalls,
     delay: Duration,
+    journal: Option<SharedJournal>,
+    listener: String,
+    first_response_gate: Arc<Mutex<Option<tokio::sync::oneshot::Receiver<()>>>>,
 }
 
 #[derive(Clone)]
@@ -84,6 +177,35 @@ pub(crate) async fn start_fake_upstream_with_delay(
     replies: HashMap<String, VecDeque<FakeReply>>,
     delay: Duration,
 ) -> (String, FakeCalls, tokio::sync::oneshot::Sender<()>) {
+    start_fake_upstream_inner(replies, delay, None, String::new(), None).await
+}
+
+pub(crate) async fn start_fake_upstream_with_gate(
+    replies: HashMap<String, VecDeque<FakeReply>>,
+    gate: tokio::sync::oneshot::Receiver<()>,
+) -> (String, FakeCalls, tokio::sync::oneshot::Sender<()>) {
+    start_fake_upstream_inner(replies, Duration::ZERO, None, String::new(), Some(gate)).await
+}
+
+/// Start a loopback upstream that appends every hit to `journal` under `label`.
+///
+/// Independent listeners share one journal so tests can assert actual arrival
+/// order across distinct TCP endpoints.
+pub(crate) async fn start_fake_upstream_on_journal(
+    label: impl Into<String>,
+    replies: HashMap<String, VecDeque<FakeReply>>,
+    journal: SharedJournal,
+) -> (String, FakeCalls, tokio::sync::oneshot::Sender<()>) {
+    start_fake_upstream_inner(replies, Duration::ZERO, Some(journal), label.into(), None).await
+}
+
+async fn start_fake_upstream_inner(
+    replies: HashMap<String, VecDeque<FakeReply>>,
+    delay: Duration,
+    journal: Option<SharedJournal>,
+    listener: String,
+    first_response_gate: Option<tokio::sync::oneshot::Receiver<()>>,
+) -> (String, FakeCalls, tokio::sync::oneshot::Sender<()>) {
     let calls = Arc::new(Mutex::new(Vec::new()));
     let app = Router::new()
         .fallback(any(fake_reply))
@@ -92,6 +214,9 @@ pub(crate) async fn start_fake_upstream_with_delay(
             replies: Arc::new(Mutex::new(replies)),
             calls: calls.clone(),
             delay,
+            journal,
+            listener,
+            first_response_gate: Arc::new(Mutex::new(first_response_gate)),
         });
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
         .await
@@ -188,15 +313,50 @@ async fn fake_reply(
 ) -> impl IntoResponse {
     let authorization = header(&headers, axum::http::header::AUTHORIZATION);
     let x_api_key = header(&headers, "x-api-key");
+    let api_key = header(&headers, "api-key");
     let x_goog_api_key = header(&headers, "x-goog-api-key");
     let key = authorization
         .as_deref()
         .and_then(|value| value.strip_prefix("Bearer "))
         .or(x_api_key.as_deref())
+        .or(api_key.as_deref())
         .or(x_goog_api_key.as_deref())
         .unwrap_or_default()
         .to_owned();
 
+    let path = uri.path().to_owned();
+    let anthropic_version = header(&headers, "anthropic-version");
+    let user_agent = header(&headers, axum::http::header::USER_AGENT);
+    // A machine-level listener scanner on some Windows hosts probes each new
+    // loopback port with this exact unauthenticated root request. It is not a
+    // Gateway attempt and must not consume or pollute deterministic fixtures.
+    let external_listener_probe = method == Method::GET
+        && path == "/"
+        && key.is_empty()
+        && authorization.is_none()
+        && x_api_key.is_none()
+        && api_key.is_none()
+        && x_goog_api_key.is_none()
+        && user_agent.as_deref() == Some("WebSocket++/0.8.2");
+    if external_listener_probe {
+        return (
+            StatusCode::NOT_FOUND,
+            [("content-type", "application/json")],
+            "{}",
+        );
+    }
+    if let Some(journal) = &state.journal {
+        journal.record(
+            &state.listener,
+            key.clone(),
+            method.clone(),
+            path.clone(),
+            authorization.clone(),
+            x_api_key.clone(),
+            anthropic_version.clone(),
+            body.clone(),
+        );
+    }
     state
         .calls
         .lock()
@@ -204,11 +364,12 @@ async fn fake_reply(
         .push(FakeCall {
             key: key.clone(),
             method,
-            path: uri.path().to_owned(),
+            path,
             authorization,
             x_api_key,
+            api_key,
             x_goog_api_key,
-            anthropic_version: header(&headers, "anthropic-version"),
+            anthropic_version,
             body,
             accept_encoding: header(&headers, axum::http::header::ACCEPT_ENCODING),
             conversation_header: header(&headers, "x-ocg-conversation-id"),
@@ -218,10 +379,14 @@ async fn fake_reply(
             opencode_project: header(&headers, "x-opencode-project"),
             session_id: header(&headers, "x-session-id"),
             session_affinity: header(&headers, "x-session-affinity"),
-            user_agent: header(&headers, axum::http::header::USER_AGENT),
+            user_agent,
             cookie: header(&headers, "cookie"),
         });
 
+    let first_gate = state.first_response_gate.lock().unwrap().take();
+    if let Some(gate) = first_gate {
+        let _ = gate.await;
+    }
     if !state.delay.is_zero() {
         tokio::time::sleep(state.delay).await;
     }

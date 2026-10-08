@@ -66,7 +66,7 @@
           :transform="`translate(${bar.x}, 0)`"
           :tabindex="dates[bi]?.total > 0 ? 0 : -1"
           role="img"
-          :aria-label="barAriaLabel(bi)"
+          :aria-label="barAriaLabels[bi]"
           @pointerenter="onEnter(bi, $event)"
           @pointermove="onMove(bi, $event)"
           @pointerleave="onLeave"
@@ -114,16 +114,15 @@
     <!-- Teleport 避开 dashboard card 的 overflow 裁剪；fixed 坐标按 viewport 计算。 -->
     <Teleport to="body">
       <div
-        v-if="tooltip.show"
+        v-if="tooltipVisible"
         ref="tooltipRef"
         class="chart-tooltip"
         role="tooltip"
-        :style="{ left: tooltip.x + 'px', top: tooltip.y + 'px' }"
       >
-        <div class="tooltip-title">{{ tooltip.title }}</div>
-        <div class="tooltip-total">{{ t("合计 {total}", { total: formatTokens(tooltip.total) }) }}</div>
+        <div class="tooltip-title">{{ tooltipContent.title }}</div>
+        <div class="tooltip-total">{{ t("合计 {total}", { total: formatTokens(tooltipContent.total) }) }}</div>
         <div
-          v-for="row in tooltip.rows"
+          v-for="row in tooltipContent.rows"
           :key="row.model"
           class="tooltip-row"
         >
@@ -138,14 +137,16 @@
 
 <script setup lang="ts">
 import { ref, computed, nextTick, onMounted, onBeforeUnmount, useId } from "vue";
-import type { DailyModelTokens } from "../api/dashboard";
+import type { DashboardChartDay, DashboardModelTotal } from "../api/pages.ts";
 import { CHART_PALETTE } from "../theme";
 import { locale, t } from "../i18n/index.ts";
 import { formatTokens } from "../utils/format.ts";
 
 const props = withDefaults(defineProps<{
-  data: DailyModelTokens[];
-  days?: number; // 实际展示的天数(用于补零)
+  series: DashboardChartDay[];
+  modelTotals: DashboardModelTotal[];
+  totalTokens: number;
+  days?: number;
 }>(), {
   days: 30,
 });
@@ -179,58 +180,50 @@ onMounted(() => {
 });
 onBeforeUnmount(() => {
   ro?.disconnect();
+  cancelPendingTooltip();
 });
 
-function modelColor(model: string, models: string[]): string {
-  const idx = models.indexOf(model);
+function modelColor(model: string): string {
+  const idx = modelIndex.value.get(model) ?? 0;
   return CHART_PALETTE[idx % CHART_PALETTE.length];
+}
+
+// Intl.DateTimeFormat construction is far slower than format(); cache per
+// (locale, variant) since this runs per axis label and per tooltip.
+const chartDateFormatters = new Map<string, Intl.DateTimeFormat>();
+
+function chartDateFormatter(localeTag: string, short: boolean): Intl.DateTimeFormat {
+  const cacheKey = `${localeTag}:${short ? "short" : "long"}`;
+  let formatter = chartDateFormatters.get(cacheKey);
+  if (!formatter) {
+    formatter = new Intl.DateTimeFormat(localeTag, short
+      ? { month: "2-digit", day: "2-digit", timeZone: "UTC" }
+      : { year: "numeric", month: "short", day: "numeric", timeZone: "UTC" });
+    chartDateFormatters.set(cacheKey, formatter);
+  }
+  return formatter;
 }
 
 function formatChartDate(value: string, short = false): string {
   const date = new Date(`${value}T00:00:00Z`);
-  return new Intl.DateTimeFormat(locale.value, short
-    ? { month: "2-digit", day: "2-digit", timeZone: "UTC" }
-    : { year: "numeric", month: "short", day: "numeric", timeZone: "UTC" }).format(date);
+  return chartDateFormatter(locale.value, short).format(date);
 }
 
-// --- 数据处理:按日期补零,得到连续的日期序列 ---
-function padZeroDates(rows: DailyModelTokens[], days: number) {
-  const map = new Map<string, Map<string, number>>();
-  for (const r of rows) {
-    if (!map.has(r.date)) map.set(r.date, new Map());
-    const m = map.get(r.date)!;
-    m.set(r.model, (m.get(r.model) ?? 0) + r.tokens);
-  }
-  // 生成最近 `days` 天的日期(UTC),缺失的天用空 map 填充
-  const today = new Date();
-  const dates: { date: string; models: Map<string, number>; total: number }[] = [];
-  for (let i = days - 1; i >= 0; i--) {
-    const d = new Date(today);
-    d.setUTCDate(today.getUTCDate() - i);
-    const ds = d.toISOString().slice(0, 10);
-    const models = map.get(ds) ?? new Map<string, number>();
-    let total = 0;
-    models.forEach((v) => (total += v));
-    dates.push({ date: ds, models, total });
-  }
-  return dates;
-}
+// The backend owns UTC reporting dates, totals, and series order.
+const sortedModels = computed(() => props.modelTotals.map(row => row.model));
 
-// 模型稳定排序(按总量 desc),保证图例顺序稳定
-const sortedModels = computed(() => {
-  const totals = new Map<string, number>();
-  for (const r of props.data) {
-    totals.set(r.model, (totals.get(r.model) ?? 0) + r.tokens);
-  }
-  return [...totals.keys()].sort((a, b) => (totals.get(b)! - totals.get(a)!));
-});
+// Palette index per model. The previous `models.indexOf(model)` lookups ran
+// inside the per-bar and per-tooltip-row loops, so a recompute driven by the
+// ResizeObserver width was O(models²) per bar instead of O(models).
+const modelIndex = computed(() => new Map(sortedModels.value.map((model, i) => [model, i])));
 
-const dates = computed(() => padZeroDates(props.data, props.days));
+const dates = computed(() => props.series.map(day => ({ date: day.date,
+  total: day.totalTokens, rows: day.models, models: new Map(day.models.map(row => [row.model, row.tokens])),
+})));
 
-const totalTokens = computed(() => dates.value.reduce((sum, date) => sum + date.total, 0));
 const chartDescription = computed(() => [
   t("模型：{count}", { count: sortedModels.value.length }),
-  `${t("{days} 天合计", { days: props.days })} ${formatTokens(totalTokens.value)}`,
+  `${t("{days} 天合计", { days: props.days })} ${formatTokens(props.totalTokens)}`,
 ].join(t("；")));
 
 const chartW = computed(() => Math.max(0, width.value - padL - padR));
@@ -281,6 +274,7 @@ const barWidth = computed(() => {
 // 每根柱子: [{model, idx, y, h, tokens}]
 const bars = computed(() => {
   const models = sortedModels.value;
+  const index = modelIndex.value;
   const scale = chartH / ceil.value;
   return dates.value.map((d, i) => {
     let cursor = padT + chartH; // 从底往上堆
@@ -292,7 +286,7 @@ const bars = computed(() => {
       const h = tokens * scale;
       cursor -= h;
       segments.push({
-        idx: models.indexOf(model) % CHART_PALETTE.length,
+        idx: (index.get(model) ?? 0) % CHART_PALETTE.length,
         model,
         y: cursor,
         h: Math.max(0.5, h),
@@ -326,66 +320,97 @@ const xLabels = computed(() => {
 });
 
 // --- tooltip ---
-const tooltip = ref<{ show: boolean; x: number; y: number; title: string; total: number; rows: { model: string; tokens: number; color: string }[] }>({
-  show: false,
-  x: 0,
-  y: 0,
-  title: "",
-  total: 0,
-  rows: [],
-});
-
-function onEnter(bi: number, e: PointerEvent) {
-  updateTooltip(bi, e);
-}
-function onMove(bi: number, e: PointerEvent) {
-  updateTooltip(bi, e);
-}
-function onLeave() {
-  tooltip.value.show = false;
-}
 
 function tooltipRows(bi: number) {
   const d = dates.value[bi];
   if (!d) return [];
-  const models = sortedModels.value;
-  return models
-    .map((model) => ({ model, tokens: d.models.get(model) ?? 0 }))
+  return d.rows
     .filter((row) => row.tokens > 0)
-    .sort((a, b) => b.tokens - a.tokens)
-    .map((row) => ({ ...row, color: modelColor(row.model, models) }));
+    .map((row) => ({ ...row, color: modelColor(row.model) }));
 }
 
-function barAriaLabel(bi: number): string {
-  const d = dates.value[bi];
-  if (!d) return "";
+// Precomputed per bar so render does not rebuild tooltip rows per column.
+const barAriaLabels = computed(() => dates.value.map((d, bi) => {
   return [
     formatChartDate(d.date),
     t("合计 {total}", { total: formatTokens(d.total) }),
     ...tooltipRows(bi).map((row) => `${row.model} ${formatTokens(row.tokens)}`),
   ].join(t("；"));
+}));
+
+// Tooltip position is written imperatively (per rAF at most once); only the
+// content is reactive, and it rebuilds only when the hovered bar changes.
+interface TooltipRow { model: string; tokens: number; color: string }
+const tooltipVisible = ref(false);
+const tooltipContent = ref<{ title: string; total: number; rows: TooltipRow[] }>({
+  title: "",
+  total: 0,
+  rows: [],
+});
+
+let currentBarIndex = -1;
+let pendingBarIndex = -1;
+let pendingX = 0;
+let pendingY = 0;
+let tooltipRaf = 0;
+
+function positionTooltip() {
+  const tip = tooltipRef.value;
+  if (!tip || !tooltipVisible.value) return;
+  const gap = 4;
+  const maxX = Math.max(gap, document.documentElement.clientWidth - tip.offsetWidth - gap);
+  const maxY = Math.max(gap, document.documentElement.clientHeight - tip.offsetHeight - gap);
+  tip.style.left = `${Math.min(Math.max(gap, pendingX), maxX)}px`;
+  tip.style.top = `${Math.min(Math.max(gap, pendingY), maxY)}px`;
 }
 
-function showTooltip(bi: number, x: number, y: number) {
+function flushTooltip() {
+  const bi = pendingBarIndex;
   const d = dates.value[bi];
   if (!d) return;
-  tooltip.value = {
-    show: true,
-    title: formatChartDate(d.date),
-    total: d.total,
-    rows: tooltipRows(bi),
-    x,
-    y,
-  };
-  void nextTick(() => {
-    const tip = tooltipRef.value;
-    if (!tip || !tooltip.value.show) return;
-    const gap = 4;
-    const maxMeasuredX = Math.max(gap, document.documentElement.clientWidth - tip.offsetWidth - gap);
-    const maxMeasuredY = Math.max(gap, document.documentElement.clientHeight - tip.offsetHeight - gap);
-    tooltip.value.x = Math.min(Math.max(gap, tooltip.value.x), maxMeasuredX);
-    tooltip.value.y = Math.min(Math.max(gap, tooltip.value.y), maxMeasuredY);
+  if (bi !== currentBarIndex) {
+    currentBarIndex = bi;
+    tooltipContent.value = {
+      title: formatChartDate(d.date),
+      total: d.total,
+      rows: tooltipRows(bi),
+    };
+    if (!tooltipVisible.value) tooltipVisible.value = true;
+    // New content resizes the tooltip; measure after Vue flushes the DOM.
+    void nextTick(positionTooltip);
+  } else {
+    positionTooltip();
+  }
+}
+
+function scheduleTooltip(bi: number, x: number, y: number) {
+  pendingBarIndex = bi;
+  pendingX = x;
+  pendingY = y;
+  if (tooltipRaf !== 0) return;
+  tooltipRaf = requestAnimationFrame(() => {
+    tooltipRaf = 0;
+    flushTooltip();
   });
+}
+
+function cancelPendingTooltip() {
+  if (tooltipRaf !== 0) {
+    cancelAnimationFrame(tooltipRaf);
+    tooltipRaf = 0;
+  }
+}
+
+function onEnter(bi: number, e: PointerEvent) {
+  scheduleTooltip(bi, e.clientX + 14, e.clientY + 14);
+}
+function onMove(bi: number, e: PointerEvent) {
+  scheduleTooltip(bi, e.clientX + 14, e.clientY + 14);
+}
+function onLeave() {
+  cancelPendingTooltip();
+  tooltipVisible.value = false;
+  currentBarIndex = -1;
 }
 
 function onFocus(bi: number) {
@@ -396,15 +421,11 @@ function onFocus(bi: number) {
   const top = bar.segments.length > 0
     ? Math.min(...bar.segments.map((segment) => segment.y))
     : padT + chartH;
-  showTooltip(
+  scheduleTooltip(
     bi,
     rect.left + (bar.x + barWidth.value / 2) * scale + 14,
     rect.top + top * scale + 14,
   );
-}
-
-function updateTooltip(bi: number, e: PointerEvent) {
-  showTooltip(bi, e.clientX + 14, e.clientY + 14);
 }
 
 </script>
@@ -450,7 +471,7 @@ function updateTooltip(bi: number, e: PointerEvent) {
   z-index: 5;
   min-width: 168px;
   max-width: 200px;
-  padding: 8px 10px;
+  padding: var(--ocg-space-sm) 10px;
   border: 1px solid var(--ocg-border);
   border-radius: 8px;
   background: var(--ocg-surface-raised);

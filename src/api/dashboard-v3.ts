@@ -20,20 +20,12 @@ import type {
   AccountSetupUpdate,
   AccountUpdate,
   AccountUsageUpdate,
-  ApplicationModels,
-  ApplicationConnectorCommitRequest,
-  ApplicationConnectorCommitResult,
-  ApplicationConnectorPreview,
-  ApplicationConnectorPreviewRequest,
-  ApplicationConnectors,
   AuthLogin,
   AuthRegister,
   AuthStatus,
   BrowserCapabilities,
   BrowserOpen,
   BrowserOpenRequest,
-  ClaudeDesktopModels,
-  ClaudeDesktopModelsUpdate,
   ConnectionInfo,
   CpaAccountDelete,
   CpaAccountStatusUpdate,
@@ -64,14 +56,13 @@ import type {
   DailyTokensByModel,
   DashboardSummary,
   DesktopUpdate,
-  DynamicProvider,
-  DynamicProviderCreate,
-  DynamicProviderDiscoverRequest,
-  DynamicProviderDiscoverResponse,
-  DynamicProviderMutation,
-  DynamicProviderTestRequest,
-  DynamicProviderTestResponse,
-  DynamicProviderUpdate,
+  ProviderDefinition,
+  ProviderDefinitionDiscoverRequest,
+  ProviderDefinitionDiscoverResponse,
+  ProviderDefinitionMutation,
+  ProviderDefinitionTestRequest,
+  ProviderDefinitionTestResponse,
+  ProviderDefinitionUpdate,
   ForwardLogKeys,
   ForwardLogModels,
   ForwardLogQuery,
@@ -82,19 +73,12 @@ import type {
   KeyCreate,
   KeyUpdate,
   ModelProtocolOverridesUpdate,
-  ModelAliasBindingsUpdate,
   MutationAck,
   MutationExpectation,
-  PricingMultipliersUpdate,
-  PricingSnapshot,
   ProtocolProbeRequest,
   ProtocolProbeResponse,
   ProviderCatalog,
   ProviderContracts,
-  ProviderModelCapability,
-  ProviderPricing,
-  ProviderPricingRefresh,
-  ProviderPricingRefreshUpdate,
   ProviderUsage,
   ProxyTestRequest,
   ProxyTestResponse,
@@ -104,21 +88,32 @@ import type {
   UsageMutation,
   UsageRefresh,
   UsageWindow,
-  ZenFreeModels,
   ZenFreeSettings,
   ZenFreeSettingsUpdate,
 } from "./generated/dashboard-v3.ts";
 
 /**
  * Hand-written Dashboard V3 endpoint client for the frozen
- * `/dashboard/api/v3` contract (schema/dashboard-api-v3.schema.json).
+ * contract (schema/dashboard-api-v3.schema.json). Requests go to
+ * `/dashboard/api/v4`; the `/dashboard/api/v3` prefix is a 410 tombstone.
+ * The remounted account-list shim is `GET /account-records`.
  *
  * Every non-2xx response uses the stable `V3Error` envelope
  * (`{ code, message, currentRevision, processGeneration }`); the transport
  * below maps it onto typed errors so callers can branch on 401 / 409 / 410 /
- * 429 without re-parsing bodies. Control-plane identity tokens observed on
- * any response are forwarded to the registered revision sink (the
- * controlPlane store) so later mutations always start from fresh CAS tokens.
+ * 429 without re-parsing bodies. Settings CAS tokens (`revision` and
+ * `processGeneration`) observed on a response are forwarded to the
+ * registered revision sink so later mutations start from those tokens.
+ * Publication is withheld when the body still names the process captured
+ * at dispatch after a different process became current, and when an
+ * unbound response would replace an already observed process. 401 and 410
+ * global events use the same captured origin. A 401 whose process is still
+ * current fires before the body is read; a changed process rechecks the
+ * live getter after the envelope is parsed. A 410 samples the current
+ * process after its body is parsed and before this response publishes
+ * tokens. After a process change, the envelope must name the process
+ * current at that sample. Replacing the sink suppresses both. The caller
+ * still receives the original body or error.
  */
 
 export const DASHBOARD_AUTH_REQUIRED_EVENT = "ocg-dashboard-auth-required";
@@ -135,31 +130,109 @@ export const PRIMARY_KEY_ID = "00000000-0000-0000-0000-000000000001";
 /** Sentinel selecting forward logs without client key attribution. */
 export const UNATTRIBUTED_KEY_FILTER = "__unattributed__";
 
-/** Control-plane identity tokens carried by (almost) every V3 payload. */
+/** Settings CAS revision and backend process generation. */
 export interface ControlPlaneTokens {
   revision: number;
   processGeneration: number;
-  pricingRevision?: string | null;
 }
 
 type ControlRevisionSink = (tokens: ControlPlaneTokens) => void;
+/** Reads the process the Pinia owner currently holds. Transport never writes through it. */
+type ControlProcessGetter = () => number | null;
 
 let controlRevisionSink: ControlRevisionSink | null = null;
+let controlProcessGetter: ControlProcessGetter | null = null;
+let controlRevisionEpoch = 0;
 
-/** Registered once by the controlPlane store; replaced when a new Pinia activates. */
-export function setControlRevisionSink(sink: ControlRevisionSink | null): void {
+/**
+ * Registered once by the controlPlane store; replaced when a new Pinia activates.
+ * `currentProcess` is optional. Replacing the sink clears a getter the new
+ * registration does not supply, and bumps the epoch so earlier responses
+ * cannot publish into the new session.
+ */
+export function setControlRevisionSink(
+  sink: ControlRevisionSink | null,
+  currentProcess?: ControlProcessGetter | null,
+): void {
+  controlRevisionEpoch += 1;
   controlRevisionSink = sink;
+  controlProcessGetter = currentProcess ?? null;
 }
 
-function publishTokens(body: unknown): void {
-  if (!controlRevisionSink || typeof body !== "object" || body === null) return;
+function observedProcess(): number | null {
+  const value = controlProcessGetter?.();
+  return typeof value === "number" ? value : null;
+}
+
+function readControlTokens(body: unknown): ControlPlaneTokens | null {
+  if (typeof body !== "object" || body === null) return null;
   const record = body as Record<string, unknown>;
-  if (typeof record.revision !== "number" || typeof record.processGeneration !== "number") return;
-  controlRevisionSink({
-    revision: record.revision,
-    processGeneration: record.processGeneration,
-    pricingRevision: typeof record.pricingRevision === "string" ? record.pricingRevision : null,
-  });
+  if (typeof record.revision === "number" && typeof record.processGeneration === "number") {
+    return { revision: record.revision, processGeneration: record.processGeneration };
+  }
+  // V4 listings/commits nest `{ revision: ControlRevision }`.
+  const nested = record.revision;
+  if (typeof nested !== "object" || nested === null) return null;
+  const nestedRecord = nested as Record<string, unknown>;
+  if (typeof nestedRecord.revision !== "number" || typeof nestedRecord.processGeneration !== "number") return null;
+  return { revision: nestedRecord.revision, processGeneration: nestedRecord.processGeneration };
+}
+
+/**
+ * Process ids are equal or not; they are not ordered.
+ *
+ * `origin` is the process at dispatch, or null when none was loaded.
+ * `current` is the process at publication.
+ * Withhold a response that names `origin` after `current` has become a
+ * different process. Withhold an unbound response that names some process
+ * other than an already observed `current`. Publish when the response names
+ * `current`, when it names a process other than a left-behind origin, or
+ * when nothing is current yet. Same-process revision order stays in the store.
+ */
+function mayPublishControlTokens(
+  origin: number | null,
+  current: number | null,
+  incoming: number,
+): boolean {
+  if (origin !== null && current !== null && current !== origin && incoming === origin) return false;
+  if (origin === null && current !== null && incoming !== current) return false;
+  return true;
+}
+
+function publishTokens(body: unknown, epoch: number, origin: number | null): void {
+  if (epoch !== controlRevisionEpoch || !controlRevisionSink) return;
+  const tokens = readControlTokens(body);
+  if (!tokens) return;
+  if (!mayPublishControlTokens(origin, observedProcess(), tokens.processGeneration)) return;
+  controlRevisionSink(tokens);
+}
+
+/**
+ * 401 and 410 notifications. Process ids are equal or not; they are not ordered.
+ * A replaced sink never notifies. An unchanged dispatch process notifies
+ * without consulting the envelope. After the process changes, the envelope
+ * must name the process current at notification time.
+ */
+function mayEmitDashboardSignal(
+  epoch: number,
+  origin: number | null,
+  current: number | null,
+  incoming: number | null,
+): boolean {
+  if (epoch !== controlRevisionEpoch) return false;
+  if (origin === current) return true;
+  return current !== null && incoming === current;
+}
+
+async function errorEnvelopeProcess(response: Response): Promise<number | null> {
+  const responseText = await response.text().catch(() => "");
+  if (!responseText) return null;
+  try {
+    const body = JSON.parse(responseText) as { processGeneration?: unknown };
+    return typeof body.processGeneration === "number" ? body.processGeneration : null;
+  } catch {
+    return null;
+  }
 }
 
 export class DashboardAuthError extends Error {
@@ -177,6 +250,8 @@ export class DashboardRequestError extends Error {
   readonly processGeneration: number | null;
   readonly retryAfterSeconds: number | null;
   readonly nextAllowedAt: string | null;
+  /** Extra rows from structured envelopes such as `destinationProjectionRefused`. */
+  readonly details: unknown[];
 
   constructor(
     message: string,
@@ -186,6 +261,7 @@ export class DashboardRequestError extends Error {
     processGeneration: number | null = null,
     retryAfterSeconds: number | null = null,
     nextAllowedAt: string | null = null,
+    details: unknown[] = [],
   ) {
     super(message);
     this.name = "DashboardRequestError";
@@ -195,6 +271,7 @@ export class DashboardRequestError extends Error {
     this.processGeneration = processGeneration;
     this.retryAfterSeconds = retryAfterSeconds;
     this.nextAllowedAt = nextAllowedAt;
+    this.details = details;
   }
 }
 
@@ -240,10 +317,8 @@ export class DashboardThrottledError extends DashboardRequestError {
 }
 
 /** Structured upgrade/refresh guidance surfaced on old-API 410 responses. */
-export function goneGuidance(): string {
-  // This is intentionally a stable transport-level fallback, outside the
-  // generated i18n key union. Shell-level UI may localize it further.
-  return "页面版本与服务不匹配，请刷新页面后重试；若仍失败请升级到最新版本";
+function goneGuidance(): string {
+  return t("页面版本与服务不匹配，刷新页面后重试；仍失败请升级到最新版本");
 }
 
 export function isRevisionConflict(error: unknown): error is DashboardConflictError {
@@ -251,12 +326,12 @@ export function isRevisionConflict(error: unknown): error is DashboardConflictEr
     || (error instanceof DashboardRequestError && error.status === 409 && error.code === "revisionConflict");
 }
 
-export function v3ApiBase(): string {
+function dashboardApiBase(_base: "v3" | "v4"): string {
   if (window.location.pathname.startsWith("/dashboard")) {
-    return "/dashboard/api/v3";
+    return "/dashboard/api/v4";
   }
   // 回退仅覆盖 Gateway 监听默认端口 9042 的纯静态托管场景（如直接打开构建产物）
-  return "http://127.0.0.1:9042/dashboard/api/v3";
+  return "http://127.0.0.1:9042/dashboard/api/v4";
 }
 
 interface V3ErrorBody {
@@ -265,26 +340,44 @@ interface V3ErrorBody {
   currentRevision?: unknown;
   processGeneration?: unknown;
   nextAllowedAt?: unknown;
+  details?: unknown;
 }
 
-export async function requestV3<T>(
+export async function requestDashboard<T>(
+  base: "v3" | "v4",
   path: string,
   init: RequestInit = {},
   notifyAuthRequired = true,
 ): Promise<T> {
+  // Resetting the session also replaces the revision sink. A receipt or 401
+  // from an earlier session must not alter the newly authenticated session.
+  // The process is captured here, before the request leaves, so a later
+  // response can be recognized as referring back to that origin.
+  const epoch = controlRevisionEpoch;
+  const originProcess = observedProcess();
   const headers = new Headers(init.headers);
   if (init.body && !headers.has("Content-Type")) {
     headers.set("Content-Type", "application/json");
   }
-  const response = await fetch(`${v3ApiBase()}${path}`, {
+  const response = await fetch(`${dashboardApiBase(base)}${path}`, {
     ...init,
     headers,
     credentials: "same-origin",
   });
   if (!response.ok) {
     if (response.status === 401 && notifyAuthRequired) {
-      const message = t("登录已失效，请重新登录");
-      window.dispatchEvent(new CustomEvent(DASHBOARD_AUTH_REQUIRED_EVENT, { detail: message }));
+      const message = t("登录已失效，重新登录");
+      // Unchanged context notifies before any body read. A changed context
+      // parses the envelope, then rechecks the live process.
+      const signalProcess = observedProcess();
+      if (mayEmitDashboardSignal(epoch, originProcess, signalProcess, null)) {
+        window.dispatchEvent(new CustomEvent(DASHBOARD_AUTH_REQUIRED_EVENT, { detail: message }));
+      } else if (epoch === controlRevisionEpoch) {
+        const incoming = await errorEnvelopeProcess(response);
+        if (mayEmitDashboardSignal(epoch, originProcess, observedProcess(), incoming)) {
+          window.dispatchEvent(new CustomEvent(DASHBOARD_AUTH_REQUIRED_EVENT, { detail: message }));
+        }
+      }
       throw new DashboardAuthError(message);
     }
     let message = `${response.status} ${response.statusText}`;
@@ -300,8 +393,12 @@ export async function requestV3<T>(
     }
     const currentRevision = typeof body?.currentRevision === "number" ? body.currentRevision : null;
     const processGeneration = typeof body?.processGeneration === "number" ? body.processGeneration : null;
+    // After the body is known, before this response can publish. A 410 must
+    // not notify from the process seen on the headers, or from a process it
+    // is about to install itself.
+    const signalProcess = observedProcess();
     if (currentRevision !== null && processGeneration !== null) {
-      publishTokens({ revision: currentRevision, processGeneration });
+      publishTokens({ revision: currentRevision, processGeneration }, epoch, originProcess);
     }
     const retryAfterHeader = response.headers.get("Retry-After");
     const retryAfterSeconds = retryAfterHeader && /^\d+$/.test(retryAfterHeader)
@@ -313,9 +410,11 @@ export async function requestV3<T>(
     }
     if (response.status === 410) {
       const error = new DashboardGoneError(message, path, currentRevision, processGeneration);
-      window.dispatchEvent(new CustomEvent(DASHBOARD_GONE_EVENT, {
-        detail: { message: error.message, guidance: error.guidance, path },
-      }));
+      if (mayEmitDashboardSignal(epoch, originProcess, signalProcess, processGeneration)) {
+        window.dispatchEvent(new CustomEvent(DASHBOARD_GONE_EVENT, {
+          detail: { message: error.message, guidance: error.guidance, path },
+        }));
+      }
       throw error;
     }
     if (response.status === 429) {
@@ -329,12 +428,29 @@ export async function requestV3<T>(
       processGeneration,
       retryAfterSeconds,
       nextAllowedAt,
+      Array.isArray(body?.details) ? body.details : [],
     );
   }
   if (response.status === 204) return undefined as T;
   const body = await response.json() as T;
-  publishTokens(body);
+  publishTokens(body, epoch, originProcess);
   return body;
+}
+
+export async function requestV3<T>(
+  path: string,
+  init: RequestInit = {},
+  notifyAuthRequired = true,
+): Promise<T> {
+  return requestDashboard<T>("v4", path, init, notifyAuthRequired);
+}
+
+export async function requestV4<T>(
+  path: string,
+  init: RequestInit = {},
+  notifyAuthRequired = true,
+): Promise<T> {
+  return requestDashboard<T>("v4", path, init, notifyAuthRequired);
 }
 
 function json(value: unknown): BodyInit {
@@ -344,7 +460,7 @@ function json(value: unknown): BodyInit {
 /** Mutation body without the CAS pair; the caller supplies it per attempt. */
 export type WithoutExpectation<T> = Omit<T, "expectedRevision" | "processGeneration">;
 
-function withExpectation<T extends object>(body: T, expectation: MutationExpectation): BodyInit {
+export function withExpectation<T extends object>(body: T, expectation: MutationExpectation): BodyInit {
   return json({ ...body, ...expectation });
 }
 
@@ -516,22 +632,6 @@ export const dashboardV3 = {
       },
     ),
 
-  // --- local Desktop application connectors ---
-  getApplicationConnectors: () => requestV3<ApplicationConnectors>("/applications/connectors"),
-  previewApplicationConnector: (id: string, input: ApplicationConnectorPreviewRequest) =>
-    requestV3<ApplicationConnectorPreview>(`/applications/connectors/${encode(id)}/preview`, {
-      method: "POST",
-      body: json(input),
-    }),
-  commitApplicationConnector: (
-    id: string,
-    input: WithoutExpectation<ApplicationConnectorCommitRequest>,
-    expectation: MutationExpectation,
-  ) => requestV3<ApplicationConnectorCommitResult>(`/applications/connectors/${encode(id)}/commit`, {
-    method: "POST",
-    body: withExpectation(input, expectation),
-  }),
-
   // --- access keys ---
   createKey: (name: string, expectation: MutationExpectation) =>
     requestV3<MutationAck>("/keys", {
@@ -571,15 +671,6 @@ export const dashboardV3 = {
       method: "POST",
       body: json(input),
     }),
-  getClaudeDesktopModels: () => requestV3<ClaudeDesktopModels>("/claude-desktop/models"),
-  putClaudeDesktopModels: (
-    models: WithoutExpectation<ClaudeDesktopModelsUpdate>,
-    expectation: MutationExpectation,
-  ) =>
-    requestV3<ClaudeDesktopModels>("/claude-desktop/models", {
-      method: "PUT",
-      body: withExpectation(models, expectation),
-    }),
 
   // --- desktop updater ---
   checkForUpdate: () => requestV3<UpdateCheck>("/settings/check-update"),
@@ -590,39 +681,8 @@ export const dashboardV3 = {
       body: withExpectation({ expectedVersion } satisfies WithoutExpectation<InstallUpdate>, expectation),
     }),
 
-  // --- pricing ---
-  refreshProviderPricing: (
-    providerId: string,
-    refresh: WithoutExpectation<ProviderPricingRefreshUpdate>,
-    expectation: MutationExpectation,
-  ) => requestV3<ProviderPricingRefresh>(`/providers/${encode(providerId)}/pricing/refresh`, {
-    method: "POST",
-    body: withExpectation(refresh, expectation),
-  }),
-  putPricingMultipliers: (
-    update: WithoutExpectation<PricingMultipliersUpdate>,
-    expectation: MutationExpectation,
-  ) =>
-    requestV3<PricingSnapshot>("/providers/opencode/pricing/multipliers", {
-      method: "PUT",
-      body: withExpectation(update, expectation),
-    }),
-  putProviderPricingMultipliers: (
-    providerId: string,
-    update: WithoutExpectation<PricingMultipliersUpdate>,
-    expectation: MutationExpectation,
-  ) => requestV3<ProviderPricing>(
-    `/providers/${encode(providerId)}/pricing/multipliers`,
-    {
-      method: "PUT",
-      body: withExpectation(update, expectation),
-    },
-  ),
-  getProviderPricing: (providerId: string) =>
-    requestV3<ProviderPricing>(`/providers/${encode(providerId)}/pricing`),
-
   // --- accounts ---
-  listAccounts: () => requestV3<AccountList>("/accounts"),
+  listAccounts: () => requestV3<AccountList>("/account-records"),
   getAccount: (id: string) => requestV3<Account>(`/accounts/${encode(id)}`),
   createAccount: (input: WithoutExpectation<AccountCreate>, expectation: MutationExpectation) =>
     requestV3<AccountMutation>("/accounts", {
@@ -678,11 +738,6 @@ export const dashboardV3 = {
     requestV3<AccountMutation>(`/accounts/${encode(id)}/model-capabilities`, {
       method: "PUT",
       body: withExpectation(update, expectation),
-    }),
-  verifyAccount: (id: string, expectation: MutationExpectation) =>
-    requestV3<AccountMutation>(`/accounts/${encode(id)}/verify`, {
-      method: "POST",
-      body: mutation(expectation),
     }),
   testAccountModel: (id: string, modelId: string) =>
     requestV3<AccountModelTestResponse>(`/accounts/${encode(id)}/model-tests`, {
@@ -741,60 +796,40 @@ export const dashboardV3 = {
 
   // --- providers ---
   getProviders: () => requestV3<ProviderCatalog>("/providers"),
-  getDynamicProvider: (providerId: string) =>
-    requestV3<DynamicProvider>(`/providers/${encode(providerId)}`),
-  createDynamicProvider: (
-    input: WithoutExpectation<DynamicProviderCreate>,
-    expectation: MutationExpectation,
-  ) => requestV3<DynamicProviderMutation>("/providers", {
-    method: "POST",
-    body: withExpectation(input, expectation),
-  }),
-  updateDynamicProvider: (
+  getProviderDefinition: (providerId: string) =>
+    requestV3<ProviderDefinition>(`/providers/${encode(providerId)}`),
+  updateProviderDefinition: (
     providerId: string,
-    input: WithoutExpectation<DynamicProviderUpdate>,
+    input: WithoutExpectation<ProviderDefinitionUpdate>,
     expectation: MutationExpectation,
-  ) => requestV3<DynamicProviderMutation>(`/providers/${encode(providerId)}`, {
+  ) => requestV3<ProviderDefinitionMutation>(`/providers/${encode(providerId)}`, {
     method: "PATCH",
     body: withExpectation(input, expectation),
   }),
-  deleteDynamicProvider: (providerId: string, expectation: MutationExpectation) =>
+  deleteProviderDefinition: (providerId: string, expectation: MutationExpectation) =>
     requestV3<MutationAck>(`/providers/${encode(providerId)}`, {
       method: "DELETE",
       body: mutation(expectation),
     }),
-  discoverDynamicProviderModels: (input: DynamicProviderDiscoverRequest) =>
-    requestV3<DynamicProviderDiscoverResponse>("/providers/models/discover", {
+  discoverProviderDefinitionModels: (input: ProviderDefinitionDiscoverRequest, signal?: AbortSignal) =>
+    requestV3<ProviderDefinitionDiscoverResponse>("/providers/models/discover", {
       method: "POST",
       body: json(input),
+      signal,
     }),
-  testDynamicProvider: (input: DynamicProviderTestRequest) =>
-    requestV3<DynamicProviderTestResponse>("/providers/test", {
+  testProviderDefinition: (input: ProviderDefinitionTestRequest, signal?: AbortSignal) =>
+    requestV3<ProviderDefinitionTestResponse>("/providers/test", {
       method: "POST",
       body: json(input),
+      signal,
     }),
-  getProviderModelCapabilities: () =>
-    requestV3<ProviderModelCapability[]>("/providers/model-capabilities"),
   getZenFreeSettings: () => requestV3<ZenFreeSettings>("/providers/zen-free"),
   patchZenFreeSettings: (enabled: boolean, expectation: MutationExpectation) =>
     requestV3<ZenFreeSettings>("/providers/zen-free", {
       method: "PATCH",
       body: withExpectation({ enabled } satisfies WithoutExpectation<ZenFreeSettingsUpdate>, expectation),
     }),
-  getZenFreeModels: () => requestV3<ZenFreeModels>("/providers/zen-free/models"),
-  refreshZenFreeModels: (expectation: MutationExpectation) =>
-    requestV3<ZenFreeModels>("/providers/zen-free/models/refresh", {
-      method: "POST",
-      body: mutation(expectation),
-    }),
   getProviderContracts: () => requestV3<ProviderContracts>("/provider-contracts"),
-  putModelAliasBindings: (
-    update: WithoutExpectation<ModelAliasBindingsUpdate>,
-    expectation: MutationExpectation,
-  ) => requestV3<ProviderContracts>("/model-alias-bindings", {
-    method: "PUT",
-    body: withExpectation(update, expectation),
-  }),
   refreshContractCatalog: (
     scopeKind: ContractScopeKind,
     scopeId: string,
@@ -837,16 +872,17 @@ export const dashboardV3 = {
     }),
 
   // --- observability (read-only, page-local state) ---
-  getApplicationModels: () => requestV3<ApplicationModels>("/application-models"),
   getDashboardSummary: () => requestV3<DashboardSummary>("/dashboard/summary"),
   getDailyTokensByModel: (days?: number) =>
     requestV3<DailyTokensByModel>(`/dashboard/daily-tokens-by-model?days=${days ?? 30}`),
-  getGatewayLogs: (query: GatewayLogQuery = {}) => {
+  getGatewayLogs: (query: GatewayLogQuery = {}, signal?: AbortSignal) => {
     const params = new URLSearchParams({ limit: String(query.limit ?? 100) });
     if (query.requestId) params.set("requestId", query.requestId);
-    return requestV3<GatewayLogs>(`/logs/gateway?${params}`);
+    if (query.level) params.set("level", query.level);
+    if (query.category) params.set("category", query.category);
+    return requestV3<GatewayLogs>(`/logs/gateway?${params}`, { signal });
   },
-  getForwardLogs: (query: ForwardLogQuery = {}) => {
+  getForwardLogs: (query: ForwardLogQuery = {}, signal?: AbortSignal) => {
     // Filters lead the query string; the backend applies them before paging.
     const params = new URLSearchParams();
     if (query.status) params.set("status", query.status);
@@ -863,7 +899,7 @@ export const dashboardV3 = {
     if (query.sortOrder) params.set("sortOrder", query.sortOrder);
     params.set("limit", String(query.limit ?? 20));
     params.set("offset", String(query.offset ?? 0));
-    return requestV3<ForwardLogs>(`/logs/forward?${params}`);
+    return requestV3<ForwardLogs>(`/logs/forward?${params}`, { signal });
   },
   getForwardLogModels: () => requestV3<ForwardLogModels>("/logs/forward/models"),
   getForwardLogKeys: () => requestV3<ForwardLogKeys>("/logs/forward/keys"),
@@ -871,7 +907,7 @@ export const dashboardV3 = {
 
 export function browserSessionWebSocketUrl(token: string): string {
   const url = new URL(
-    `${v3ApiBase()}/browser/sessions/${encodeURIComponent(token)}/ws`,
+    `${dashboardApiBase("v4")}/browser/sessions/${encodeURIComponent(token)}/ws`,
     window.location.href,
   );
   url.protocol = url.protocol === "https:" ? "wss:" : "ws:";

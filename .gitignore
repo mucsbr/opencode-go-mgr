@@ -71,3 +71,15 @@ pnpm.cmd
 # Local review / install verification artifacts
 .verify-gui-install/
 diff.txt
+
+# Agent session artifacts (audit reports, screenshots, scratch logs)
+.artifacts/
+/.acl-out/
+/.worktrees/
+/.playwright-cli/
+/.playwright-mcp/
+/target-agent/
+/tmp/
+
+# Local agent mockups and generated routing acceptance evidence
+.grok/

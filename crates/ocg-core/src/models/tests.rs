@@ -1,57 +1,8 @@
 use super::{
-    AppConfig, CLAUDE_DESKTOP_HAIKU_ALIAS, CLAUDE_DESKTOP_OPUS_ALIAS, CLAUDE_DESKTOP_SONNET_ALIAS,
-    ClaudeDesktopModels, DEFAULT_OPENCODE_INVITE_URL, MAX_ACCOUNT_NOTES_CHARS, ProxyListDirection,
-    ProxyMode, RoutingMode, normalize_account_notes, normalize_opencode_invite_url,
-    normalize_proxy_url, normalize_purchase_date, purchase_expires_on,
+    AppConfig, DEFAULT_OPENCODE_INVITE_URL, MAX_ACCOUNT_NOTES_CHARS, ProxyListDirection, ProxyMode,
+    RoutingMode, normalize_account_notes, normalize_opencode_invite_url, normalize_proxy_url,
+    normalize_purchase_date, purchase_expires_on,
 };
-use ocg_domain::account::{AccountSetupStep, AccountType, UpstreamChannel};
-
-#[test]
-fn account_wire_identities_keep_canonical_strings() {
-    assert_eq!(AccountType::Key.as_str(), "key");
-    assert_eq!(AccountSetupStep::Ready.as_str(), "ready");
-    let _ = UpstreamChannel::Go;
-}
-
-#[test]
-fn claude_desktop_models_map_aliases_and_inherit_by_role_priority() {
-    let models = ClaudeDesktopModels {
-        sonnet: String::new(),
-        opus: "glm-5.2".to_string(),
-        haiku: "mimo-v2.5".to_string(),
-    };
-
-    assert_eq!(
-        models.model_for_alias(CLAUDE_DESKTOP_SONNET_ALIAS),
-        Some("glm-5.2")
-    );
-    assert_eq!(
-        models.model_for_alias(CLAUDE_DESKTOP_OPUS_ALIAS),
-        Some("glm-5.2")
-    );
-    assert_eq!(
-        models.model_for_alias(CLAUDE_DESKTOP_HAIKU_ALIAS),
-        Some("mimo-v2.5")
-    );
-    assert_eq!(models.model_for_alias("claude-unknown"), None);
-}
-
-#[test]
-fn claude_desktop_models_reject_unknown_and_all_empty_values() {
-    let empty = ClaudeDesktopModels {
-        sonnet: String::new(),
-        opus: String::new(),
-        haiku: String::new(),
-    };
-    assert!(empty.validate().is_err());
-
-    let unknown = ClaudeDesktopModels {
-        sonnet: "not-a-supported-model".to_string(),
-        ..ClaudeDesktopModels::default()
-    };
-    assert!(unknown.validate().is_err());
-    assert!(ClaudeDesktopModels::default().validate().is_ok());
-}
 
 #[test]
 fn account_notes_trim_empty_and_reject_overlong() {
@@ -308,12 +259,7 @@ fn legacy_config_without_list_fields_loads_with_defaults() {
         "stream_idle_timeout_secs": 300,
         "routing_mode": "strict-priority",
         "conversation_sticky": false,
-        "free_model_routing": "explicit",
-        "claude_desktop_models": {
-            "sonnet": "minimax-m3",
-            "opus": "",
-            "haiku": ""
-        }
+        "free_model_routing": "explicit"
     });
     let config: AppConfig = serde_json::from_value(legacy).expect("legacy config loads");
     assert_eq!(config.proxy_list_direction, ProxyListDirection::Whitelist);
@@ -352,8 +298,7 @@ fn persisted_list_with_stale_ids_loads_and_never_matches() {
         "proxy_mode": "list",
         "proxy_url": "http://127.0.0.1:7890",
         "proxy_list_direction": "whitelist",
-        "proxy_list_models": ["gpt-5.6-luna", "removed-model"],
-        "claude_desktop_models": { "sonnet": "minimax-m3", "opus": "", "haiku": "" }
+        "proxy_list_models": ["gpt-5.6-luna", "removed-model"]
     }))
     .expect("stale list entries must load");
     config

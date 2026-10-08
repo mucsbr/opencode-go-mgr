@@ -1,0 +1,207 @@
+//! Dashboard V4 HTTP contract kernel.
+//!
+//! Mounted at `/dashboard/api/v4`. This slice owns the additive control
+//! plane (read-only connection/template projections plus CAS-protected
+//! onboarding, binding, credential, local CPA catalog, built-in Provider
+//! catalog writes, alias publication, and New API Key import) and remounts
+//! the operational V3 handlers on the same prefix. `GET /accounts` stays the
+//! identity listing; the remounted V3 account-list shim is `GET
+//! /account-records`. `GET /contract` is the V4-native ControlRevision.
+//! It reuses V3 session middleware and the V3 error envelope.
+//! Handlers do not issue outbound network requests except Key import and
+//! the explicit official-API balance/price refreshes.
+
+mod applications;
+mod billing;
+pub(crate) mod billing_cache;
+mod bindings;
+mod byok_applications;
+mod catalog;
+mod connections;
+mod cpa;
+mod credentials;
+mod destination_catalog;
+mod destinations;
+mod identities;
+pub(crate) mod logs;
+mod model_metadata;
+mod official_api;
+mod onboarding;
+pub(crate) mod pages;
+mod platform_keys;
+mod publication;
+mod routing;
+mod routing_cards;
+mod templates;
+mod temporary_policy;
+pub(crate) mod types;
+
+use axum::extract::State;
+use axum::middleware;
+use axum::routing::{get, patch, post};
+use axum::{Json, Router};
+
+use crate::dashboard_v3::{ControlRevision, require_v3_session};
+use crate::state::CoreState;
+
+pub use pages::types::*;
+pub use types::{
+    CATALOG_TYPE_NAMES, ConnectionList, ConnectionSummary, CpaCatalog, CpaCatalogUpdate,
+    CredentialList, CredentialRotateRequest, CredentialRotateResult, DestinationCredentialDto,
+    DestinationDto, DestinationList, DshApplication, DshApplicationInstallRequest,
+    DshApplicationStatus, IdentityList, IdentitySummary, OnboardingAuthorization,
+    OnboardingCommitRequest, OnboardingCommitResult, OnboardingConnection, OnboardingTarget,
+    PlatformKeyImportFailure, PlatformKeyImportRequest, PlatformKeyImportResult, ProviderTemplate,
+    RoutingCard, RoutingCardList, RoutingCardUpdate, RoutingExplanation, TemplateList,
+    contract_schema, contract_schema_pretty,
+};
+
+pub fn api_router(state: CoreState) -> Router<CoreState> {
+    let v4_native = Router::new()
+        .route("/contract", get(get_contract))
+        .route("/pages/dashboard", get(pages::overview::get))
+        .route("/pages/accounts", get(pages::accounts_page))
+        .route("/pages/accounts/layout", get(pages::account_layout))
+        .route(
+            "/pages/accounts/cards/{id}/credentials",
+            get(pages::card_credentials),
+        )
+        .route("/pages/accounts/{id}/detail", get(pages::account_detail))
+        .route("/pages/accounts/{id}/refresh", post(pages::refresh_account))
+        .route("/pages/providers", get(pages::providers_page))
+        .route("/pages/providers/{id}", get(pages::provider_detail))
+        .route("/pages/providers/{id}/models", get(pages::provider_models))
+        .route(
+            "/pages/providers/{id}/edit-detail",
+            get(pages::provider_edit_detail),
+        )
+        .route("/pages/aliases", get(pages::aliases_page))
+        .route(
+            "/applications/byok/{client}",
+            get(byok_applications::inspect)
+                .post(byok_applications::configure)
+                .delete(byok_applications::remove),
+        )
+        .route(
+            "/applications/byok/{client}/recover",
+            post(byok_applications::recover),
+        )
+        .route("/templates", get(templates::list_templates))
+        .route("/connections", get(connections::list_connections))
+        .route("/accounts", get(identities::list_accounts))
+        .route("/destinations", get(destinations::list_destinations))
+        .route(
+            "/destinations/{id}/catalog/refresh",
+            post(destination_catalog::refresh),
+        )
+        .route(
+            "/destinations/{id}/catalog",
+            axum::routing::put(destination_catalog::update),
+        )
+        .route("/model-metadata", get(model_metadata::list))
+        .route(
+            "/destinations/{id}/model-metadata",
+            get(model_metadata::get).put(model_metadata::put),
+        )
+        .route(
+            "/destinations/{id}/model-tests",
+            post(destination_catalog::test_model),
+        )
+        .route(
+            "/destinations/{id}",
+            patch(destinations::patch_destination).delete(destinations::delete_destination),
+        )
+        .route("/credentials", get(destinations::list_credentials))
+        .route("/accounts/{id}/official-api", get(official_api::get_status))
+        .route("/accounts/{id}/billing", get(billing::get_status))
+        .route("/billing/snapshots", post(billing::snapshots))
+        .route(
+            "/accounts/{id}/billing/credits",
+            axum::routing::put(billing::configure).delete(billing::disable),
+        )
+        .route(
+            "/accounts/{id}/billing/credits/calibrate",
+            post(billing::calibrate),
+        )
+        .route(
+            "/accounts/{id}/billing/credits/grants",
+            post(billing::grant),
+        )
+        .route(
+            "/accounts/{id}/official-api/balance",
+            post(official_api::refresh_balance),
+        )
+        .route(
+            "/applications/dsh",
+            get(applications::get_dsh)
+                .post(applications::install_dsh)
+                .delete(applications::uninstall_dsh),
+        )
+        .route("/onboarding/commit", post(onboarding::commit))
+        .route(
+            "/platform-accounts/{id}/import-keys",
+            post(platform_keys::import_keys),
+        )
+        .route("/credentials/{id}/rotate", post(credentials::rotate))
+        .route(
+            "/credentials/{id}/quota-retry",
+            post(credentials::quota_retry),
+        )
+        .route("/bindings/{id}", patch(bindings::patch))
+        .route(
+            "/identities/{id}/credentials",
+            post(identities::create_credential),
+        )
+        .route("/cpa/models", get(cpa::get_models).put(cpa::put_models))
+        .route(
+            "/provider-contracts/provider/{scope_id}/catalog/model",
+            axum::routing::put(catalog::edit_model),
+        )
+        .route(
+            "/provider-contracts/{scope_kind}/{scope_id}/catalog/add",
+            post(catalog::add_models),
+        )
+        .route(
+            "/provider-contracts/{scope_kind}/{scope_id}/catalog/remove",
+            post(catalog::remove_models),
+        )
+        .route(
+            "/alias-publication",
+            get(publication::get_publication).patch(publication::patch_publication),
+        )
+        .route("/routing/explain", get(routing::explain))
+        .route(
+            "/routing/cards",
+            get(routing_cards::list).put(routing_cards::replace),
+        )
+        .route(
+            "/routing/temporary-unavailability",
+            get(temporary_policy::get_configuration).put(temporary_policy::put_configuration),
+        )
+        .route(
+            "/routing/temporary-unavailability/restrictions",
+            get(temporary_policy::get_restrictions),
+        )
+        .route(
+            "/routing/temporary-unavailability/restrictions/{id}/clear",
+            post(temporary_policy::clear_restriction),
+        )
+        .route("/logs/operations", get(logs::list_operations))
+        .route("/logs/requests", get(logs::list_requests))
+        .route(
+            "/logs/requests/{request_key}/attempts",
+            get(logs::list_request_attempts),
+        )
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_v3_session,
+        ));
+
+    // V3 no longer registers GET /accounts or GET /contract, so these V4-native
+    // routes stay authoritative after merge.
+    v4_native.merge(crate::dashboard_v3::api_router(state))
+}
+
+async fn get_contract(State(state): State<CoreState>) -> Json<ControlRevision> {
+    Json(ControlRevision::from_state(&state))
+}

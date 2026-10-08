@@ -15,7 +15,7 @@ export function installWindowDashboard(): void {
 }
 
 export function installFetchMock(
-  responder: (req: RecordedRequest) => Response | object,
+  responder: (req: RecordedRequest) => Response | object | Promise<Response | object>,
 ): RecordedRequest[] {
   installWindowDashboard();
   const requests: RecordedRequest[] = [];
@@ -28,7 +28,7 @@ export function installFetchMock(
         body: init.body ? JSON.parse(String(init.body)) as Record<string, unknown> : null,
       };
       requests.push(request);
-      const result = responder(request);
+      const result = await responder(request);
       return result instanceof Response
         ? result
         : new Response(JSON.stringify(result), { headers: { "Content-Type": "application/json" } });
@@ -40,10 +40,12 @@ export function installFetchMock(
 export function setupControlPlane(
   revision = 7,
   processGeneration = 99,
-  pricingRevision: string | null = null,
+  // Kept so existing callers still typecheck. A historical id is not a live CAS token.
+  pricingRevision?: string | null,
 ): void {
+  void pricingRevision;
   setActivePinia(createPinia());
-  useControlPlaneStore().sync({ revision, processGeneration, pricingRevision });
+  useControlPlaneStore().sync({ revision, processGeneration });
 }
 
 export function v3AccountDto(id: string, overrides: Record<string, unknown> = {}): object {

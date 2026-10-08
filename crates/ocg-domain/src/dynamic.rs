@@ -1,8 +1,8 @@
 //! Typed dynamic Provider definitions. These are data, not adapter plugins.
 //!
 //! Every dynamic Provider binds the sealed Configurable HTTP adapter. Custom
-//! API remains a distinct account-owned route (`custom`) and is not a dynamic
-//! Provider.
+//! API retains the distinct compatibility identity (`custom`) and is not a
+//! dynamic Provider, while its persisted HTTP configuration is destination-owned.
 
 use crate::catalog::{
     CatalogParseError, CredentialKind, QuotaScope, UpstreamAuthScheme, UpstreamProtocolKind,
@@ -17,23 +17,25 @@ use serde::{Deserialize, Serialize};
 pub enum DynamicAuthKind {
     Bearer,
     XApiKey,
+    ApiKey,
     None,
 }
 
 impl DynamicAuthKind {
-    pub const ALL: [Self; 3] = [Self::Bearer, Self::XApiKey, Self::None];
+    pub const ALL: [Self; 4] = [Self::Bearer, Self::XApiKey, Self::ApiKey, Self::None];
 
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Bearer => "bearer",
             Self::XApiKey => "x-api-key",
+            Self::ApiKey => "api-key",
             Self::None => "none",
         }
     }
 
     pub const fn credential_kind(self) -> CredentialKind {
         match self {
-            Self::Bearer | Self::XApiKey => CredentialKind::ApiKey,
+            Self::Bearer | Self::XApiKey | Self::ApiKey => CredentialKind::ApiKey,
             Self::None => CredentialKind::None,
         }
     }
@@ -54,6 +56,7 @@ impl DynamicAuthKind {
         match self {
             Self::Bearer => Some(UpstreamAuthScheme::Bearer),
             Self::XApiKey => Some(UpstreamAuthScheme::XApiKey),
+            Self::ApiKey => Some(UpstreamAuthScheme::ApiKey),
             Self::None => None,
         }
     }
@@ -66,6 +69,7 @@ impl TryFrom<&str> for DynamicAuthKind {
         match value {
             "bearer" => Ok(Self::Bearer),
             "x-api-key" | "x_api_key" => Ok(Self::XApiKey),
+            "api-key" | "api_key" => Ok(Self::ApiKey),
             "none" => Ok(Self::None),
             _ => Err(CatalogParseError::UnknownAuthScheme(value.to_string())),
         }
@@ -74,14 +78,27 @@ impl TryFrom<&str> for DynamicAuthKind {
 
 /// One public-to-upstream mapping owned by a dynamic Provider.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DynamicModelUpstreamOverride {
+    pub protocol: UpstreamProtocolKind,
+    pub endpoint_url: String,
+}
+
+/// Absent overrides inherit the Provider's endpoint and protocol. Authentication
+/// remains Provider-owned; protocol names never imply an authentication scheme.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DynamicModelMapping {
     pub public_model: String,
     pub upstream_model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_override: Option<DynamicModelUpstreamOverride>,
 }
 
 /// Normalized dynamic Provider definition used by persistence and routing.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DynamicProviderDefinition {
+    /// Optional configuration-template provenance; never a routing identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preset_id: Option<String>,
     pub id: String,
     pub name: String,
     pub endpoint_url: String,
@@ -104,7 +121,7 @@ impl DynamicProviderDefinition {
     }
 }
 
-/// True when `provider_id` is the account-owned Custom API identity.
+/// True when `provider_id` is the legacy Custom API compatibility identity.
 pub fn is_custom_api_id(provider_id: &str) -> bool {
     provider_id == CUSTOM_PROVIDER_ID
 }
@@ -151,6 +168,7 @@ pub fn normalize_dynamic_mappings(
         normalized.push(DynamicModelMapping {
             public_model,
             upstream_model,
+            upstream_override: mapping.upstream_override.clone(),
         });
     }
     Ok(normalized)
@@ -170,14 +188,16 @@ mod tests {
             DynamicModelMapping {
                 public_model: "Gpt-4".into(),
                 upstream_model: "gpt-4-upstream".into(),
+                upstream_override: None,
             },
             DynamicModelMapping {
                 public_model: "gpt-4".into(),
                 upstream_model: "other".into(),
+                upstream_override: None,
             },
         ])
         .unwrap_err();
-        assert!(error.to_string().contains("duplicate public model"));
+        assert!(matches!(error, ProviderBindingError::InvalidModelId(_)));
     }
 
     #[test]

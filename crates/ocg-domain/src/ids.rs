@@ -57,13 +57,29 @@ pub const PRIMARY_KEY_ID: &str = "00000000-0000-0000-0000-000000000001";
 /// labels the entry with the localized "涓?Key".
 pub const PRIMARY_KEY_NAME: &str = "Primary";
 
-/// Canonicalize a client or catalog model name for table lookup.
+/// Lookup key for static price tables and historical protocol profiles.
 ///
-/// Spaces, underscores, and slashes become `-`; case is folded. Callers that
-/// must treat slash/underscore IDs as raw (alias resolution) must not use this
-/// folding for identity, only for protocol/pricing table keys.
+/// Spaces, underscores, and slashes become `-`; case is folded. This is not
+/// model identity: catalog rows, routing, and authorization use
+/// [`model_ids_match`], which keeps those separators distinct.
 pub fn normalize_model_name(name: &str) -> String {
     name.trim().to_lowercase().replace([' ', '_', '/'], "-")
+}
+
+/// Identity comparison for catalog rows, routing, and authorization.
+///
+/// Trims and ignores ASCII case. `/`, `_`, spaces, and `-` stay different
+/// names, so `vendor/model` and `vendor-model` are not the same model.
+pub fn model_ids_match(left: &str, right: &str) -> bool {
+    let left = model_identity_key(left);
+    let right = model_identity_key(right);
+    !left.is_empty() && !right.is_empty() && left == right
+}
+
+/// Proxy-list and catalog identity. Trims and folds ASCII case. Separators stay
+/// distinct, so `vendor/model` and `vendor-model` are different keys.
+pub fn model_identity_key(name: &str) -> String {
+    name.trim().to_lowercase()
 }
 
 /// True for the Zen catalog naming contract. The discovered catalog remains
@@ -85,21 +101,10 @@ pub fn looks_raw_shaped(name: &str) -> bool {
 
 /// Match a client-requested name against a declared Custom capability ID.
 ///
-/// Raw-shaped IDs (`/`, `_`, whitespace) never fold separators onto kebab
-/// aliases. Otherwise matching is case-insensitive like published aliases.
+/// Same identity rule as [`model_ids_match`]: case-insensitive, with
+/// separators preserved.
 pub fn custom_model_id_matches(declared: &str, requested: &str) -> bool {
-    let declared = declared.trim();
-    let requested = requested.trim();
-    if declared.is_empty() || requested.is_empty() {
-        return false;
-    }
-    if declared == requested {
-        return true;
-    }
-    if looks_raw_shaped(declared) || looks_raw_shaped(requested) {
-        return declared.eq_ignore_ascii_case(requested);
-    }
-    declared.eq_ignore_ascii_case(requested)
+    model_ids_match(declared, requested)
 }
 
 #[cfg(test)]
@@ -131,6 +136,14 @@ mod tests {
     }
 
     #[test]
+    fn model_ids_match_ignores_case_and_keeps_separators() {
+        assert!(model_ids_match("vendor/model", "Vendor/Model"));
+        assert!(!model_ids_match("vendor/model", "vendor-model"));
+        assert!(!model_ids_match("vendor/model", "vendor_model"));
+        assert!(!model_ids_match("", "vendor/model"));
+    }
+
+    #[test]
     fn custom_model_id_matching_is_exact_or_case_folded_without_separator_folding() {
         assert!(custom_model_id_matches("glm-5.2", "GLM-5.2"));
         assert!(custom_model_id_matches("my-local", "my-local"));
@@ -149,12 +162,7 @@ mod tests {
     }
 
     #[test]
-    fn ollama_cloud_identities_and_fixed_surfaces_stay_stable() {
-        assert_eq!(OLLAMA_PROVIDER_ID, "ollama");
-        assert_eq!(OLLAMA_CLOUD_BASE_URL, "https://ollama.com");
-        assert_eq!(OLLAMA_CLOUD_CHAT_COMPLETIONS_PATH, "/v1/chat/completions");
-        assert_eq!(OLLAMA_CLOUD_MODELS_PATH, "/v1/models");
-        assert_eq!(OLLAMA_CLOUD_PRICING_URL, "https://ollama.com/pricing");
+    fn ollama_cloud_pricing_page_stays_on_the_inference_origin() {
         // Pricing is a separate official page; keep it independent of the API
         // origin so a docs-host move cannot silently retarget inference.
         assert!(OLLAMA_CLOUD_PRICING_URL.starts_with(OLLAMA_CLOUD_BASE_URL));

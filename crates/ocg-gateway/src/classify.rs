@@ -4,10 +4,9 @@
 //! CAS, cooldown writes, usage-sync scheduling, and wire envelopes. This table
 //! exists so `forwarder` does not grow more `provider_id` policy branches.
 //!
-//! Runtime 401/429 rules here freeze Stage 0 `forwarder` behavior. OpenCode Go
-//! 401 is passthrough at this layer; only exact structured CreditsError rotates
-//! in the host. Only OpenCode responses use the provider-specific usage-window
-//! parser.
+//! Status and exact structured-error decoding stay side-effect free.
+//! The Core failure module turns these dialects into facts and applies one
+//! restriction policy; unknown 429s never imply a fixed account cooldown.
 //!
 //! HTTP classification takes `free_channel: bool` rather than a host channel
 //! enum. Window parsing, cooldown durations, and 429 body text stay in the host.
@@ -31,31 +30,35 @@ pub enum ProviderErrorClass {
     DecryptFailed,
     Connect,
     OutcomeUnknown,
-    RateLimited { policy: RateLimitPolicy },
+    RateLimited {
+        profile: ErrorProfile,
+    },
+    /// A rejected Zen Free attempt can use another compatible route.
+    FreeRejected,
     UnauthorizedPassthrough,
     UnauthorizedRotate,
     ForbiddenStop,
     ForbiddenRotate,
     HttpRequestTimeout,
     ClientError,
+    /// Explicit account credit rejection with no advertised recovery time.
+    InsufficientCredits,
     ServerError,
     StreamRetryEligible,
     StreamNoReplay,
 }
 
-/// How a classified 429 cools down and whether it may fall through.
+/// Static error dialect. This carries no duration, retry, or state-write policy.
 ///
 /// Public only as the cross-crate bridge; the host crate's `gateway::classify`
 /// facade keeps this type crate-private.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[doc(hidden)]
-pub enum RateLimitPolicy {
-    /// Parse OpenCode Go window text, rotate, key-match CAS, deferred usage sync.
-    GoWindow,
-    /// Shared egress-IP Free channel; exhaust it, no key rotate, no usage sync.
-    ZenFreeShared,
-    /// Custom/GOAT: five-minute generic cooldown, no Go window parse, no usage sync.
-    GenericFiveMinute,
+pub enum ErrorProfile {
+    OpenCodeGo,
+    ZenFree,
+    CommandCodeGoat,
+    GenericHttp,
 }
 
 /// Public only as the cross-crate bridge; the host crate's `gateway::classify`
@@ -76,16 +79,7 @@ pub enum Auth401Policy {
     RotatePersistAuthError,
 }
 
-/// Public only as the cross-crate bridge; the host crate's `gateway::classify`
-/// facade keeps this type crate-private.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[doc(hidden)]
-pub enum RateLimit429Policy {
-    GoWindow,
-    GenericFiveMinute,
-}
-
-/// Static per-adapter 401/429 policy. Free-channel 429 overlay is applied by
+/// Static authentication behavior and error dialect. Free-channel overlay is applied by
 /// [`classify_http`] from the `free_channel` flag, not from adapter identity.
 ///
 /// Public only as the cross-crate bridge; the host crate's `gateway::classify`
@@ -96,7 +90,7 @@ pub struct ProviderErrorPolicy {
     #[doc(hidden)]
     pub inference_401: Auth401Policy,
     #[doc(hidden)]
-    pub rate_limit_429: RateLimit429Policy,
+    pub error_profile: ErrorProfile,
 }
 
 /// Public only as the cross-crate bridge; the host crate's `gateway::classify`
@@ -155,7 +149,7 @@ pub fn provider_error_policy(provider_id: &str) -> ProviderErrorPolicy {
             } else {
                 Auth401Policy::RotatePersistAuthError
             },
-            rate_limit_429: RateLimit429Policy::GenericFiveMinute,
+            error_profile: ErrorProfile::GenericHttp,
         },
     }
 }
@@ -167,20 +161,25 @@ fn policy_for_kind(kind: ProviderAdapterKind) -> ProviderErrorPolicy {
             // account failures. classify_http_response refines only the exact
             // structured CreditsError case.
             inference_401: Auth401Policy::Passthrough,
-            rate_limit_429: RateLimit429Policy::GoWindow,
+            error_profile: ErrorProfile::OpenCodeGo,
         },
         ProviderAdapterKind::ZenFree => ProviderErrorPolicy {
+            // The active Free channel is handled before this status-only
+            // fallback. Keep the non-Free classification conservative.
             inference_401: Auth401Policy::Passthrough,
-            rate_limit_429: RateLimit429Policy::GoWindow,
+            error_profile: ErrorProfile::OpenCodeGo,
         },
-        ProviderAdapterKind::CommandCodeGoat
-        | ProviderAdapterKind::MiniMaxCn
+        ProviderAdapterKind::CommandCodeGoat => ProviderErrorPolicy {
+            inference_401: Auth401Policy::RotatePersistAuthError,
+            error_profile: ErrorProfile::CommandCodeGoat,
+        },
+        ProviderAdapterKind::MiniMaxCn
         | ProviderAdapterKind::KimiCn
         | ProviderAdapterKind::OllamaCloud
         | ProviderAdapterKind::ConfigurableHttp
         | ProviderAdapterKind::Cpa => ProviderErrorPolicy {
             inference_401: Auth401Policy::RotatePersistAuthError,
-            rate_limit_429: RateLimit429Policy::GenericFiveMinute,
+            error_profile: ErrorProfile::GenericHttp,
         },
     }
 }
@@ -239,18 +238,20 @@ pub fn classify_http(
     free_channel: bool,
     anonymous: bool,
 ) -> ProviderErrorClass {
+    if status == 429 {
+        let profile = match provider_error_policy(provider_id).error_profile {
+            ErrorProfile::OpenCodeGo if free_channel => ErrorProfile::ZenFree,
+            profile => profile,
+        };
+        return ProviderErrorClass::RateLimited { profile };
+    }
+    if free_channel && provider_id == OPENCODE_ZEN_FREE_PROVIDER_ID && status >= 400 {
+        return ProviderErrorClass::FreeRejected;
+    }
     if (500..600).contains(&status) {
         return ProviderErrorClass::ServerError;
     }
-    if status == 429 {
-        let policy = provider_error_policy(provider_id);
-        let rate = match policy.rate_limit_429 {
-            RateLimit429Policy::GenericFiveMinute => RateLimitPolicy::GenericFiveMinute,
-            RateLimit429Policy::GoWindow if free_channel => RateLimitPolicy::ZenFreeShared,
-            RateLimit429Policy::GoWindow => RateLimitPolicy::GoWindow,
-        };
-        return ProviderErrorClass::RateLimited { policy: rate };
-    }
+
     if status == 408 {
         return ProviderErrorClass::HttpRequestTimeout;
     }
@@ -294,9 +295,30 @@ pub fn classify_http_response(
         && response_has_error_type(response_body, "CreditsError")
     {
         ProviderErrorClass::UnauthorizedRotate
+    } else if status == 400
+        && !anonymous
+        && ProviderAdapterKind::from_provider_id(provider_id)
+            == Some(ProviderAdapterKind::CommandCodeGoat)
+        && response_has_insufficient_credits(response_body)
+    {
+        ProviderErrorClass::InsufficientCredits
     } else {
         base
     }
+}
+
+// Only the observed GOAT account-level envelope is evidence. A context-length,
+// model, or reasoning validation error must never trigger another billable send.
+fn response_has_insufficient_credits(body: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<Value>(body) else {
+        return false;
+    };
+    value.pointer("/error/code").and_then(Value::as_str) == Some("BAD_REQUEST")
+        && value.pointer("/error/type").and_then(Value::as_str) == Some("invalid_request_error")
+        && value.pointer("/error/message").and_then(Value::as_str).is_some_and(|message| {
+            message == "You have insufficient credits to make this request."
+                || message == "You have insufficient credits to make this request. Please purchase more credits to continue using the service."
+        })
 }
 
 fn response_has_error_type(response_body: &str, expected: &str) -> bool {
@@ -316,7 +338,7 @@ pub fn schedule_go_usage_sync(class: ProviderErrorClass) -> bool {
     matches!(
         class,
         ProviderErrorClass::RateLimited {
-            policy: RateLimitPolicy::GoWindow
+            profile: ErrorProfile::OpenCodeGo
         }
     )
 }

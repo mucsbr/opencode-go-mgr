@@ -12,7 +12,8 @@ clients expect the trailing `/v1`.
    dashboard does not collect or manage an OpenCode login password.
 2. In the dashboard's **Connection Center**, copy the **Key** and the
    **API Base URL** (`http://127.0.0.1:9042/v1`).
-3. Point your client at the base URL with the Key. See [Manual client setup](add-application.md) for URL and protocol selection.
+3. Point your client at the base URL with the Key. See
+   [Manual client setup](add-application.md) for URL and protocol selection.
 4. Verify the setup with a real request.
 
 The **Key** is the only secret you hand to the client. It accepts three
@@ -20,7 +21,7 @@ header shapes — `Authorization: Bearer <key>`, Anthropic-style
 `x-api-key: <key>`, or Gemini-style `x-goog-api-key: <key>`. The gateway
 pulls the upstream OpenCode-Go account key from SQLite and injects it itself.
 
-Minimal POSIX-shell checks for all five client formats:
+Minimal POSIX-shell checks for all four client formats:
 
 ```bash
 BASE=http://127.0.0.1:9042
@@ -40,11 +41,6 @@ curl "$BASE/v1/responses" -H "Authorization: Bearer $KEY" \
 curl "$BASE/v1/messages" -H "x-api-key: $KEY" \
   -H "anthropic-version: 2023-06-01" -H "Content-Type: application/json" \
   -d '{"model":"deepseek-v4-flash","max_tokens":16,"messages":[{"role":"user","content":"ping"}]}'
-
-# Claude Desktop: the alias is rewritten to the stored sonnet/opus/haiku mapping
-curl "$BASE/claude-desktop/v1/messages" -H "x-api-key: $KEY" \
-  -H "anthropic-version: 2023-06-01" -H "Content-Type: application/json" \
-  -d '{"model":"claude-sonnet-4-6","max_tokens":16,"messages":[{"role":"user","content":"ping"}]}'
 
 # Gemini generateContent
 curl "$BASE/v1beta/models/deepseek-v4-flash:generateContent" \

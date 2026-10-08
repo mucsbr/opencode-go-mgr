@@ -5,11 +5,15 @@ use crate::models::ForwardLog;
 use crate::redaction::{redact_exact_occurrences, redact_text, sha256_hex, truncate_text};
 use axum::http::HeaderMap;
 use chrono::Utc;
+use ocg_gateway::protocol::{ReplayDomain, RestoredReplay, restore_replay_opaque};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
 use std::time::Instant;
 use uuid::Uuid;
+
+#[cfg(test)]
+use std::cell::RefCell;
 
 pub const REQUEST_ID_HEADER: &str = "x-ocg-request-id";
 pub const DIAGNOSTIC_VERSION: u8 = 1;
@@ -25,6 +29,7 @@ pub(crate) use crate::redaction::{
 #[derive(Debug, Clone)]
 pub struct RequestTrace {
     pub request_id: String,
+    pub(crate) path: String,
     started_at: Instant,
     client_key_id: Option<String>,
     client_key_name: Option<String>,
@@ -34,6 +39,7 @@ impl RequestTrace {
     pub fn new() -> Self {
         Self {
             request_id: format!("ocg-{}", Uuid::new_v4()),
+            path: String::new(),
             started_at: Instant::now(),
             client_key_id: None,
             client_key_name: None,
@@ -213,8 +219,89 @@ pub fn serialize_diagnostic(mut diagnostic: ErrorDiagnostic) -> String {
     })
 }
 
+/// Program-only request event. `OCG_LOG_LEVEL` does not enable or suppress it.
+/// Severity follows the process filter (`RUST_LOG`) alone. Pass non-content
+/// metadata; full request content belongs in debug captures.
+pub(crate) fn log_event(
+    trace: &RequestTrace,
+    level: &str,
+    category: &str,
+    event: &str,
+    attempt: Option<u32>,
+    fields: Value,
+) {
+    let metadata = redact_text(&fields.to_string());
+    macro_rules! emit {
+        ($level:expr) => {
+            tracing::event!($level, category, request_id = %trace.request_id,
+                attempt, duration_ms = trace.elapsed_ms(), metadata = %metadata, "{event}")
+        };
+    }
+    use crate::runtime_log::Level;
+    match Level::parse(level) {
+        Some(Level::Trace) => emit!(tracing::Level::TRACE),
+        Some(Level::Debug) => emit!(tracing::Level::DEBUG),
+        Some(Level::Info) => emit!(tracing::Level::INFO),
+        Some(Level::Warn) => emit!(tracing::Level::WARN),
+        Some(Level::Error) => emit!(tracing::Level::ERROR),
+        None => tracing::warn!(category, "invalid request event severity"),
+    }
+}
+
 pub fn emit_failure(diagnostic_json: &str) {
-    eprintln!("OCG_REQUEST_ERROR {diagnostic_json}");
+    // The persisted diagnostic remains rich. Process logs carry only failure
+    // metadata, so upstream error text and request content cannot leak here.
+    if let Ok(diagnostic) = serde_json::from_str::<ErrorDiagnostic>(diagnostic_json) {
+        tracing::warn!(category = "request", request_id = %diagnostic.request_id,
+            attempt = diagnostic.attempt, error_source = %diagnostic.error_source,
+            error_stage = %diagnostic.error_stage, duration_ms = diagnostic.duration_ms,
+            upstream_status = diagnostic.upstream_status, downstream_status = diagnostic.downstream_status,
+            "request attempt failed");
+    } else {
+        tracing::warn!(
+            category = "request",
+            "request attempt failed with an invalid diagnostic"
+        );
+    }
+}
+
+/// Runtime record of a versioned legacy-compat hosted-tool drop.
+///
+/// Emitted at the actual forward attempt. The payload is request id, compat
+/// profile, version, and dropped hosted-tool types only — never the request
+/// body or secrets.
+pub fn emit_legacy_tool_compat(
+    request_id: &str,
+    profile: &str,
+    version: u32,
+    dropped_hosted_tools: &[String],
+) {
+    #[cfg(test)]
+    let payload = json!({
+        "request_id": request_id,
+        "profile": profile,
+        "version": version,
+        "dropped_hosted_tools": dropped_hosted_tools,
+    });
+    tracing::warn!(category = "compatibility", request_id, profile, version,
+        dropped_hosted_tools = ?dropped_hosted_tools, "legacy hosted tools omitted");
+    #[cfg(test)]
+    record_legacy_tool_compat_emission(&payload);
+}
+
+#[cfg(test)]
+thread_local! {
+    static LEGACY_TOOL_COMPAT_EMISSIONS: RefCell<Vec<Value>> = const { RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+fn record_legacy_tool_compat_emission(payload: &Value) {
+    LEGACY_TOOL_COMPAT_EMISSIONS.with(|slot| slot.borrow_mut().push(payload.clone()));
+}
+
+#[cfg(test)]
+pub(crate) fn take_legacy_tool_compat_emissions() -> Vec<Value> {
+    LEGACY_TOOL_COMPAT_EMISSIONS.with(|slot| std::mem::take(&mut *slot.borrow_mut()))
 }
 
 /// Persist a local request failure in the request log without leaking request
@@ -243,7 +330,11 @@ pub(crate) fn log_request_failure(
         credential_account_id: None,
         client_key_id: trace.client_key_id.clone(),
         client_key_name: trace.client_key_name.clone(),
-        status: if diagnostic.error_source == "client" {
+        status: if diagnostic.error_source == "transport"
+            && diagnostic.error_stage == "request_budget"
+        {
+            "outcome_unknown"
+        } else if diagnostic.error_source == "client" {
             "client_error"
         } else {
             "error"
@@ -263,7 +354,14 @@ pub(crate) fn log_request_failure(
         quota_multiplier: None,
         local_adjustment_multiplier: None,
         service_tier: None,
-        cost_state: "not_applicable".to_string(),
+        cost_state: if diagnostic.error_source == "transport"
+            && diagnostic.error_stage == "request_budget"
+        {
+            "outcome_unknown"
+        } else {
+            "not_applicable"
+        }
+        .to_string(),
         error_message: Some(redact_text(message)),
         request_id: Some(diagnostic.request_id.clone()),
         attempt: Some(i64::from(diagnostic.attempt)),
@@ -273,7 +371,7 @@ pub(crate) fn log_request_failure(
         diagnostic: diagnostic_value,
     };
     if let Err(error) = db.log_forward(&log) {
-        eprintln!("failed to persist local request failure: {error}");
+        tracing::warn!(error = %error, "failed to persist local request failure");
     }
 }
 
@@ -486,107 +584,268 @@ fn is_safe_label_char(ch: char) -> bool {
 /// a more aggressive text sanitizer, but client-facing success payloads only
 /// need the credential removed from values that can carry provider output.
 pub(crate) fn redact_known_secret_values(value: &mut Value, known_secret: &str) {
-    if known_secret.is_empty() {
-        return;
-    }
-    redact_known_secret_values_at(value, known_secret, None, None, false, None, true);
+    let _ = walk_secrets(value, known_secret, false, None);
 }
 
 /// Streaming argument fragments are not standalone JSON yet. Their semantic
 /// redactor owns those fields, so the frame-level defense must leave them intact
 /// instead of accidentally rewriting nested property names.
 pub(crate) fn redact_known_secret_stream_values(value: &mut Value, known_secret: &str) {
-    if known_secret.is_empty() {
-        return;
-    }
-    let event_type = value
-        .get("type")
-        .and_then(Value::as_str)
-        .map(str::to_string);
-    redact_known_secret_values_at(
-        value,
-        known_secret,
-        None,
-        None,
-        true,
-        event_type.as_deref(),
-        true,
-    );
+    let _ = walk_secrets(value, known_secret, true, None);
 }
 
-fn redact_known_secret_values_at(
+/// Post-bind redaction for one known route.
+///
+/// Returns true when restored raw opaque or signed thinking contains the
+/// secret. A validated marker or codec is left unchanged only when it is the
+/// value of a native opaque field (`thinking.signature`, `signature_delta`,
+/// `redacted_thinking.data`, or `reasoning.encrypted_content`). The same
+/// strings inside tool arguments, parameters, metadata, or ordinary text are
+/// redacted. A `None` domain keeps [`redact_known_secret_values`].
+pub(crate) fn redact_bound_generated_values(
     value: &mut Value,
     known_secret: &str,
-    key_hint: Option<&str>,
-    parent_key: Option<&str>,
+    domain: ReplayDomain,
+) -> bool {
+    walk_secrets(value, known_secret, false, Some(domain))
+}
+
+/// Streaming form of [`redact_bound_generated_values`] for generated frames.
+pub(crate) fn redact_bound_generated_stream_values(
+    value: &mut Value,
+    known_secret: &str,
+    domain: ReplayDomain,
+) -> bool {
+    walk_secrets(value, known_secret, true, Some(domain))
+}
+
+#[derive(Clone, Copy)]
+struct SecretWalk<'a> {
+    secret: &'a str,
     streaming: bool,
-    stream_event_type: Option<&str>,
-    preserve_protocol_controls: bool,
-) {
-    match value {
-        Value::String(text)
-            if !(preserve_protocol_controls
-                && key_hint.is_some_and(|key| is_protocol_control_string_value(key, text))) =>
-        {
-            if key_hint == Some("encrypted_content")
-                && opaque_replay_contains_secret(text, known_secret)
+    stream_event_type: Option<&'a str>,
+    bound_domain: Option<ReplayDomain>,
+}
+
+fn walk_secrets(
+    value: &mut Value,
+    known_secret: &str,
+    streaming: bool,
+    bound_domain: Option<ReplayDomain>,
+) -> bool {
+    if known_secret.is_empty() {
+        return false;
+    }
+    let event_type = streaming
+        .then(|| {
+            value
+                .get("type")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .flatten();
+    let walk = SecretWalk {
+        secret: known_secret,
+        streaming,
+        stream_event_type: event_type.as_deref(),
+        bound_domain,
+    };
+    walk.apply(value, None, None, None, true, true)
+}
+
+impl SecretWalk<'_> {
+    fn apply(
+        &self,
+        value: &mut Value,
+        key_hint: Option<&str>,
+        parent_key: Option<&str>,
+        parent_type: Option<&str>,
+        preserve_protocol_controls: bool,
+        allow_native_scaffold: bool,
+    ) -> bool {
+        match value {
+            Value::String(text)
+                if !(preserve_protocol_controls
+                    && key_hint.is_some_and(|key| is_protocol_control_string_value(key, text))) =>
             {
-                text.clear();
-                return;
+                if self.streaming
+                    && stream_fragment_is_semantically_owned(
+                        key_hint,
+                        parent_key,
+                        self.stream_event_type,
+                    )
+                {
+                    return false;
+                }
+                let native_role =
+                    allow_native_scaffold && native_opaque_field(key_hint, parent_type);
+                if native_role && let Some(domain) = self.bound_domain {
+                    match bound_carrier(text, self.secret, domain) {
+                        BoundCarrier::Keep => return false,
+                        BoundCarrier::Conflict => return true,
+                        BoundCarrier::Redact => {}
+                    }
+                }
+                // Domain None still clears a decoded opaque replay. A known
+                // domain only does that for a real reasoning field; tool data
+                // is ordinary redaction.
+                if key_hint == Some("encrypted_content")
+                    && opaque_replay_contains_secret(text, self.secret)
+                    && (self.bound_domain.is_none() || native_role)
+                {
+                    text.clear();
+                    return false;
+                }
+                if key_hint == Some("arguments")
+                    && let Ok(mut arguments) = serde_json::from_str::<Value>(text)
+                {
+                    let nested = SecretWalk {
+                        secret: self.secret,
+                        streaming: false,
+                        stream_event_type: None,
+                        bound_domain: self.bound_domain,
+                    };
+                    if nested.apply(&mut arguments, None, None, None, false, false) {
+                        return true;
+                    }
+                    if let Ok(encoded) = serde_json::to_string(&arguments) {
+                        *text = encoded;
+                        return false;
+                    }
+                }
+                *text = redact_exact_occurrences(text, self.secret);
+                false
             }
-            if streaming
-                && stream_fragment_is_semantically_owned(key_hint, parent_key, stream_event_type)
-            {
-                return;
+            Value::Array(values) => {
+                for value in values {
+                    if self.apply(
+                        value,
+                        key_hint,
+                        parent_key,
+                        parent_type,
+                        preserve_protocol_controls,
+                        allow_native_scaffold,
+                    ) {
+                        return true;
+                    }
+                }
+                false
             }
-            if key_hint == Some("arguments")
-                && let Ok(mut arguments) = serde_json::from_str::<Value>(text)
-            {
-                redact_known_secret_values_at(
-                    &mut arguments,
-                    known_secret,
-                    None,
-                    None,
-                    false,
-                    None,
-                    false,
-                );
-                if let Ok(encoded) = serde_json::to_string(&arguments) {
-                    *text = encoded;
-                    return;
+            Value::Object(values) => {
+                let this_type = values
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned);
+                for (key, value) in values {
+                    let child_preserves_protocol_controls = preserve_protocol_controls
+                        && !matches!(key.as_str(), "input" | "args" | "metadata");
+                    let child_scaffold = allow_native_scaffold
+                        && !matches!(
+                            key.as_str(),
+                            "arguments" | "args" | "input" | "metadata" | "parameters"
+                        );
+                    if self.apply(
+                        value,
+                        Some(key.as_str()),
+                        key_hint,
+                        this_type.as_deref(),
+                        child_preserves_protocol_controls,
+                        child_scaffold,
+                    ) {
+                        return true;
+                    }
+                }
+                false
+            }
+            _ => false,
+        }
+    }
+}
+
+/// Native history fields only. A same-named key inside tool arguments or
+/// parameters is not a native field, even when its value is a valid marker.
+fn native_opaque_field(key: Option<&str>, parent_type: Option<&str>) -> bool {
+    matches!(
+        (parent_type, key),
+        (Some("thinking" | "signature_delta"), Some("signature"))
+            | (Some("redacted_thinking"), Some("data"))
+            | (Some("reasoning"), Some("encrypted_content"))
+    )
+}
+
+enum BoundCarrier {
+    Keep,
+    Conflict,
+    Redact,
+}
+
+enum OpaqueText {
+    Semantic(String),
+    Untrusted,
+}
+
+/// Whole-string carriers only. A validated marker for `domain`, or a codec
+/// whose inner opaque restores for `domain`, is scaffold. A failed marker, a
+/// foreign domain, or any longer string is ordinary text.
+fn bound_carrier(text: &str, secret: &str, domain: ReplayDomain) -> BoundCarrier {
+    if let Ok(RestoredReplay::Bound(raw)) = restore_replay_opaque(domain, text) {
+        return if raw.contains(secret) {
+            BoundCarrier::Conflict
+        } else {
+            BoundCarrier::Keep
+        };
+    }
+    if let Some(block) = decode_anthropic_thinking_block(text) {
+        return anthropic_bound_carrier(&block, secret, domain);
+    }
+    if let Some(reasoning) = decode_chat_reasoning(text) {
+        return if reasoning.contains(secret) {
+            BoundCarrier::Conflict
+        } else {
+            BoundCarrier::Keep
+        };
+    }
+    BoundCarrier::Redact
+}
+
+fn anthropic_bound_carrier(block: &Value, secret: &str, domain: ReplayDomain) -> BoundCarrier {
+    let conflict = match block.get("type").and_then(Value::as_str) {
+        Some("thinking") => {
+            let signature = block.get("signature").and_then(Value::as_str).unwrap_or("");
+            let thinking = block.get("thinking").and_then(Value::as_str).unwrap_or("");
+            match semantic_opaque(signature, domain) {
+                OpaqueText::Untrusted => return BoundCarrier::Redact,
+                OpaqueText::Semantic(raw) => {
+                    raw.contains(secret) || (!signature.is_empty() && thinking.contains(secret))
                 }
             }
-            *text = redact_exact_occurrences(text, known_secret);
         }
-        Value::Array(values) => {
-            for value in values {
-                redact_known_secret_values_at(
-                    value,
-                    known_secret,
-                    key_hint,
-                    parent_key,
-                    streaming,
-                    stream_event_type,
-                    preserve_protocol_controls,
-                );
+        Some("redacted_thinking") => {
+            let data = block.get("data").and_then(Value::as_str).unwrap_or("");
+            match semantic_opaque(data, domain) {
+                OpaqueText::Untrusted => return BoundCarrier::Redact,
+                OpaqueText::Semantic(raw) => raw.contains(secret),
             }
         }
-        Value::Object(values) => {
-            for (key, value) in values {
-                let child_preserves_protocol_controls = preserve_protocol_controls
-                    && !matches!(key.as_str(), "input" | "args" | "metadata");
-                redact_known_secret_values_at(
-                    value,
-                    known_secret,
-                    Some(key),
-                    key_hint,
-                    streaming,
-                    stream_event_type,
-                    child_preserves_protocol_controls,
-                );
-            }
-        }
-        _ => {}
+        _ => return BoundCarrier::Redact,
+    };
+    if conflict {
+        BoundCarrier::Conflict
+    } else {
+        BoundCarrier::Keep
+    }
+}
+
+fn semantic_opaque(value: &str, domain: ReplayDomain) -> OpaqueText {
+    if value.is_empty() {
+        return OpaqueText::Semantic(String::new());
+    }
+    match restore_replay_opaque(domain, value) {
+        Ok(RestoredReplay::Bound(raw)) => OpaqueText::Semantic(raw),
+        Ok(RestoredReplay::Absent) => OpaqueText::Semantic(String::new()),
+        // `ocg-replay-` that does not restore for this domain is not scaffold.
+        Err(_) if value.starts_with("ocg-replay-") => OpaqueText::Untrusted,
+        Err(_) => OpaqueText::Semantic(value.to_string()),
     }
 }
 
@@ -595,6 +854,84 @@ fn opaque_replay_contains_secret(encrypted_content: &str, known_secret: &str) ->
         .is_some_and(|block| json_values_contain_secret(&block, known_secret))
         || decode_chat_reasoning(encrypted_content)
             .is_some_and(|reasoning| reasoning.contains(known_secret))
+}
+
+/// Stable client error when redaction would change signed native history.
+/// The phrase must not contain the credential.
+pub(crate) const SIGNED_HISTORY_REDACTION_CONFLICT: &str =
+    "signed native history cannot be preserved by secret redaction";
+
+/// True when exact secret redaction would change a signature, redacted
+/// thinking payload, Responses encrypted field, or the text of a signed
+/// thinking block. Unsigned text, an empty signature, and non-string fields
+/// are not conflicts: non-strings are type errors, and unsigned text may still
+/// be redacted.
+pub(crate) fn signed_native_history_redaction_conflict(value: &Value, secret: &str) -> bool {
+    if secret.is_empty() {
+        return false;
+    }
+    signed_history_conflict_at(value, secret)
+}
+
+fn signed_history_conflict_at(value: &Value, secret: &str) -> bool {
+    signed_history_conflict_in(value, secret, true)
+}
+
+/// `native_scope` is false under tool `input`, `arguments`, `args`,
+/// `parameters`, and `metadata`. Those subtrees are ordinary data: nested
+/// objects and JSON strings that only look like signed history are not
+/// conflicts. Root message content, response output, and native SSE blocks
+/// stay in scope.
+fn signed_history_conflict_in(value: &Value, secret: &str, native_scope: bool) -> bool {
+    if !native_scope {
+        return false;
+    }
+    match value {
+        Value::Array(items) => items
+            .iter()
+            .any(|item| signed_history_conflict_in(item, secret, true)),
+        Value::Object(map) => {
+            signed_object_conflicts(map, secret)
+                || map.iter().any(|(key, child)| {
+                    signed_history_conflict_in(child, secret, !ordinary_data_key(key))
+                })
+        }
+        _ => false,
+    }
+}
+
+/// Same ordinary-data keys the post-bind walk drops from native scaffold.
+/// Native type checks use this gate so tool `input` is not a signature carrier.
+pub(super) fn ordinary_data_key(key: &str) -> bool {
+    matches!(
+        key,
+        "arguments" | "args" | "input" | "metadata" | "parameters"
+    )
+}
+
+fn signed_object_conflicts(map: &Map<String, Value>, secret: &str) -> bool {
+    match map.get("type").and_then(Value::as_str) {
+        Some("thinking") => {
+            let signature = map.get("signature").and_then(Value::as_str).unwrap_or("");
+            let thinking = map.get("thinking").and_then(Value::as_str).unwrap_or("");
+            signature.contains(secret) || (!signature.is_empty() && thinking.contains(secret))
+        }
+        Some("redacted_thinking") => map
+            .get("data")
+            .and_then(Value::as_str)
+            .is_some_and(|data| data.contains(secret)),
+        Some("reasoning") => map
+            .get("encrypted_content")
+            .and_then(Value::as_str)
+            .is_some_and(|encrypted| {
+                encrypted.contains(secret) || opaque_replay_contains_secret(encrypted, secret)
+            }),
+        Some("signature_delta") => map
+            .get("signature")
+            .and_then(Value::as_str)
+            .is_some_and(|signature| signature.contains(secret)),
+        _ => false,
+    }
 }
 
 fn json_values_contain_secret(value: &Value, known_secret: &str) -> bool {
@@ -776,185 +1113,4 @@ fn is_protocol_control_string_value(key: &str, value: &str) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn request_summary_never_keeps_content_or_tool_arguments() {
-        let secret = "private prompt sk-super-secret";
-        let body = serde_json::to_vec(&json!({
-            "model": "kimi-k2.7-code",
-            "stream": true,
-            "messages": [{"role": "user", "content": secret}],
-            "tools": [{"type": "function", "function": {"name": "private_tool", "arguments": {"password": "hunter2"}}}],
-            "image_url": "https://secret.example/token"
-        }))
-        .unwrap();
-        let (summary, fingerprint) = summarize_request(&body);
-        let encoded = summary.to_string();
-        assert!(!encoded.contains(secret));
-        assert!(!encoded.contains("private_tool"));
-        assert!(!encoded.contains("hunter2"));
-        assert!(!encoded.contains("secret.example"));
-        assert_eq!(fingerprint.len(), 64);
-        assert!(encoded.len() <= MAX_REQUEST_SUMMARY_BYTES);
-        let (again, again_fingerprint) = summarize_request(&body);
-        assert_eq!(summary, again);
-        assert_eq!(fingerprint, again_fingerprint);
-    }
-
-    #[test]
-    fn diagnostic_facade_reexports_pure_sanitizers() {
-        let encoded =
-            sanitize_upstream_error_value_with_known_secret("secret=abc", "abc").to_string();
-        assert!(!encoded.contains("abc"));
-        assert_eq!(redact_known_secret("token abc", "abc"), "token <redacted>");
-    }
-
-    #[test]
-    fn success_value_redaction_never_changes_json_keys() {
-        let mut value = json!({
-            "data": "data",
-            "metadata": {
-                "database": "safe data value",
-                "nested": ["data", 42]
-            }
-        });
-        redact_known_secret_values(&mut value, "data");
-
-        assert!(value.get("data").is_some());
-        assert!(value["metadata"].get("database").is_some());
-        assert_eq!(value["data"], "<redacted>");
-        assert_eq!(value["metadata"]["database"], "safe <redacted> value");
-        assert_eq!(value["metadata"]["nested"][0], "<redacted>");
-    }
-
-    #[test]
-    fn success_value_redaction_preserves_protocol_control_values() {
-        let mut value = json!({
-            "type": "text",
-            "object": "chat.completion",
-            "status": "completed",
-            "id": "text",
-            "model": "text",
-            "name": "text",
-            "text": "before text after",
-            "detail": "text"
-        });
-        redact_known_secret_values(&mut value, "text");
-
-        assert_eq!(value["type"], "text");
-        assert_eq!(value["object"], "chat.completion");
-        assert_eq!(value["status"], "completed");
-        for key in ["id", "model", "name"] {
-            assert_eq!(value[key], "<redacted>", "free-form field {key} leaked");
-        }
-        assert_eq!(value["text"], "before <redacted> after");
-        assert_eq!(value["detail"], "<redacted>");
-
-        for event_type in [
-            "response.reasoning_summary_part.added",
-            "response.output_text.done",
-            "response.reasoning_summary_text.done",
-        ] {
-            let mut event = json!({"type":event_type});
-            redact_known_secret_values(&mut event, event_type);
-            assert_eq!(event["type"], event_type);
-        }
-    }
-
-    #[test]
-    fn success_value_redaction_does_not_trust_arbitrary_control_field_text() {
-        let secret = "opaque/account+key=42";
-        let mut value = json!({
-            "type": format!("echo {secret}"),
-            "status": format!("failed: {secret}"),
-            "stop_sequence": secret,
-            "nested": {"reason": format!("provider said {secret}")}
-        });
-        redact_known_secret_values(&mut value, secret);
-
-        assert!(!value.to_string().contains(secret), "{value}");
-        assert_eq!(value["type"], "echo <redacted>");
-        assert_eq!(value["stop_sequence"], "<redacted>");
-    }
-
-    #[test]
-    fn success_value_redaction_removes_known_opaque_replays_with_the_secret() {
-        let secret = "opaque/account+key=42";
-        let anthropic = super::super::protocol::encode_anthropic_thinking_block(&json!({
-            "type":"thinking",
-            "thinking":format!("before {secret} after"),
-            "signature":"sig_123"
-        }))
-        .unwrap();
-        let chat = super::super::protocol::encode_chat_reasoning(&format!("before {secret} after"))
-            .unwrap();
-        let mut value = json!({
-            "output":[
-                {"type":"reasoning","encrypted_content":anthropic},
-                {"type":"reasoning","encrypted_content":chat}
-            ]
-        });
-        redact_known_secret_values(&mut value, secret);
-
-        assert_eq!(value["output"][0]["encrypted_content"], "");
-        assert_eq!(value["output"][1]["encrypted_content"], "");
-
-        let safe = super::super::protocol::encode_anthropic_thinking_block(&json!({
-            "type":"redacted_thinking",
-            "data":"safe"
-        }))
-        .unwrap();
-        let mut safe_value = json!({"encrypted_content":safe});
-        redact_known_secret_values(&mut safe_value, "data");
-        assert_eq!(safe_value["encrypted_content"], safe);
-    }
-
-    #[test]
-    fn success_value_redaction_parses_nested_tool_arguments() {
-        for secret in ["data", "a\"b", "a\\b"] {
-            let mut value = json!({
-                "arguments": json!({"data":"safe","type":secret,"token":secret}).to_string()
-            });
-            redact_known_secret_values(&mut value, secret);
-            let arguments: Value =
-                serde_json::from_str(value["arguments"].as_str().unwrap()).unwrap();
-            assert_eq!(
-                arguments,
-                json!({"data":"safe","type":"<redacted>","token":"<redacted>"}),
-                "nested arguments leaked or corrupted {secret:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn serialized_diagnostic_is_valid_json_and_bounded() {
-        let trace = RequestTrace::new();
-        let mut diagnostic =
-            ErrorDiagnostic::new(&trace, 1, "upstream", "upstream_http", ApiFormat::Responses);
-        diagnostic.request_summary = Some(json!({"padding": "x".repeat(10_000)}));
-        diagnostic.upstream_error = Some(json!({"padding": "y".repeat(10_000)}));
-        let encoded = serialize_diagnostic(diagnostic);
-        assert!(encoded.len() <= MAX_DIAGNOSTIC_BYTES);
-        let parsed: Value = serde_json::from_str(&encoded).unwrap();
-        assert_eq!(parsed["truncated"], true);
-    }
-
-    #[test]
-    fn upstream_header_capture_uses_an_explicit_allowlist() {
-        let mut headers = HeaderMap::new();
-        headers.insert("x-request-id", "provider-123".parse().unwrap());
-        headers.insert("cf-ray", "ray-456".parse().unwrap());
-        headers.insert("authorization", "Bearer secret".parse().unwrap());
-        headers.insert("set-cookie", "session=secret".parse().unwrap());
-        let safe = safe_upstream_headers(&headers, None);
-        assert_eq!(
-            safe.get("x-request-id").map(String::as_str),
-            Some("provider-123")
-        );
-        assert_eq!(safe.get("cf-ray").map(String::as_str), Some("ray-456"));
-        assert!(!safe.contains_key("authorization"));
-        assert!(!safe.contains_key("set-cookie"));
-    }
-}
+mod tests;

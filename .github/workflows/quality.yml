@@ -2,6 +2,12 @@ name: Quality
 
 on:
   workflow_call:
+    inputs:
+      checkout_ref:
+        description: Exact candidate commit to validate; defaults to the triggering commit
+        required: false
+        type: string
+        default: ""
   pull_request:
   push:
     branches:
@@ -29,6 +35,7 @@ jobs:
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
+          ref: ${{ inputs.checkout_ref || github.sha }}
           persist-credentials: false
 
       - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
@@ -42,8 +49,10 @@ jobs:
 
       - run: pnpm install --frozen-lockfile
       - run: pnpm run contract:v3:check
+      - run: pnpm run contract:v4:check
       - run: pnpm run typecheck
       - run: pnpm run test:web
+      - run: pnpm run test:tooling
       - run: pnpm exec vite build
       - run: pnpm run design:lint
       - run: docker compose -f compose.example.yaml config --quiet
@@ -56,6 +65,7 @@ jobs:
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
+          ref: ${{ inputs.checkout_ref || github.sha }}
           persist-credentials: false
 
       - run: cargo fmt --all -- --check
@@ -72,8 +82,8 @@ jobs:
           cache-on-failure: true
           save-if: ${{ github.event_name != 'pull_request' }}
 
-      - run: cargo test --workspace --exclude ocg-manager --locked
-      - run: cargo clippy --workspace --exclude ocg-manager --all-targets --locked -- -D warnings
+      - run: cargo test --workspace --exclude ocg-manager --locked --no-fail-fast --features ocg-core/ollama-cloud-loopback-test
+      - run: cargo clippy --workspace --exclude ocg-manager --all-targets --locked --features ocg-core/ollama-cloud-loopback-test -- -D warnings
 
   windows-tauri:
     name: Windows Tauri tests
@@ -83,6 +93,7 @@ jobs:
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
+          ref: ${{ inputs.checkout_ref || github.sha }}
           persist-credentials: false
 
       - name: Restore Rust build cache
@@ -101,6 +112,9 @@ jobs:
 
       - name: Compile and test Windows-only desktop behavior
         run: cargo test -p ocg-manager --lib --locked
+
+      - name: Test Windows CPA file-sharing failure receipts
+        run: cargo test -p ocg-core --lib --locked --features dsh-local-host removal_
 
       - name: Lint Windows desktop crate
         run: cargo clippy -p ocg-manager --all-targets --locked -- -D warnings

@@ -1,0 +1,485 @@
+import {
+  parseModelCatalog,
+  describeOcgModel,
+  refuseCrossProtocolReplay,
+  refuseDegradingReplay,
+  refuseUndeclaredMessagesReasoning,
+} from "./model-catalog.js";
+import { randomBytes } from "node:crypto";
+import { constants as fsConstants } from "node:fs";
+import { chmod, copyFile, readFile, readdir, rename, unlink } from "node:fs/promises";
+import { findPackageJSON } from "node:module";
+import { basename, dirname, join } from "node:path";
+import { pathToFileURL } from "node:url";
+
+if (process.argv[1] === undefined) {
+  throw new Error("Open Console Gateway could not identify the active DSH runtime.");
+}
+
+const runtimeBase = pathToFileURL(process.argv[1]).href;
+
+async function importFromDsh(packageName, entry) {
+  const manifest = findPackageJSON(packageName, runtimeBase);
+  if (manifest === undefined) {
+    throw new Error(`Open Console Gateway requires ${packageName} from the active DSH runtime.`);
+  }
+  return import(pathToFileURL(join(dirname(manifest), entry)).href);
+}
+
+const [piAi, completionsApi, responsesApi, messagesApi, dshLlm, dshPiAi] = await Promise.all([
+  importFromDsh("@earendil-works/pi-ai", "dist/index.js"),
+  importFromDsh("@earendil-works/pi-ai", "dist/api/openai-completions.lazy.js"),
+  importFromDsh("@earendil-works/pi-ai", "dist/api/openai-responses.lazy.js"),
+  importFromDsh("@earendil-works/pi-ai", "dist/api/anthropic-messages.lazy.js"),
+  importFromDsh("@deepseek-ai/dsh-llm", "lib/index.js"),
+  importFromDsh("@deepseek-ai/dsh-llm-pi-ai", "lib/index.js"),
+]);
+
+const { InMemoryCredentialStore, createProvider } = piAi;
+const { openAICompletionsApi } = completionsApi;
+const { openAIResponsesApi } = responsesApi;
+const { anthropicMessagesApi } = messagesApi;
+const { LlmError, assertUsableApiKey, resolveRetryPolicy } = dshLlm;
+const { PiAiAdapter } = dshPiAi;
+
+function wrapApi(base, prepare) {
+  const invoke = (method, model, context, options) => {
+    refuseCrossProtocolReplay(model, context);
+    return base[method](model, context, prepare ? prepare(model, context, options) : options);
+  };
+  return {
+    stream: (model, context, options) => invoke("stream", model, context, options),
+    streamSimple: (model, context, options) => invoke("streamSimple", model, context, options),
+  };
+}
+
+// The Messages SDK already sends the ordinary Gateway Key as x-api-key, plus
+// anthropic-version. Leave those headers alone.
+function messagesStreamOptions(model, _context, options) {
+  refuseUndeclaredMessagesReasoning(model, options);
+  return options;
+}
+
+const providerApis = {
+  "openai-completions": wrapApi(openAICompletionsApi()),
+  "openai-responses": wrapApi(openAIResponsesApi()),
+  "anthropic-messages": wrapApi(anthropicMessagesApi(), messagesStreamOptions),
+};
+
+export const name = "open-console-gateway-dsh";
+export const inject = ["llm", "credentials"];
+
+const providerIds = ["ocg"];
+const displayName = "Open Console Gateway";
+const baseUrl = "__OCG_GATEWAY_V1_URL__";
+const credentialRef = "OCG_GATEWAY_KEY";
+const credentialBootstrapPath = __OCG_CREDENTIAL_BOOTSTRAP_PATH_JSON__;
+const catalogTimeoutMs = 10_000;
+
+const HANDOFF_CLAIM_MARKER = ".claimed-";
+
+// Handoff state machine (one DSH runtime apply() at a time; the Host may
+// replace the live path while credentials.set is in flight):
+//   live `credential-handoff`     — durable pending Key from the Host
+//   `credential-handoff.claimed-*` — ephemeral ownership of a previously live
+//                                    Key, owned only by the current apply()
+// Live always wins over leftovers. If live is missing, the newest leftover
+// claim is the pending Key (crash remnant). After consume succeeds, or after
+// a failed set is reconciled with live, no claim files remain. Claim names
+// never include the secret.
+
+function handoffClaimPrefix(livePath) {
+  return `${basename(livePath)}${HANDOFF_CLAIM_MARKER}`;
+}
+
+function claimToken() {
+  return `${String(Date.now()).padStart(16, "0")}-${randomBytes(8).toString("hex")}`;
+}
+
+async function unlinkIfPresent(path) {
+  try {
+    await unlink(path);
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
+  }
+}
+
+async function listClaimedHandoffs(livePath) {
+  const directory = dirname(livePath);
+  const prefix = handoffClaimPrefix(livePath);
+  let entries;
+  try {
+    entries = await readdir(directory, { withFileTypes: true });
+  } catch (error) {
+    if (error?.code === "ENOENT") return [];
+    throw error;
+  }
+  return entries
+    .filter((entry) => entry.isFile() && entry.name.startsWith(prefix))
+    .map((entry) => join(directory, entry.name));
+}
+
+function newestClaim(paths) {
+  if (paths.length === 0) return undefined;
+  return paths.reduce((latest, path) => (
+    basename(path).localeCompare(basename(latest)) > 0 ? path : latest
+  ));
+}
+
+async function sweepClaimedHandoffs(livePath) {
+  const claims = await listClaimedHandoffs(livePath);
+  claims.sort((left, right) => basename(left).localeCompare(basename(right)));
+  for (const path of claims) {
+    await unlinkIfPresent(path);
+  }
+}
+
+async function claimCredentialHandoff(livePath) {
+  const claimPath = `${livePath}${HANDOFF_CLAIM_MARKER}${claimToken()}`;
+  try {
+    await rename(livePath, claimPath);
+    return claimPath;
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
+  }
+  return newestClaim(await listClaimedHandoffs(livePath));
+}
+
+async function restoreClaimedHandoff(claimPath, livePath) {
+  try {
+    await copyFile(claimPath, livePath, fsConstants.COPYFILE_EXCL);
+  } catch (error) {
+    if (error?.code === "EEXIST") {
+      await unlinkIfPresent(claimPath);
+      return;
+    }
+    throw error;
+  }
+  try {
+    await chmod(livePath, 0o600);
+  } catch {
+    // Best-effort; Windows may ignore POSIX modes. The live file remains for retry.
+  }
+  await unlinkIfPresent(claimPath);
+}
+
+async function consumeCredentialHandoff(credentials) {
+  const livePath = credentialBootstrapPath;
+  const claimPath = await claimCredentialHandoff(livePath);
+  if (claimPath === undefined) return;
+  let bootstrap;
+  try {
+    bootstrap = await readFile(claimPath, "utf8");
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      await sweepClaimedHandoffs(livePath);
+      return;
+    }
+    throw error;
+  }
+  if (bootstrap.length === 0) {
+    await restoreClaimedHandoff(claimPath, livePath);
+    await sweepClaimedHandoffs(livePath);
+    throw new Error("Open Console Gateway credential handoff is empty.");
+  }
+  try {
+    await credentials.set(credentialRef, bootstrap);
+  } catch (error) {
+    try {
+      await restoreClaimedHandoff(claimPath, livePath);
+      await sweepClaimedHandoffs(livePath);
+    } catch {
+      // Keep the claim for retry when live could not be restored.
+    }
+    throw error;
+  }
+  await sweepClaimedHandoffs(livePath);
+}
+
+export async function apply(ctx) {
+  try {
+    await consumeCredentialHandoff(ctx.get("credentials"));
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
+  }
+
+  let profiles = new Map();
+  let refreshPromise;
+
+  const resolveApiKey = async () => {
+    const stored = await ctx.get("credentials")?.resolve(credentialRef);
+    const value = stored?.value ?? process.env[credentialRef];
+    if (value !== undefined && value.length > 0) {
+      return assertUsableApiKey(value, name, credentialRef);
+    }
+    throw new LlmError(
+      `${name}: no credential stored for ${credentialRef}`,
+      "MISSING_CREDENTIAL",
+    );
+  };
+
+  const abortedError = (signal) => {
+    if (signal?.reason instanceof Error) return signal.reason;
+    const error = new Error("This operation was aborted");
+    error.name = "AbortError";
+    return error;
+  };
+
+  const throwIfAborted = (signal) => {
+    if (signal?.aborted) throw abortedError(signal);
+  };
+
+  const waitIsolated = (flight, signal) => {
+    if (signal === undefined) return flight;
+    if (signal.aborted) return Promise.reject(abortedError(signal));
+    return new Promise((resolve, reject) => {
+      const onAbort = () => {
+        signal.removeEventListener("abort", onAbort);
+        reject(abortedError(signal));
+      };
+      signal.addEventListener("abort", onAbort, { once: true });
+      flight.then(
+        (value) => {
+          signal.removeEventListener("abort", onAbort);
+          resolve(value);
+        },
+        (error) => {
+          signal.removeEventListener("abort", onAbort);
+          reject(error);
+        },
+      );
+    });
+  };
+
+  const isTimeoutError = (error) => error != null && (error.name === "TimeoutError" || error.code === 23);
+
+  const catalogDiscoveryError = (error, signal) => {
+    if (error instanceof LlmError) return error;
+    if (error instanceof SyntaxError) {
+      return new LlmError("Open Console Gateway returned an invalid /v1/models payload", "INVALID_CONFIG", {
+        cause: error,
+      });
+    }
+    if (isTimeoutError(error) || isTimeoutError(signal?.reason)) {
+      return new LlmError("Open Console Gateway model discovery timed out", "TIMEOUT", { cause: error });
+    }
+    return new LlmError("Open Console Gateway model discovery failed", "TRANSPORT", { cause: error });
+  };
+
+  const applyCatalog = (payload) => {
+    profiles = new Map(providerIds.map((providerId) => {
+      let catalog;
+      try {
+        catalog = parseModelCatalog(payload, { providerId, baseUrl });
+      } catch {
+        throw new LlmError("Open Console Gateway returned an invalid /v1/models payload", "INVALID_CONFIG");
+      }
+      const { models, modelErrors, metadata } = catalog;
+      const piProvider = createProvider({
+        id: providerId,
+        name: displayName,
+        baseUrl,
+        auth: {
+          apiKey: {
+            name: `${displayName} Key`,
+            async resolve({ credential }) {
+              return {
+                auth: credential?.key ? { apiKey: credential.key } : {},
+                source: displayName,
+              };
+            },
+          },
+        },
+        models,
+        api: providerApis,
+      });
+      return [providerId, {
+        provider: providerId,
+        displayName,
+        apiKeyEnv: credentialRef,
+        baseURL: baseUrl,
+        streamIdleTimeoutMs: 300_000,
+        maxRequestImageBytes: 20 * 1024 * 1024,
+        requestImagePixelBudget: 2048 * 2048,
+        requestImageMaxBytes: 1024 * 1024,
+        retryPolicy: resolveRetryPolicy(undefined, name),
+        configuredMaxTokens: new Map(),
+        modelErrors,
+        ocgMetadata: metadata,
+        piProvider,
+      }];
+    }));
+  };
+
+  const invalidateCatalog = () => {
+    profiles = new Map();
+  };
+
+  const catalogLoaded = () => profiles.size > 0;
+
+  const modelIsKnown = (provider, model) => {
+    const profile = profiles.get(provider);
+    return profile !== undefined
+      && (profile.ocgMetadata.has(model) || profile.modelErrors.has(model));
+  };
+
+  const requireKnownModel = (provider, model) => {
+    const profile = profiles.get(provider);
+    if (profile?.ocgMetadata.has(model) || profile?.modelErrors.has(model)) {
+      return profile;
+    }
+    throw new LlmError(
+      `${name}: model ${model} is not in the Open Console Gateway catalog`,
+      "INVALID_CONFIG",
+    );
+  };
+
+  const fetchCatalog = async () => {
+    const apiKey = await resolveApiKey();
+    const signal = AbortSignal.timeout(catalogTimeoutMs);
+    let response;
+    try {
+      response = await fetch(`${baseUrl}/models`, {
+        headers: { Authorization: `Bearer ${apiKey}` },
+        signal,
+      });
+    } catch (error) {
+      throw catalogDiscoveryError(error, signal);
+    }
+    if (response.status === 401 || response.status === 403) {
+      throw new LlmError(
+        `Open Console Gateway model discovery failed with HTTP ${response.status}`,
+        "AUTH",
+        { status: response.status },
+      );
+    }
+    if (response.status === 429) {
+      throw new LlmError(
+        `Open Console Gateway model discovery failed with HTTP ${response.status}`,
+        "RATE_LIMIT",
+        { status: response.status },
+      );
+    }
+    if (response.status >= 500) {
+      throw new LlmError(
+        `Open Console Gateway model discovery failed with HTTP ${response.status}`,
+        "SERVER",
+        { status: response.status },
+      );
+    }
+    if (!response.ok) {
+      throw new LlmError(
+        `Open Console Gateway model discovery failed with HTTP ${response.status}`,
+        "INVALID_CONFIG",
+        { status: response.status },
+      );
+    }
+    let payload;
+    try {
+      payload = await response.json();
+    } catch (error) {
+      throw catalogDiscoveryError(error, signal);
+    }
+    applyCatalog(payload);
+  };
+
+  const startRefresh = () => {
+    if (refreshPromise !== undefined) return refreshPromise;
+    refreshPromise = fetchCatalog().catch((error) => {
+      const mapped = error instanceof LlmError ? error : catalogDiscoveryError(error);
+      if (
+        mapped.code !== "TIMEOUT"
+        && mapped.code !== "TRANSPORT"
+        && mapped.code !== "SERVER"
+        && mapped.code !== "RATE_LIMIT"
+      ) {
+        invalidateCatalog();
+      }
+      throw mapped;
+    }).finally(() => {
+      refreshPromise = undefined;
+    });
+    return refreshPromise;
+  };
+
+  const awaitRefresh = async (signal) => {
+    throwIfAborted(signal);
+    await waitIsolated(startRefresh(), signal);
+    throwIfAborted(signal);
+  };
+
+  const ensureModelCatalog = async (provider, model, signal) => {
+    throwIfAborted(signal);
+    if (!catalogLoaded() || !modelIsKnown(provider, model)) {
+      await waitIsolated(startRefresh(), signal);
+    }
+    throwIfAborted(signal);
+  };
+
+  class OcgAdapter extends PiAiAdapter {
+    providerInfo(provider) {
+      return {
+        id: provider,
+        name: displayName,
+      };
+    }
+
+    async listModels(provider) {
+      await awaitRefresh();
+      const profile = profiles.get(provider);
+      const metadata = profile?.ocgMetadata;
+      const errors = profile?.modelErrors;
+      return (await super.listModels(provider))
+        .filter((info) => !errors?.has(info.id))
+        .map((info) => describeOcgModel(info, metadata?.get(info.id)));
+    }
+
+    async resolveModel(provider, model, signal) {
+      await ensureModelCatalog(provider, model, signal);
+      throwIfAborted(signal);
+      const profile = requireKnownModel(provider, model);
+      const metadata = profile.ocgMetadata.get(model);
+      const resolved = await super.resolveModel(provider, model, signal);
+      throwIfAborted(signal);
+      return describeOcgModel(resolved, metadata);
+    }
+
+    async prepareCall(provider, model, signal) {
+      await ensureModelCatalog(provider, model, signal);
+      throwIfAborted(signal);
+      const profile = requireKnownModel(provider, model);
+      // Capture metadata before the await, just like PiAiAdapter captures its provider.
+      const metadata = profile.ocgMetadata.get(model);
+      const prepared = await super.prepareCall(provider, model, signal);
+      throwIfAborted(signal);
+      return { ...prepared, model: describeOcgModel(prepared.model, metadata) };
+    }
+
+    // prepareCall's stream and Adapter.stream both enter here. Reject unusable
+    // native replay before the base adapter can turn it into unsigned text.
+    async *streamWithSnapshot(options, snapshot) {
+      const model = this.modelOf(snapshot, options.provider, options.model);
+      refuseDegradingReplay(model, options.messages);
+      yield* super.streamWithSnapshot(options, snapshot);
+    }
+  }
+
+  const adapter = new OcgAdapter({
+    profiles: () => profiles,
+    resolveApiKey,
+    auth: {
+      credentials: new InMemoryCredentialStore(),
+      authContext: {
+        async env(variable) {
+          return process.env[variable];
+        },
+        async fileExists() {
+          return false;
+        },
+      },
+    },
+    resolveAttachments: () => ctx.get("attachments"),
+  });
+
+  ctx.llm.registerAdapter(providerIds, adapter);
+}

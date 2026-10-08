@@ -1,5 +1,6 @@
 import { defineConfig } from "vite";
 import vue from "@vitejs/plugin-vue";
+import tailwindcss from "@tailwindcss/vite";
 import path from "path";
 
 const gatewayPort = (() => {
@@ -15,7 +16,7 @@ const gatewayPort = (() => {
 
 export default defineConfig({
   base: "/dashboard/",
-  plugins: [vue()],
+  plugins: [vue(), tailwindcss()],
   resolve: {
     alias: {
       "@": path.resolve(__dirname, "./src"),
@@ -23,7 +24,7 @@ export default defineConfig({
   },
   clearScreen: false,
   server: {
-    port: 30001,
+    port: Number(process.env.OCG_VITE_PORT) || 30001,
     strictPort: true,
     host: "127.0.0.1",
     proxy: {
@@ -33,7 +34,43 @@ export default defineConfig({
       },
     },
     watch: {
-      ignored: ["**/target/**", "**/src-tauri/target/**"],
+      // The watcher is async, but its initial scan still costs seconds and
+      // competes with startup: the repo root also holds ~18k non-app files
+      // (pnpm store, Rust workspace, agent scratch, test output). Ignoring them
+      // keeps HMR cheap without touching the module graph -- `src`, `assets`
+      // and `resources` stay watched because index.html and
+      // provider-presets.test.ts resolve into them.
+      ignored: [
+        "**/node_modules/**",
+        "**/target/**",
+        "**/target-agent/**",
+        "**/src-tauri/**",
+        "**/crates/**",
+        // pnpm store + npm cache: largest non-app tree in the repo root.
+        "**/.pnpm-store/**",
+        "**/.playwright-cli/**",
+        "**/.playwright-mcp/**",
+        "**/playwright-out/**",
+        "**/dist/**",
+        "**/release/**",
+        "**/tmp/**",
+        "**/tools/**",
+        "**/docs/**",
+        "**/skills/**",
+        "**/integrations/**",
+        "**/browser/**",
+        "**/schema/**",
+        // Local worktrees/artifacts live outside the app graph; never watch them.
+        "**/.worktrees/**",
+        "**/.artifacts/**",
+        "**/.acl-out/**",
+        "**/.agent/**",
+        "**/.codegraph/**",
+        "**/.githooks/**",
+        "**/.zcode/**",
+        // Stale bundles from interrupted `vite` config loads.
+        "**/*.timestamp-*.mjs",
+      ],
     },
   },
   envPrefix: ["VITE_", "TAURI_"],
@@ -59,6 +96,10 @@ export default defineConfig({
           // the dynamic imports in src/i18n; do not merge them back into one.
           if (id.includes("/node_modules/@vicons/")) return "icons";
           if (id.includes("/node_modules/vue/") || id.includes("/node_modules/@vue/")) return "vue";
+          // naive-ui is intentionally NOT grouped: the entry (App.vue) only
+          // uses the shell components, and a forced single chunk made every
+          // first screen preload the entire library (~1.7 MB). Letting Rollup
+          // follow the import graph splits it across the lazy view chunks.
         },
       },
     },

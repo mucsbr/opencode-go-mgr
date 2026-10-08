@@ -8,43 +8,47 @@ use ocg_domain::dynamic::{
     DynamicAuthKind, DynamicModelMapping, DynamicProviderDefinition, normalize_dynamic_mappings,
     normalize_dynamic_provider_name,
 };
-use ocg_domain::provider::{ProviderRegistry, builtin_provider};
+use ocg_domain::provider::{ProviderOrigin, ProviderRegistry, builtin_provider};
 
 use crate::custom;
 use crate::custom::validate_custom_endpoint_url;
 use crate::dynamic::{DynamicProviderRuntime, collides_with_known_id, validate_definition};
+use crate::log_types::OperationMetadata;
 use crate::models::{
     Account as ModelAccount, AccountCustomConfig, AccountCustomConfigInput, AccountModelCapability,
-    AccountType, normalize_account_notes,
+    AccountType, NEW_READY_KEY_ACCOUNT_ENABLED, normalize_account_notes,
 };
 use crate::redaction::redact_known_secret;
 use crate::state::CoreState;
 
+use super::accounts::{DashboardAttempt, RevisionAck};
 use super::types::{
-    ControlRevision, DynamicProvider, DynamicProviderCreate, DynamicProviderDiscoverRequest,
-    DynamicProviderDiscoverResponse, DynamicProviderModel, DynamicProviderMutation,
-    DynamicProviderTestRequest, DynamicProviderTestResponse, DynamicProviderUpdate, MutationAck,
-    MutationExpectation,
+    ControlRevision, MutationAck, MutationExpectation, ProviderDefinition,
+    ProviderDefinitionCreate, ProviderDefinitionDiscoverRequest,
+    ProviderDefinitionDiscoverResponse, ProviderDefinitionModel, ProviderDefinitionMutation,
+    ProviderDefinitionTestRequest, ProviderDefinitionTestResponse, ProviderDefinitionUpdate,
 };
 use super::{V3ApiError, check_expectation, parse_json, parse_mutation_json};
 
 pub(super) async fn create_provider(
     State(state): State<CoreState>,
     body: Bytes,
-) -> Result<Json<DynamicProviderMutation>, V3ApiError> {
-    let input = parse_mutation_json::<DynamicProviderCreate>(&body)?;
-    create_locked(&state, input).map(Json)
+) -> Result<Json<ProviderDefinitionMutation>, V3ApiError> {
+    let mut attempt = DashboardAttempt::open(&state, "provider.create", "provider", None);
+    let result = parse_mutation_json::<ProviderDefinitionCreate>(&body)
+        .and_then(|input| create_locked(&state, input, &mut attempt));
+    attempt.finish(result).map(Json)
 }
 
 pub(super) async fn get_provider(
     State(state): State<CoreState>,
     Path(provider_id): Path<String>,
-) -> Result<Json<DynamicProvider>, V3ApiError> {
+) -> Result<Json<ProviderDefinition>, V3ApiError> {
     let captured = ControlRevision::from_state(&state);
     let runtime = state
         .db
         .lock()
-        .get_dynamic_provider(&provider_id)
+        .get_provider_definition(&provider_id)
         .map_err(V3ApiError::internal)?
         .ok_or_else(|| V3ApiError::not_found_at(&state, "provider not found"))?;
     Ok(Json(to_wire(
@@ -58,9 +62,16 @@ pub(super) async fn update_provider(
     State(state): State<CoreState>,
     Path(provider_id): Path<String>,
     body: Bytes,
-) -> Result<Json<DynamicProviderMutation>, V3ApiError> {
-    let input = parse_mutation_json::<DynamicProviderUpdate>(&body)?;
-    update_locked(&state, &provider_id, input).map(Json)
+) -> Result<Json<ProviderDefinitionMutation>, V3ApiError> {
+    let mut attempt = DashboardAttempt::open(
+        &state,
+        "provider.update",
+        "provider",
+        Some(provider_id.clone()),
+    );
+    let result = parse_mutation_json::<ProviderDefinitionUpdate>(&body)
+        .and_then(|input| update_locked(&state, &provider_id, input, &mut attempt));
+    attempt.finish(result).map(Json)
 }
 
 pub(super) async fn delete_provider(
@@ -68,21 +79,37 @@ pub(super) async fn delete_provider(
     Path(provider_id): Path<String>,
     body: Bytes,
 ) -> Result<Json<MutationAck>, V3ApiError> {
-    let expectation = parse_mutation_json::<MutationExpectation>(&body)?;
-    delete_locked(&state, &provider_id, &expectation).map(Json)
+    let mut attempt = DashboardAttempt::open(
+        &state,
+        "provider.delete",
+        "provider",
+        Some(provider_id.clone()),
+    );
+    let result = parse_mutation_json::<MutationExpectation>(&body)
+        .and_then(|expectation| delete_locked(&state, &provider_id, &expectation, &mut attempt));
+    attempt.finish(result).map(Json)
 }
 
 pub(super) async fn discover_models(
     State(state): State<CoreState>,
     body: Bytes,
-) -> Result<Json<DynamicProviderDiscoverResponse>, V3ApiError> {
-    let input = parse_json::<DynamicProviderDiscoverRequest>(&body)?;
-    let captured = ControlRevision::from_state(&state);
+) -> Result<Json<ProviderDefinitionDiscoverResponse>, V3ApiError> {
+    let attempt = DashboardAttempt::open(&state, "provider.discover", "provider", None);
+    let result = discover_models_result(&state, body).await;
+    attempt.finish(result).map(Json)
+}
+
+async fn discover_models_result(
+    state: &CoreState,
+    body: Bytes,
+) -> Result<ProviderDefinitionDiscoverResponse, V3ApiError> {
+    let input = parse_json::<ProviderDefinitionDiscoverRequest>(&body)?;
+    let captured = ControlRevision::from_state(state);
     let config = state.config();
     let endpoint = validate_custom_endpoint_url(&input.endpoint_url)
-        .map_err(|error| V3ApiError::invalid_request_at(&state, error.to_string()))?;
+        .map_err(|error| V3ApiError::invalid_request_at(state, error.to_string()))?;
     let auth_kind = DynamicAuthKind::from(input.auth_kind);
-    let key = required_probe_key(&state, auth_kind, input.key.as_deref())?;
+    let key = required_probe_key(state, auth_kind, input.key.as_deref())?;
     let custom_config = AccountCustomConfigInput {
         endpoint_url: endpoint,
         upstream_protocol: input.upstream_protocol.into(),
@@ -90,30 +117,39 @@ pub(super) async fn discover_models(
     let discovery =
         custom::discover_models_with_auth(&config, &custom_config, auth_kind.upstream_auth(), &key)
             .await
-            .map_err(|failure| map_probe_failure(&state, &key, failure.message))?;
-    Ok(Json(DynamicProviderDiscoverResponse {
+            .map_err(|failure| map_probe_failure(state, &key, failure.message))?;
+    Ok(ProviderDefinitionDiscoverResponse {
         models: models_without_key(discovery.models, &key),
         truncated: discovery.truncated,
         revision: captured.revision,
         process_generation: captured.process_generation,
-    }))
+    })
 }
 
 pub(super) async fn test_provider(
     State(state): State<CoreState>,
     body: Bytes,
-) -> Result<Json<DynamicProviderTestResponse>, V3ApiError> {
-    let input = parse_json::<DynamicProviderTestRequest>(&body)?;
-    let captured = ControlRevision::from_state(&state);
+) -> Result<Json<ProviderDefinitionTestResponse>, V3ApiError> {
+    let attempt = DashboardAttempt::open(&state, "provider.test", "provider", None);
+    let result = provider_test_result(&state, body).await;
+    finish_provider_test(attempt, result).map(Json)
+}
+
+async fn provider_test_result(
+    state: &CoreState,
+    body: Bytes,
+) -> Result<ProviderDefinitionTestResponse, V3ApiError> {
+    let input = parse_json::<ProviderDefinitionTestRequest>(&body)?;
+    let captured = ControlRevision::from_state(state);
     let config = state.config();
     let endpoint = validate_custom_endpoint_url(&input.endpoint_url)
-        .map_err(|error| V3ApiError::invalid_request_at(&state, error.to_string()))?;
+        .map_err(|error| V3ApiError::invalid_request_at(state, error.to_string()))?;
     let auth_kind = DynamicAuthKind::from(input.auth_kind);
-    let key = required_probe_key(&state, auth_kind, input.key.as_deref())?;
+    let key = required_probe_key(state, auth_kind, input.key.as_deref())?;
     let public_model = ocg_domain::provider::validate_custom_model_id(&input.public_model)
-        .map_err(|error| V3ApiError::invalid_request_at(&state, error.to_string()))?;
+        .map_err(|error| V3ApiError::invalid_request_at(state, error.to_string()))?;
     let upstream_model = ocg_domain::provider::validate_custom_model_id(&input.upstream_model)
-        .map_err(|error| V3ApiError::invalid_request_at(&state, error.to_string()))?;
+        .map_err(|error| V3ApiError::invalid_request_at(state, error.to_string()))?;
     let custom_config = AccountCustomConfig {
         account_id: String::new(),
         endpoint_url: endpoint,
@@ -141,23 +177,52 @@ pub(super) async fn test_provider(
         Ok(()) => (true, None),
         Err(failure) => (false, Some(redact_known_secret(&failure.message, &key))),
     };
-    Ok(Json(DynamicProviderTestResponse {
+    Ok(ProviderDefinitionTestResponse {
         ok,
         error,
         revision: captured.revision,
         process_generation: captured.process_generation,
-    }))
+    })
+}
+
+fn finish_provider_test(
+    mut attempt: DashboardAttempt,
+    result: Result<ProviderDefinitionTestResponse, V3ApiError>,
+) -> Result<ProviderDefinitionTestResponse, V3ApiError> {
+    match &result {
+        Ok(response) if response.ok => {
+            attempt.note_success(OperationMetadata {
+                revision: Some(response.revision),
+                ..OperationMetadata::default()
+            });
+            attempt.finish(result)
+        }
+        Ok(response) => {
+            let revision = response.revision;
+            attempt.complete_failed(
+                "outboundFailed",
+                OperationMetadata {
+                    revision: Some(revision),
+                    failed_count: Some(1),
+                    ..OperationMetadata::default()
+                },
+            );
+            result
+        }
+        Err(_) => attempt.finish(result),
+    }
 }
 
 fn create_locked(
     state: &CoreState,
-    input: DynamicProviderCreate,
-) -> Result<DynamicProviderMutation, V3ApiError> {
+    input: ProviderDefinitionCreate,
+    attempt: &mut DashboardAttempt,
+) -> Result<ProviderDefinitionMutation, V3ApiError> {
     let _settings_update = state.settings_update.lock();
     check_expectation(state, &input.expectation)?;
     let now = Utc::now();
     let auth_kind = DynamicAuthKind::from(input.auth_kind);
-    let definition = validate_wire_definition(
+    let mut definition = validate_wire_definition(
         uuid::Uuid::new_v4().to_string(),
         input.name,
         input.endpoint_url,
@@ -166,6 +231,8 @@ fn create_locked(
         input.models,
     )
     .map_err(|error| V3ApiError::invalid_request_at(state, error.to_string()))?;
+    definition.preset_id = crate::dynamic::normalize_preset_id(input.preset_id)
+        .map_err(|error| V3ApiError::invalid_request_at(state, error.to_string()))?;
     let existing = state.dynamic_providers();
     if collides_with_known_id(&definition.id, &existing) {
         return Err(V3ApiError::conflict_at(
@@ -173,61 +240,85 @@ fn create_locked(
             "generated provider id collided; retry",
         ));
     }
-    let key_cipher = first_account_key(state, auth_kind, input.key.as_deref())?;
-    let account_name = input
-        .account_name
+    let supplied_key = input
+        .key
         .as_deref()
         .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or(definition.name.as_str())
-        .to_string();
-    let notes = match input.notes.as_deref() {
-        Some(value) => normalize_account_notes(value)
-            .map_err(|error| V3ApiError::invalid_request_at(state, error.to_string()))?,
-        None => None,
-    };
-    let account = ModelAccount {
-        id: uuid::Uuid::new_v4().to_string(),
-        provider_id: definition.id.clone(),
-        credential_kind: auth_kind.credential_kind(),
-        quota_scope: auth_kind.quota_scope(),
-        name: account_name,
-        username: None,
-        password_cipher: None,
-        key_cipher,
-        enabled: true,
-        account_type: AccountType::Key,
-        setup_step: crate::models::AccountSetupStep::Ready,
-        referral_code: None,
-        purchase_date: String::new(),
-        expires_on: String::new(),
-        cooldown_until: None,
-        cooldown_generic_until: None,
-        cooldown_5h_until: None,
-        cooldown_week_until: None,
-        cooldown_month_until: None,
-        cooldown_free_until: None,
-        last_error: None,
-        auth_error: None,
-        notes,
-        created_at: now,
-        updated_at: now,
-    };
+        .filter(|value| !value.is_empty());
+    // Keyed auth without a Key saves the definition only. Accounts add the Key.
+    // No-auth still creates the singleton account because that row is the connection.
+    let create_first_account = !auth_kind.requires_key() || supplied_key.is_some();
     let runtime = runtime_from_definition(definition, now, now);
+    let first_account = if create_first_account {
+        let key_cipher = first_account_key(state, auth_kind, input.key.as_deref())?;
+        let account_name = input
+            .account_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(runtime.name.as_str())
+            .to_string();
+        let notes = match input.notes.as_deref() {
+            Some(value) => normalize_account_notes(value)
+                .map_err(|error| V3ApiError::invalid_request_at(state, error.to_string()))?,
+            None => None,
+        };
+        Some(ModelAccount {
+            id: uuid::Uuid::new_v4().to_string(),
+            provider_id: runtime.id.clone(),
+            credential_kind: auth_kind.credential_kind(),
+            quota_scope: auth_kind.quota_scope(),
+            name: account_name,
+            username: None,
+            password_cipher: None,
+            key_cipher,
+            enabled: NEW_READY_KEY_ACCOUNT_ENABLED,
+            account_type: AccountType::Key,
+            setup_step: crate::models::AccountSetupStep::Ready,
+            referral_code: None,
+            purchase_date: String::new(),
+            expires_on: String::new(),
+            cooldown_until: None,
+            cooldown_generic_until: None,
+            cooldown_5h_until: None,
+            cooldown_week_until: None,
+            cooldown_month_until: None,
+            cooldown_free_until: None,
+            last_error: None,
+            auth_error: None,
+            notes,
+            created_at: now,
+            updated_at: now,
+        })
+    } else {
+        None
+    };
     let snapshot = {
         let db = state.db.lock();
-        db.create_dynamic_provider(&runtime, &account)
-            .map_err(|error| V3ApiError::invalid_request_at(state, error.to_string()))?
+        match first_account.as_ref() {
+            Some(account) => db.create_dynamic_provider(&runtime, account),
+            None => db.create_dynamic_provider_definition(&runtime),
+        }
+        .map_err(|error| V3ApiError::invalid_request_at(state, error.to_string()))?
     };
-    state.install_dynamic_providers_snapshot(snapshot);
+    attempt.subject(runtime.id.clone());
+    if let Err(error) = state.install_dynamic_providers_snapshot(snapshot) {
+        attempt.note_partial(OperationMetadata {
+            completed_count: Some(1),
+            failed_count: Some(1),
+            ..OperationMetadata::default()
+        });
+        return Err(V3ApiError::internal(error));
+    }
     Ok(provider_mutation(state, runtime, state.settings_revision()))
 }
 
 fn update_locked(
     state: &CoreState,
     provider_id: &str,
-    input: DynamicProviderUpdate,
-) -> Result<DynamicProviderMutation, V3ApiError> {
+    input: ProviderDefinitionUpdate,
+    attempt: &mut DashboardAttempt,
+) -> Result<ProviderDefinitionMutation, V3ApiError> {
     let _settings_update = state.settings_update.lock();
     check_expectation(state, &input.expectation)?;
     reject_builtin_id(state, provider_id)?;
@@ -238,7 +329,7 @@ fn update_locked(
         .map_err(V3ApiError::internal)?
         .ok_or_else(|| V3ApiError::not_found_at(state, "provider not found"))?;
     let auth_kind = DynamicAuthKind::from(input.auth_kind);
-    let definition = validate_wire_definition(
+    let mut definition = validate_wire_definition(
         existing.id.clone(),
         input.name,
         input.endpoint_url,
@@ -247,6 +338,9 @@ fn update_locked(
         input.models,
     )
     .map_err(|error| V3ApiError::invalid_request_at(state, error.to_string()))?;
+    definition.preset_id =
+        crate::dynamic::normalize_preset_id(input.preset_id.or(existing.preset_id.clone()))
+            .map_err(|error| V3ApiError::invalid_request_at(state, error.to_string()))?;
     let account_count = state
         .db
         .lock()
@@ -258,7 +352,6 @@ fn update_locked(
             "no-auth provider requires a singleton account",
         ));
     }
-    let changing_to_none = !existing.auth_kind.is_singleton() && auth_kind.is_singleton();
     let changing_from_none = existing.auth_kind.is_singleton() && !auth_kind.is_singleton();
     let supplied_key = input
         .key
@@ -278,47 +371,62 @@ fn update_locked(
     };
     let now = Utc::now();
     let runtime = runtime_from_definition(definition, existing.created_at, now);
-    let substantive = existing.endpoint_url != runtime.endpoint_url
-        || existing.upstream_protocol != runtime.upstream_protocol
-        || existing.auth_kind != runtime.auth_kind
-        || existing.mappings != runtime.mappings;
-    let snapshot = {
-        let db = state.db.lock();
-        db.replace_dynamic_provider(
-            &runtime,
-            substantive,
-            changing_to_none,
-            replacement_key.as_deref(),
-        )
-        .map_err(|error| V3ApiError::invalid_request_at(state, error.to_string()))?
-    };
-    state.install_dynamic_providers_snapshot(snapshot);
-    Ok(provider_mutation(state, runtime, state.settings_revision()))
+    let destination_id = ocg_domain::destination::destination_id_for_dynamic(&existing.id);
+    if let Err(error) = state.commit_configuration_update_recorded(
+        |db| {
+            crate::db::destination_commands::replace_http_destination_on(
+                db,
+                &destination_id,
+                &runtime.definition(),
+                &[],
+            )?;
+            if let Some(cipher) = replacement_key.as_deref() {
+                db.replace_destination_singleton_key_on(&destination_id, cipher)?;
+            }
+            Ok(())
+        },
+        |revision| attempt.note_own_commit(revision),
+    ) {
+        return Err(V3ApiError::invalid_request_at(state, error.to_string()));
+    }
+    let mutation = provider_mutation(state, runtime, state.settings_revision());
+    attempt.note_success(OperationMetadata {
+        revision: Some(mutation.revision),
+        ..OperationMetadata::default()
+    });
+    Ok(mutation)
 }
 
 fn delete_locked(
     state: &CoreState,
     provider_id: &str,
     expectation: &MutationExpectation,
+    attempt: &mut DashboardAttempt,
 ) -> Result<MutationAck, V3ApiError> {
     let _settings_update = state.settings_update.lock();
     check_expectation(state, expectation)?;
     reject_builtin_id(state, provider_id)?;
-    let snapshot = {
-        let db = state.db.lock();
-        db.delete_dynamic_provider(provider_id)
-            .map_err(|error| map_delete_error(state, error))?
-    };
-    state.install_dynamic_providers_snapshot(snapshot);
-    Ok(MutationAck {
+    let destination_id = ocg_domain::destination::destination_id_for_dynamic(provider_id);
+    if let Err(error) = state.commit_configuration_update_recorded(
+        |db| crate::db::destination_commands::delete_http_destination_on(db, &destination_id),
+        |revision| attempt.note_own_commit(revision),
+    ) {
+        return Err(map_delete_error(state, error));
+    }
+    let ack = MutationAck {
         revision: state.settings_revision(),
         process_generation: state.process_generation(),
-    })
+    };
+    attempt.note_success(OperationMetadata {
+        revision: Some(ack.revision),
+        ..OperationMetadata::default()
+    });
+    Ok(ack)
 }
 
 fn reject_builtin_id(state: &CoreState, provider_id: &str) -> Result<(), V3ApiError> {
     if ProviderRegistry::get(provider_id).is_some() || builtin_provider(provider_id).is_some() {
-        return Err(V3ApiError::invalid_request_at(
+        return Err(V3ApiError::builtin_provider_immutable(
             state,
             "built-in providers cannot be deleted or replaced through this route",
         ));
@@ -326,13 +434,37 @@ fn reject_builtin_id(state: &CoreState, provider_id: &str) -> Result<(), V3ApiEr
     Ok(())
 }
 
-fn validate_wire_definition(
+pub(crate) fn validate_wire_definition(
     id: String,
     name: String,
     endpoint_url: String,
     protocol: super::types::AccountUpstreamProtocol,
     auth_kind: DynamicAuthKind,
-    models: Vec<DynamicProviderModel>,
+    models: Vec<ProviderDefinitionModel>,
+) -> Result<DynamicProviderDefinition, ocg_domain::provider::ProviderBindingError> {
+    validate_wire_definition_inner(id, name, endpoint_url, protocol, auth_kind, models, false)
+}
+
+/// Drafts may omit model targets. Configured writes still require at least one.
+pub(crate) fn validate_draft_wire_definition(
+    id: String,
+    name: String,
+    endpoint_url: String,
+    protocol: super::types::AccountUpstreamProtocol,
+    auth_kind: DynamicAuthKind,
+    models: Vec<ProviderDefinitionModel>,
+) -> Result<DynamicProviderDefinition, ocg_domain::provider::ProviderBindingError> {
+    validate_wire_definition_inner(id, name, endpoint_url, protocol, auth_kind, models, true)
+}
+
+fn validate_wire_definition_inner(
+    id: String,
+    name: String,
+    endpoint_url: String,
+    protocol: super::types::AccountUpstreamProtocol,
+    auth_kind: DynamicAuthKind,
+    models: Vec<ProviderDefinitionModel>,
+    allow_empty_mappings: bool,
 ) -> Result<DynamicProviderDefinition, ocg_domain::provider::ProviderBindingError> {
     let endpoint_url = validate_custom_endpoint_url(&endpoint_url)?;
     let mappings = models
@@ -340,24 +472,56 @@ fn validate_wire_definition(
         .map(|model| DynamicModelMapping {
             public_model: model.public_model,
             upstream_model: model.upstream_model,
+            upstream_override: model.upstream_override.map(|value| {
+                ocg_domain::dynamic::DynamicModelUpstreamOverride {
+                    protocol: value.protocol.into(),
+                    endpoint_url: value.endpoint_url,
+                }
+            }),
         })
         .collect::<Vec<_>>();
+    let mappings = if mappings.is_empty() {
+        if allow_empty_mappings {
+            Vec::new()
+        } else {
+            normalize_dynamic_mappings(&mappings)?
+        }
+    } else {
+        normalize_dynamic_mappings(&mappings)?
+    };
+    if mappings.is_empty() {
+        return Ok(DynamicProviderDefinition {
+            preset_id: None,
+            id,
+            name: normalize_dynamic_provider_name(&name)?,
+            endpoint_url,
+            upstream_protocol: protocol.into(),
+            auth_kind,
+            mappings,
+        });
+    }
     validate_definition(DynamicProviderDefinition {
+        preset_id: None,
         id,
         name: normalize_dynamic_provider_name(&name)?,
         endpoint_url,
         upstream_protocol: protocol.into(),
         auth_kind,
-        mappings: normalize_dynamic_mappings(&mappings)?,
+        mappings,
     })
 }
 
-fn runtime_from_definition(
+pub(crate) fn runtime_from_definition(
     definition: DynamicProviderDefinition,
     created_at: chrono::DateTime<Utc>,
     updated_at: chrono::DateTime<Utc>,
 ) -> DynamicProviderRuntime {
+    let preset_for_origin = definition.preset_id.as_deref();
+    let origin = ocg_domain::provider::provider_origin_from_preset(preset_for_origin);
+    let offering =
+        ocg_domain::provider::preset_offering(preset_for_origin.unwrap_or("")).to_string();
     DynamicProviderRuntime {
+        preset_id: definition.preset_id,
         id: definition.id,
         name: definition.name,
         endpoint_url: definition.endpoint_url,
@@ -366,10 +530,12 @@ fn runtime_from_definition(
         mappings: definition.mappings,
         created_at,
         updated_at,
+        origin,
+        offering,
     }
 }
 
-fn first_account_key(
+pub(crate) fn first_account_key(
     state: &CoreState,
     auth_kind: DynamicAuthKind,
     key: Option<&str>,
@@ -428,31 +594,55 @@ fn provider_mutation(
     state: &CoreState,
     runtime: DynamicProviderRuntime,
     revision: u64,
-) -> DynamicProviderMutation {
-    DynamicProviderMutation {
+) -> ProviderDefinitionMutation {
+    ProviderDefinitionMutation {
         provider: to_wire(runtime, revision, state.process_generation()),
         revision,
         process_generation: state.process_generation(),
     }
 }
 
-fn to_wire(
+pub(crate) fn to_wire(
     runtime: DynamicProviderRuntime,
     revision: u64,
     process_generation: u64,
-) -> DynamicProvider {
-    DynamicProvider {
+) -> ProviderDefinition {
+    let is_builtin = matches!(runtime.origin, ProviderOrigin::Builtin);
+    ProviderDefinition {
+        origin: runtime.origin,
+        editable: !is_builtin,
+        deletable: !is_builtin,
+        offering: runtime.offering,
+        preset_id: runtime.preset_id,
         id: runtime.id,
         name: runtime.name,
-        endpoint_url: runtime.endpoint_url,
-        upstream_protocol: runtime.upstream_protocol.into(),
-        auth_kind: runtime.auth_kind.into(),
+        endpoint_url: if is_builtin {
+            None
+        } else {
+            Some(runtime.endpoint_url)
+        },
+        upstream_protocol: if is_builtin {
+            None
+        } else {
+            Some(runtime.upstream_protocol.into())
+        },
+        auth_kind: if is_builtin {
+            None
+        } else {
+            Some(runtime.auth_kind.into())
+        },
         models: runtime
             .mappings
             .into_iter()
-            .map(|mapping| DynamicProviderModel {
+            .map(|mapping| ProviderDefinitionModel {
                 public_model: mapping.public_model,
                 upstream_model: mapping.upstream_model,
+                upstream_override: mapping.upstream_override.map(|value| {
+                    super::types::ProviderModelUpstreamOverride {
+                        protocol: value.protocol.into(),
+                        endpoint_url: value.endpoint_url,
+                    }
+                }),
             })
             .collect(),
         created_at: runtime.created_at.to_rfc3339(),
@@ -461,3 +651,24 @@ fn to_wire(
         process_generation,
     }
 }
+
+impl RevisionAck for ProviderDefinitionMutation {
+    fn acked_revision(&self) -> Option<u64> {
+        Some(self.revision)
+    }
+}
+
+impl RevisionAck for ProviderDefinitionDiscoverResponse {
+    fn acked_revision(&self) -> Option<u64> {
+        Some(self.revision)
+    }
+}
+
+impl RevisionAck for ProviderDefinitionTestResponse {
+    fn acked_revision(&self) -> Option<u64> {
+        Some(self.revision)
+    }
+}
+
+#[cfg(test)]
+mod tests;

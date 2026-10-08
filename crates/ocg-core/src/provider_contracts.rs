@@ -4,20 +4,19 @@
 //! seam: dashboard, materialize, and `/v1/models` read an immutable snapshot
 //! captured at request entry. Request paths never discover or probe.
 
-use crate::alias::{ProviderMapping, UserAliasBinding};
+use crate::alias::ProviderMapping;
 use crate::custom::CustomAccountRuntime;
 use crate::kernel::ids::{
-    COMMAND_CODE_PROVIDER_ID, CUSTOM_PROVIDER_ID, KIMI_PROVIDER_ID, MINIMAX_PROVIDER_ID,
-    OLLAMA_PROVIDER_ID, OPENCODE_PROVIDER_ID, OPENCODE_ZEN_FREE_PROVIDER_ID,
+    COMMAND_CODE_PROVIDER_ID, CPA_PROVIDER_ID, CUSTOM_PROVIDER_ID, KIMI_PROVIDER_ID,
+    MINIMAX_PROVIDER_ID, OLLAMA_PROVIDER_ID, OPENCODE_PROVIDER_ID, OPENCODE_ZEN_FREE_PROVIDER_ID,
     custom_model_id_matches, normalize_model_name,
 };
-use crate::kernel::protocol::{ApiFormat, is_known_model, supported_model_protocol_profiles};
+use crate::kernel::protocol::ApiFormat;
 use crate::kernel::zen::ZenFreeModelCatalog;
 use crate::models::Account;
 use crate::provider::{
-    COMMAND_CODE_GOAT_BASE_URL, COMMAND_CODE_GOAT_INCLUDED_MODEL_IDS,
-    OPENCODE_CONSTRUCTABLE_PROTOCOLS, ProtocolProbeDescriptor, ProviderAdapterKind,
-    ProviderRegistry, StructuralProbeCeiling, UpstreamProtocolKind,
+    COMMAND_CODE_GOAT_BASE_URL, OPENCODE_CONSTRUCTABLE_PROTOCOLS, ProtocolProbeDescriptor,
+    ProviderAdapterKind, ProviderRegistry, StructuralProbeCeiling, UpstreamProtocolKind,
     command_code_goat_includes_model,
 };
 use crate::redaction::sanitize_upstream_error_value_with_known_secret;
@@ -353,7 +352,85 @@ pub struct PersistedContracts {
     pub scopes: HashMap<ContractScope, PersistedScopeRow>,
     pub evidence: HashMap<ContractScope, Vec<PersistedModelProtocol>>,
     pub overrides: HashMap<ContractScope, Vec<PersistedModelProtocolOverride>>,
-    pub user_alias_bindings: Vec<UserAliasBinding>,
+    /// Selected conversion-default protocol, independent of enablement.
+    pub preferences: HashMap<ContractScope, Vec<(String, UpstreamProtocolKind)>>,
+}
+
+/// True when a persisted preferred protocol may be stored for this provider.
+/// CPA is excluded. Custom endpoint scopes are rejected by the writer
+/// (`scope.kind == provider`), not here.
+pub fn selectable_model_protocol(provider_id: &str, protocol: UpstreamProtocolKind) -> bool {
+    let id = provider_id.trim();
+    !id.is_empty()
+        && id != CPA_PROVIDER_ID
+        && matches!(
+            protocol,
+            UpstreamProtocolKind::ChatCompletions
+                | UpstreamProtocolKind::Responses
+                | UpstreamProtocolKind::Messages
+        )
+}
+
+/// `force_off` rows that a mutually exclusive radio wrote on *available*
+/// sibling protocols. Deleting them restores Auto so passthrough can use
+/// every available protocol. Unavailable siblings stay `force_off`.
+pub fn exclusive_available_force_off_repairs(
+    set: &EffectiveContractSet,
+    persisted: &PersistedContracts,
+) -> Vec<(ContractScope, String, UpstreamProtocolKind)> {
+    let mut repairs = Vec::new();
+    for (scope, rows) in &persisted.overrides {
+        let Some(contract) = set.scope(scope) else {
+            continue;
+        };
+        if contract.adapter_kind == ProviderAdapterKind::Cpa {
+            continue;
+        }
+        let mut by_model: HashMap<String, Vec<&PersistedModelProtocolOverride>> = HashMap::new();
+        for row in rows {
+            by_model
+                .entry(row.model_id.trim().to_ascii_lowercase())
+                .or_default()
+                .push(row);
+        }
+        for (model_key, model_rows) in by_model {
+            let Some(model) = contract
+                .models
+                .values()
+                .find(|model| custom_or_case_match(&model.model_id, &model_key))
+            else {
+                continue;
+            };
+            let available: Vec<UpstreamProtocolKind> = model
+                .protocols
+                .values()
+                .filter(|row| row.available)
+                .map(|row| row.protocol)
+                .collect();
+            if available.len() < 2 {
+                continue;
+            }
+            let mut force_on = Vec::new();
+            let mut force_off = Vec::new();
+            for protocol in &available {
+                match model_rows
+                    .iter()
+                    .find(|row| row.protocol == *protocol)
+                    .map(|row| row.state)
+                {
+                    Some(ProtocolOverrideState::ForceOn) => force_on.push(*protocol),
+                    Some(ProtocolOverrideState::ForceOff) => force_off.push(*protocol),
+                    Some(ProtocolOverrideState::Auto) | None => {}
+                }
+            }
+            if force_on.len() == 1 && force_off.len() == available.len() - 1 {
+                for protocol in force_off {
+                    repairs.push((scope.clone(), model.model_id.clone(), protocol));
+                }
+            }
+        }
+    }
+    repairs
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -441,10 +518,85 @@ impl EffectiveScopeContract {
 pub struct EffectiveContractSet {
     pub providers: BTreeMap<String, EffectiveScopeContract>,
     pub custom_endpoints: BTreeMap<String, EffectiveScopeContract>,
-    pub user_alias_bindings: Vec<UserAliasBinding>,
 }
 
 impl EffectiveContractSet {
+    /// Compatibility/dashboard evidence view. Routing decisions belong to the
+    /// saved destination catalog; evidence and override labels remain visible.
+    pub(crate) fn apply_destination_configuration(
+        &mut self,
+        projection: &crate::destination_projection::DestinationProjection,
+    ) {
+        let destinations: HashMap<_, _> = projection
+            .destinations
+            .iter()
+            .map(|destination| (destination.id.as_str(), destination))
+            .collect();
+        let by_account: HashMap<_, _> = projection
+            .credentials
+            .iter()
+            .filter_map(|credential| {
+                destinations
+                    .get(credential.destination_id.as_str())
+                    .map(|destination| (credential.legacy_account_id.as_str(), *destination))
+            })
+            .collect();
+        for scope in self
+            .providers
+            .values_mut()
+            .chain(self.custom_endpoints.values_mut())
+        {
+            let destination = match &scope.scope {
+                ContractScope::Provider(id) => destinations
+                    .get(ocg_domain::destination::destination_id_for_builtin(id).as_str())
+                    .copied(),
+                ContractScope::CustomEndpoint(id) => by_account.get(id.as_str()).copied(),
+            };
+            let Some(destination) = destination else {
+                continue;
+            };
+            scope.catalog.models = destination
+                .catalog
+                .iter()
+                .map(|model| {
+                    if matches!(scope.scope, ContractScope::Provider(_)) {
+                        model.upstream_model.clone()
+                    } else {
+                        model.public_model.clone()
+                    }
+                })
+                .collect();
+            for model in scope.models.values_mut() {
+                let saved = destination.catalog.iter().find(|saved| {
+                    if matches!(scope.scope, ContractScope::Provider(_)) {
+                        saved.upstream_model.eq_ignore_ascii_case(&model.model_id)
+                    } else {
+                        saved.public_model.eq_ignore_ascii_case(&model.model_id)
+                    }
+                });
+                for evidence in model.protocols.values_mut() {
+                    evidence.enabled = destination.enabled
+                        && saved.is_some_and(|saved| {
+                            saved.enabled && saved.protocols.contains(&evidence.protocol)
+                        });
+                    if saved.is_some_and(|saved| saved.protocols.contains(&evidence.protocol)) {
+                        evidence.available = true;
+                    }
+                }
+                if let Some(preferred) = saved.and_then(|saved| saved.preferred) {
+                    model.preferred_protocol = preferred;
+                }
+                model.routable = model.has_enabled_protocol() && scope.production_inference;
+                if !model.routable && model.disabled_reasons.is_empty() {
+                    model.disabled_reasons.push("model_disabled".to_string());
+                } else if model.routable {
+                    model.disabled_reasons.clear();
+                }
+            }
+            scope.catalog_routable = scope.models.values().any(|model| model.routable);
+        }
+    }
+
     pub fn scope(&self, scope: &ContractScope) -> Option<&EffectiveScopeContract> {
         match scope {
             ContractScope::Provider(id) => self.providers.get(id),
@@ -463,27 +615,6 @@ impl EffectiveContractSet {
         };
         self.scope(&scope)
             .is_some_and(|contract| contract.model_has_enabled_protocol(&mapping.upstream_model))
-    }
-
-    /// Persisted bindings survive catalog rotation, but only bindings whose
-    /// exact upstream ID remains in the current Provider catalog with an
-    /// enabled protocol may enter runtime Alias resolution.
-    pub fn routeable_user_alias_bindings(&self) -> Vec<UserAliasBinding> {
-        self.user_alias_bindings
-            .iter()
-            .filter(|binding| {
-                self.provider_offering(&binding.provider_id)
-                    .is_some_and(|contract| {
-                        contract
-                            .catalog
-                            .models
-                            .iter()
-                            .any(|model| model == &binding.upstream_model)
-                            && contract.model_has_enabled_protocol(&binding.upstream_model)
-                    })
-            })
-            .cloned()
-            .collect()
     }
 
     pub fn production_protocol_allowed(
@@ -554,6 +685,56 @@ impl fmt::Display for ProtocolSelectError {
 
 impl std::error::Error for ProtocolSelectError {}
 
+/// Already-enabled protocols to try, in selection order.
+///
+/// 1. `preferred`, when it is enabled.
+/// 2. The client protocol, when it is enabled and distinct.
+/// 3. Remaining enabled entries of `fallback_priority`, in that order.
+///
+/// `enabled` and `fallback_priority` are already permission-filtered. This
+/// does not add a protocol, grant, or endpoint, and it does not contact a
+/// network. An unenabled preferred protocol is omitted. Gemini is client-only
+/// and never matches step 2.
+pub(crate) fn enabled_upstream_order(
+    client: ApiFormat,
+    preferred: UpstreamProtocolKind,
+    enabled: &[UpstreamProtocolKind],
+    fallback_priority: &[UpstreamProtocolKind],
+) -> Vec<UpstreamProtocolKind> {
+    let mut order = Vec::new();
+    if enabled.contains(&preferred) {
+        order.push(preferred);
+    }
+    if let Some(client_protocol) = protocol_from_api(client)
+        && enabled.contains(&client_protocol)
+        && !order.contains(&client_protocol)
+    {
+        order.push(client_protocol);
+    }
+    for protocol in fallback_priority {
+        if enabled.contains(protocol) && !order.contains(protocol) {
+            order.push(*protocol);
+        }
+    }
+    order
+}
+
+/// Pick the upstream protocol for one request.
+///
+/// Uses [`enabled_upstream_order`] and returns the first entry.
+pub fn select_enabled_upstream(
+    client: ApiFormat,
+    preferred: UpstreamProtocolKind,
+    enabled: &[UpstreamProtocolKind],
+    fallback_priority: &[UpstreamProtocolKind],
+) -> Result<ApiFormat, ProtocolSelectError> {
+    enabled_upstream_order(client, preferred, enabled, fallback_priority)
+        .into_iter()
+        .next()
+        .map(protocol_to_api)
+        .ok_or_else(|| ProtocolSelectError::new(NO_ENABLED_UPSTREAM_PROTOCOL))
+}
+
 pub fn select_upstream_protocol(
     contract: &EffectiveScopeContract,
     client: ApiFormat,
@@ -569,25 +750,7 @@ pub fn select_upstream_protocol(
         return Err(ProtocolSelectError::new(NO_ENABLED_UPSTREAM_PROTOCOL));
     }
     let preferred = model.preferred_protocol;
-    if available.contains(&preferred) {
-        return Ok(match protocol_from_api(client) {
-            Some(client_protocol) if available.contains(&client_protocol) => {
-                protocol_to_api(client_protocol)
-            }
-            _ => protocol_to_api(preferred),
-        });
-    }
-    if let Some(client_protocol) = protocol_from_api(client)
-        && available.contains(&client_protocol)
-    {
-        return Ok(protocol_to_api(client_protocol));
-    }
-    for protocol in contract.fallback_priority {
-        if available.contains(protocol) {
-            return Ok(protocol_to_api(*protocol));
-        }
-    }
-    Err(ProtocolSelectError::new(NO_ENABLED_UPSTREAM_PROTOCOL))
+    select_enabled_upstream(client, preferred, &available, contract.fallback_priority)
 }
 
 pub fn safety_ceiling_protocols(
@@ -612,15 +775,74 @@ pub fn safety_ceiling_protocols(
             }
         }
         StructuralProbeCeiling::ZenFreeConstructable => {
-            if is_known_model(model_id) {
-                OPENCODE_CONSTRUCTABLE_PROTOCOLS.to_vec()
-            } else if crate::kernel::ids::is_free_model(model_id) {
+            if crate::kernel::ids::is_free_model(model_id) {
                 vec![UpstreamProtocolKind::ChatCompletions]
             } else {
                 Vec::new()
             }
         }
     }
+}
+
+/// Official-docs Static rows currently stored for Go / Zen / Command.
+/// Probe observations are ignored: they must not expand sealed adapter authority.
+pub fn official_static_protocols(
+    adapter: ProviderAdapterKind,
+    model_id: &str,
+    evidence: &[PersistedModelProtocol],
+) -> Vec<UpstreamProtocolKind> {
+    if !matches!(
+        adapter,
+        ProviderAdapterKind::OpenCodeGo
+            | ProviderAdapterKind::ZenFree
+            | ProviderAdapterKind::CommandCodeGoat
+    ) {
+        return Vec::new();
+    }
+    evidence
+        .iter()
+        .filter(|row| {
+            custom_or_case_match(&row.model_id, model_id)
+                && row.source == ContractEvidenceSource::Static
+        })
+        .map(|row| row.protocol)
+        .collect()
+}
+
+fn structural_admission_protocols(
+    adapter: ProviderAdapterKind,
+    probe: ProtocolProbeDescriptor,
+    model_id: &str,
+) -> Vec<UpstreamProtocolKind> {
+    if adapter == ProviderAdapterKind::CommandCodeGoat
+        && !model_id.eq_ignore_ascii_case("stealth/ox-alpha")
+    {
+        ocg_domain::protocol::command_code_supported_formats(model_id)
+            .iter()
+            .copied()
+            .filter_map(protocol_from_api)
+            .collect()
+    } else {
+        safety_ceiling_protocols(probe, model_id)
+    }
+}
+
+/// Protocols the effective contract may admit: the adapter structural ceiling
+/// plus current official-docs Static evidence. Probe-manufactured rows do not
+/// widen this set on sealed adapters.
+pub fn admitted_protocols(
+    adapter: ProviderAdapterKind,
+    probe: ProtocolProbeDescriptor,
+    model_id: &str,
+    evidence: &[PersistedModelProtocol],
+) -> Vec<UpstreamProtocolKind> {
+    let mut admitted = structural_admission_protocols(adapter, probe, model_id);
+    for protocol in official_static_protocols(adapter, model_id, evidence) {
+        if !admitted.contains(&protocol) {
+            admitted.push(protocol);
+        }
+    }
+    admitted
 }
 
 pub fn static_verified_protocols(
@@ -636,11 +858,7 @@ pub fn static_verified_protocols(
             .collect();
     }
     match adapter {
-        ProviderAdapterKind::OpenCodeGo | ProviderAdapterKind::ZenFree => {
-            opencode_profile(model_id)
-                .map(|(_, supported)| supported.to_vec())
-                .unwrap_or_default()
-        }
+        ProviderAdapterKind::OpenCodeGo | ProviderAdapterKind::ZenFree => Vec::new(),
         ProviderAdapterKind::CommandCodeGoat => {
             if model_id.eq_ignore_ascii_case("stealth/ox-alpha") {
                 Vec::new()
@@ -648,7 +866,14 @@ pub fn static_verified_protocols(
                 ocg_domain::protocol::command_code_supported_formats(model_id).to_vec()
             }
         }
-        ProviderAdapterKind::MiniMaxCn | ProviderAdapterKind::KimiCn => {
+        ProviderAdapterKind::MiniMaxCn => {
+            return vec![
+                UpstreamProtocolKind::ChatCompletions,
+                UpstreamProtocolKind::Messages,
+                UpstreamProtocolKind::Responses,
+            ];
+        }
+        ProviderAdapterKind::KimiCn => {
             return vec![
                 UpstreamProtocolKind::ChatCompletions,
                 UpstreamProtocolKind::Messages,
@@ -673,13 +898,6 @@ pub fn static_verified_protocols(
     .into_iter()
     .filter_map(protocol_from_api)
     .collect()
-}
-
-fn opencode_profile(model_id: &str) -> Option<(ApiFormat, &'static [ApiFormat])> {
-    let normalized = normalize_model_name(model_id);
-    supported_model_protocol_profiles()
-        .find(|(id, _, _)| *id == normalized)
-        .map(|(_, preferred, supported)| (preferred, supported))
 }
 
 pub fn probe_may_add(
@@ -718,13 +936,8 @@ pub fn apply_probe_observation(
             ProbeResultKind::Failure
         });
         next.last_probe_error = if success { None } else { sanitized };
-        if success {
-            if next.verified_at.is_none() {
-                next.verified_at = Some(now);
-            }
-            if !next.source.confers_support() {
-                next.source = ContractEvidenceSource::ProbeConfirmed;
-            }
+        if success && next.verified_at.is_none() {
+            next.verified_at = Some(now);
         }
         return Ok(next);
     }
@@ -733,7 +946,7 @@ pub fn apply_probe_observation(
             scope,
             model_id: model_id.to_string(),
             protocol,
-            source: ContractEvidenceSource::ProbeConfirmed,
+            source: ContractEvidenceSource::ProbeObserved,
             verified_at: Some(now),
             observed_at: Some(now),
             last_probe_result: Some(ProbeResultKind::Success),
@@ -799,6 +1012,90 @@ fn truncate_chars(input: &str, max_chars: usize) -> String {
     truncated
 }
 
+fn refreshed_catalog(
+    persisted: Option<&PersistedScopeRow>,
+    fallback_source: &str,
+    fallback_url: &str,
+) -> (EffectiveCatalog, Vec<String>) {
+    let fetched = persisted.is_some_and(|row| !row.catalog_models.is_empty());
+    let models = if fetched {
+        persisted
+            .map(|row| row.catalog_models.clone())
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    (
+        EffectiveCatalog {
+            source: if fetched {
+                persisted
+                    .map(|row| row.catalog_source.clone())
+                    .filter(|source| !source.is_empty())
+                    .unwrap_or_else(|| fallback_source.to_string())
+            } else {
+                String::new()
+            },
+            source_url: if fetched && persisted.is_none_or(|row| row.catalog_source != "manual") {
+                persisted
+                    .map(|row| row.catalog_source_url.clone())
+                    .filter(|url| !url.is_empty())
+                    .unwrap_or_else(|| fallback_url.to_string())
+            } else {
+                String::new()
+            },
+            refreshed_at: if fetched {
+                persisted.and_then(|row| row.catalog_refreshed_at)
+            } else {
+                None
+            },
+            models: models.clone(),
+            refresh_supported: true,
+        },
+        models,
+    )
+}
+
+fn persisted_catalog_is_explicit(row: &PersistedScopeRow) -> bool {
+    !row.catalog_models.is_empty()
+        || row.catalog_refreshed_at.is_some()
+        || !row.catalog_source.is_empty()
+}
+
+fn zen_refreshable_catalog(
+    persisted: Option<&PersistedScopeRow>,
+    zen_catalog: &ZenFreeModelCatalog,
+) -> (EffectiveCatalog, Vec<String>) {
+    if persisted.is_some_and(persisted_catalog_is_explicit) {
+        return refreshed_catalog(
+            persisted,
+            CATALOG_SOURCE_OFFICIAL_ZEN,
+            &zen_catalog.source_url,
+        );
+    }
+    if zen_catalog.models.is_empty() {
+        return refreshed_catalog(None, CATALOG_SOURCE_OFFICIAL_ZEN, &zen_catalog.source_url);
+    }
+    let fetched = zen_catalog.refreshed_at.is_some();
+    (
+        EffectiveCatalog {
+            source: if fetched {
+                CATALOG_SOURCE_OFFICIAL_ZEN.to_string()
+            } else {
+                String::new()
+            },
+            source_url: if fetched {
+                zen_catalog.source_url.clone()
+            } else {
+                String::new()
+            },
+            refreshed_at: zen_catalog.refreshed_at,
+            models: zen_catalog.models.clone(),
+            refresh_supported: true,
+        },
+        zen_catalog.models.clone(),
+    )
+}
+
 pub fn build_effective_contracts(
     zen_catalog: &ZenFreeModelCatalog,
     custom_runtimes: &[CustomAccountRuntime],
@@ -812,13 +1109,24 @@ pub fn build_effective_contracts(
         let persisted_scope = persisted.scopes.get(&scope);
         let evidence = persisted.evidence.get(&scope).cloned().unwrap_or_default();
         let overrides = persisted.overrides.get(&scope).cloned().unwrap_or_default();
-        let contract = merge_provider_scope(
+        let mut contract = merge_provider_scope(
             descriptor,
             zen_catalog,
             persisted_scope,
             &evidence,
             &overrides,
         );
+        for (model_id, protocol) in persisted.preferences.get(&scope).into_iter().flatten() {
+            if selectable_model_protocol(scope_id, *protocol)
+                && let Some(model) = contract
+                    .models
+                    .values_mut()
+                    .find(|model| custom_or_case_match(&model.model_id, model_id))
+                && model.protocols.contains_key(protocol.as_str())
+            {
+                model.preferred_protocol = *protocol;
+            }
+        }
         set.providers.insert(scope_id.to_string(), contract);
     }
     for runtime in custom_runtimes {
@@ -830,7 +1138,6 @@ pub fn build_effective_contracts(
         set.custom_endpoints
             .insert(runtime.account_id.clone(), contract);
     }
-    set.user_alias_bindings = persisted.user_alias_bindings;
     set
 }
 
@@ -847,157 +1154,32 @@ fn merge_provider_scope(
         .expect("provider contract descriptor must declare a scope id");
     let revision = persisted.map(|row| row.revision).unwrap_or(1);
     let (catalog, static_models) = match adapter {
-        ProviderAdapterKind::OpenCodeGo => {
-            let models: Vec<String> = persisted
-                .filter(|row| !row.catalog_models.is_empty())
-                .map(|row| row.catalog_models.clone())
-                .unwrap_or_else(|| {
-                    supported_model_protocol_profiles()
-                        .map(|(id, _, _)| id.to_string())
-                        .collect()
-                });
-            (
-                EffectiveCatalog {
-                    source: persisted
-                        .map(|row| row.catalog_source.clone())
-                        .filter(|source| !source.is_empty())
-                        .unwrap_or_else(|| CATALOG_SOURCE_STATIC.to_string()),
-                    source_url: persisted
-                        .map(|row| row.catalog_source_url.clone())
-                        .unwrap_or_default(),
-                    refreshed_at: persisted.and_then(|row| row.catalog_refreshed_at),
-                    models: models.clone(),
-                    refresh_supported: true,
-                },
-                models,
-            )
-        }
-        ProviderAdapterKind::ZenFree => {
-            let has_persisted_catalog = persisted.is_some_and(|row| !row.catalog_models.is_empty());
-            let models = persisted
-                .filter(|row| !row.catalog_models.is_empty())
-                .map(|row| row.catalog_models.clone())
-                .unwrap_or_else(|| zen_catalog.models.clone());
-            (
-                EffectiveCatalog {
-                    source: if has_persisted_catalog {
-                        persisted
-                            .map(|row| row.catalog_source.clone())
-                            .filter(|source| !source.is_empty())
-                            .unwrap_or_else(|| CATALOG_SOURCE_OFFICIAL_ZEN.to_string())
-                    } else {
-                        CATALOG_SOURCE_STATIC.to_string()
-                    },
-                    source_url: if has_persisted_catalog {
-                        persisted
-                            .map(|row| row.catalog_source_url.clone())
-                            .filter(|url| !url.is_empty())
-                            .unwrap_or_else(|| zen_catalog.source_url.clone())
-                    } else {
-                        String::new()
-                    },
-                    refreshed_at: if has_persisted_catalog {
-                        persisted
-                            .and_then(|row| row.catalog_refreshed_at)
-                            .or(zen_catalog.refreshed_at)
-                    } else {
-                        None
-                    },
-                    models: models.clone(),
-                    refresh_supported: true,
-                },
-                models,
-            )
-        }
-        ProviderAdapterKind::CommandCodeGoat => {
-            let models: Vec<String> = persisted
-                .filter(|row| !row.catalog_models.is_empty())
-                .map(|row| row.catalog_models.clone())
-                .unwrap_or_else(|| {
-                    COMMAND_CODE_GOAT_INCLUDED_MODEL_IDS
-                        .iter()
-                        .map(|model| (*model).to_string())
-                        .collect()
-                });
-            (
-                EffectiveCatalog {
-                    source: persisted
-                        .map(|row| row.catalog_source.clone())
-                        .filter(|source| !source.is_empty())
-                        .unwrap_or_else(|| CATALOG_SOURCE_COMMAND_CODE_MODELS.to_string()),
-                    source_url: persisted
-                        .map(|row| row.catalog_source_url.clone())
-                        .filter(|url| !url.is_empty())
-                        .unwrap_or_else(|| COMMAND_CODE_GOAT_BASE_URL.to_string()),
-                    refreshed_at: persisted.and_then(|row| row.catalog_refreshed_at),
-                    models: models.clone(),
-                    refresh_supported: true,
-                },
-                models,
-            )
-        }
-        ProviderAdapterKind::MiniMaxCn | ProviderAdapterKind::KimiCn => {
-            let (fallback, source, source_url): (&[&str], _, _) =
-                if adapter == ProviderAdapterKind::MiniMaxCn {
-                    (
-                        &["MiniMax-M3"],
-                        CATALOG_SOURCE_MINIMAX_CN_MODELS,
-                        crate::provider::MINIMAX_CN_BASE_URL,
-                    )
-                } else {
-                    (
-                        &["kimi-for-coding", "kimi-k3"],
-                        CATALOG_SOURCE_KIMI_CN_MODELS,
-                        crate::provider::KIMI_CN_BASE_URL,
-                    )
-                };
-            let models = persisted
-                .filter(|row| !row.catalog_models.is_empty())
-                .map(|row| row.catalog_models.clone())
-                .unwrap_or_else(|| fallback.iter().map(|model| (*model).to_string()).collect());
-            (
-                EffectiveCatalog {
-                    source: persisted
-                        .map(|row| row.catalog_source.clone())
-                        .filter(|value| !value.is_empty())
-                        .unwrap_or_else(|| source.to_string()),
-                    source_url: persisted
-                        .map(|row| row.catalog_source_url.clone())
-                        .filter(|value| !value.is_empty())
-                        .unwrap_or_else(|| source_url.to_string()),
-                    refreshed_at: persisted.and_then(|row| row.catalog_refreshed_at),
-                    models: models.clone(),
-                    refresh_supported: true,
-                },
-                models,
-            )
-        }
-        ProviderAdapterKind::OllamaCloud => {
-            let fallback: Vec<String> = crate::kernel::protocol::ollama_cloud_protocol_seed_ids()
-                .into_iter()
-                .map(str::to_string)
-                .collect();
-            let models = persisted
-                .filter(|row| !row.catalog_models.is_empty())
-                .map(|row| row.catalog_models.clone())
-                .unwrap_or(fallback);
-            (
-                EffectiveCatalog {
-                    source: persisted
-                        .map(|row| row.catalog_source.clone())
-                        .filter(|value| !value.is_empty())
-                        .unwrap_or_else(|| CATALOG_SOURCE_OLLAMA_CLOUD_MODELS.to_string()),
-                    source_url: persisted
-                        .map(|row| row.catalog_source_url.clone())
-                        .filter(|value| !value.is_empty())
-                        .unwrap_or_else(|| crate::kernel::ids::OLLAMA_CLOUD_BASE_URL.to_string()),
-                    refreshed_at: persisted.and_then(|row| row.catalog_refreshed_at),
-                    models: models.clone(),
-                    refresh_supported: true,
-                },
-                models,
-            )
-        }
+        ProviderAdapterKind::OpenCodeGo => refreshed_catalog(
+            persisted,
+            CATALOG_SOURCE_OPENCODE_MODELS,
+            crate::provider::OPENCODE_GO_BASE_URL,
+        ),
+        ProviderAdapterKind::ZenFree => zen_refreshable_catalog(persisted, zen_catalog),
+        ProviderAdapterKind::CommandCodeGoat => refreshed_catalog(
+            persisted,
+            CATALOG_SOURCE_COMMAND_CODE_MODELS,
+            COMMAND_CODE_GOAT_BASE_URL,
+        ),
+        ProviderAdapterKind::MiniMaxCn => refreshed_catalog(
+            persisted,
+            CATALOG_SOURCE_MINIMAX_CN_MODELS,
+            crate::provider::MINIMAX_CN_BASE_URL,
+        ),
+        ProviderAdapterKind::KimiCn => refreshed_catalog(
+            persisted,
+            CATALOG_SOURCE_KIMI_CN_MODELS,
+            crate::provider::KIMI_CN_BASE_URL,
+        ),
+        ProviderAdapterKind::OllamaCloud => refreshed_catalog(
+            persisted,
+            CATALOG_SOURCE_OLLAMA_CLOUD_MODELS,
+            crate::kernel::ids::OLLAMA_CLOUD_BASE_URL,
+        ),
         ProviderAdapterKind::Cpa => {
             unreachable!("CPA is an external integration without a Provider contract scope")
         }
@@ -1061,11 +1243,7 @@ fn merge_custom_scope(
     let descriptor =
         ProviderRegistry::get(CUSTOM_PROVIDER_ID).expect("custom offering is registered");
     let revision = persisted.map(|row| row.revision).unwrap_or(1);
-    let declared: Vec<(String, UpstreamProtocolKind)> = runtime
-        .capabilities
-        .iter()
-        .map(|capability| (capability.public_model.clone(), capability.protocol))
-        .collect();
+    let declared: Vec<(String, UpstreamProtocolKind)> = runtime.declared_protocols();
     let mut catalog_models = Vec::new();
     let mut catalog_seen = HashSet::new();
     for (model_id, _) in &declared {
@@ -1133,8 +1311,9 @@ fn preferred_protocol(
 ) -> UpstreamProtocolKind {
     match adapter {
         ProviderAdapterKind::OpenCodeGo | ProviderAdapterKind::ZenFree => {
-            opencode_profile(model_id)
-                .and_then(|(preferred, _)| protocol_from_api(preferred))
+            // The V3 preferred field is non-null; this placeholder does not
+            // confer support when an unknown model has no admitted evidence.
+            provider_default_protocol(adapter, model_id)
                 .unwrap_or(UpstreamProtocolKind::ChatCompletions)
         }
         ProviderAdapterKind::CommandCodeGoat => {
@@ -1142,9 +1321,10 @@ fn preferred_protocol(
                 .and_then(protocol_from_api)
                 .unwrap_or(UpstreamProtocolKind::ChatCompletions)
         }
-        ProviderAdapterKind::MiniMaxCn | ProviderAdapterKind::KimiCn => {
-            UpstreamProtocolKind::ChatCompletions
-        }
+        // MiniMax recommends its Anthropic-compatible API. Enabled alternatives
+        // are fallback choices only when this configured preference is disabled.
+        ProviderAdapterKind::MiniMaxCn => UpstreamProtocolKind::Messages,
+        ProviderAdapterKind::KimiCn => UpstreamProtocolKind::ChatCompletions,
         ProviderAdapterKind::OllamaCloud => UpstreamProtocolKind::ChatCompletions,
         ProviderAdapterKind::Cpa => UpstreamProtocolKind::ChatCompletions,
         ProviderAdapterKind::ConfigurableHttp => {
@@ -1160,6 +1340,22 @@ fn preferred_protocol(
     }
 }
 
+/// Known per-model defaults only. Directory discovery cannot assert Chat support.
+fn provider_default_protocol(
+    adapter: ProviderAdapterKind,
+    model_id: &str,
+) -> Option<UpstreamProtocolKind> {
+    match adapter {
+        ProviderAdapterKind::OpenCodeGo => {
+            crate::official_protocols::known_opencode_default(model_id, false)
+        }
+        ProviderAdapterKind::ZenFree => {
+            crate::official_protocols::known_opencode_default(model_id, true)
+        }
+        _ => None,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn merge_model_contract(
     adapter: ProviderAdapterKind,
@@ -1171,27 +1367,28 @@ fn merge_model_contract(
     overrides: &[PersistedModelProtocolOverride],
     adapter_routable: bool,
 ) -> EffectiveModelContract {
+    let official_docs = official_static_protocols(adapter, model_id, evidence);
+    // GOAT extras stay Auto-off until official-docs Static evidence exists.
+    // Included preset rows, and every other sealed adapter, default on once a
+    // trusted protocol baseline makes the protocol available. Directory
+    // discovery still cannot assert Chat for a model with no protocol evidence.
     let default_enabled = adapter != ProviderAdapterKind::CommandCodeGoat
-        || command_code_goat_includes_model(model_id);
-    let preferred = preferred_protocol(adapter, model_id, declared);
-    let ceiling = if adapter == ProviderAdapterKind::CommandCodeGoat
-        && !model_id.eq_ignore_ascii_case("stealth/ox-alpha")
-    {
-        ocg_domain::protocol::command_code_supported_formats(model_id)
-            .iter()
-            .copied()
-            .filter_map(protocol_from_api)
-            .collect()
+        || command_code_goat_includes_model(model_id)
+        || !official_docs.is_empty();
+    let preferred = official_docs
+        .first()
+        .copied()
+        .unwrap_or_else(|| preferred_protocol(adapter, model_id, declared));
+    let ceiling = admitted_protocols(adapter, probe, model_id, evidence);
+    let mut static_verified = if official_docs.is_empty() {
+        static_verified_protocols(adapter, model_id, declared)
     } else {
-        safety_ceiling_protocols(probe, model_id)
+        official_docs
     };
-    let mut static_verified = static_verified_protocols(adapter, model_id, declared);
-    if probe.unknown_zen_free_defaults_to_chat
-        && crate::kernel::ids::is_free_model(model_id)
-        && opencode_profile(model_id).is_none()
-        && !static_verified.contains(&UpstreamProtocolKind::ChatCompletions)
+    if static_verified.is_empty()
+        && let Some(default) = provider_default_protocol(adapter, model_id)
     {
-        static_verified.push(UpstreamProtocolKind::ChatCompletions);
+        static_verified.push(default);
     }
     let mut protocols = BTreeMap::new();
     for protocol in UpstreamProtocolKind::ALL {

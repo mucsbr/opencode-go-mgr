@@ -1,0 +1,1347 @@
+//! Bounded New API / Sub2API metadata reader.
+//!
+//! Verified against official sources:
+//! - New API `71c1fd7caad738db4d13aabbf28eeadb293d0cfe`
+//!   (`router/api-router.go`, `router/relay-router.go`, `controller/user.go`,
+//!   `controller/group.go`, `controller/subscription.go`, `controller/token.go`,
+//!   `controller/pricing.go`, `controller/model.go`, `controller/misc.go`,
+//!   `controller/log.go`, `middleware/auth.go`, `model/pricing.go`,
+//!   `model/token.go`, `model/subscription.go`)
+//! - Sub2API `772a0382f079676983c06f24b0d41e09139a8462`
+//!   (`backend/internal/server/router.go`, `.../routes/user.go`,
+//!   `.../routes/gateway.go`, `.../routes/model_plaza.go`,
+//!   `backend/internal/handler/subscription_handler.go`,
+//!   `.../api_key_handler.go`, `.../model_plaza_handler.go`,
+//!   `.../available_channel_handler.go` (`userSupportedModelPricing`,
+//!   `toUserPricing`), `.../gateway_key_billing.go`,
+//!   `.../gateway_handler.go` (`Usage`), `.../user_handler.go` (`GetProfile`),
+//!   `backend/internal/pkg/response/response.go`,
+//!   `backend/internal/handler/dto/types.go`)
+//!
+//! Inference stays Custom HTTP. This leaf only reads account-owned metadata.
+
+use super::{
+    PlatformGroup, PlatformKind, PlatformModel, PlatformQuota, PlatformQuotaKind,
+    PlatformReadRequest, PlatformSnapshot,
+};
+use crate::custom_http::join_inference_endpoint;
+use chrono::{DateTime, Datelike, TimeZone, Utc};
+use futures_util::StreamExt;
+use reqwest::StatusCode;
+use reqwest::header::HeaderValue;
+use serde_json::Value;
+use std::collections::BTreeSet;
+use std::time::Duration;
+
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+const MAX_BODY_BYTES: usize = 256 * 1024;
+
+const ERR_BASE_URL_INVALID: &str = "base_url.invalid";
+const ERR_AUTH_MISSING: &str = "auth.missing";
+const CODE_REDIRECT: &str = "redirect_rejected";
+const CODE_NETWORK: &str = "network";
+const CODE_TIMEOUT: &str = "timeout";
+const CODE_UNAUTHORIZED: &str = "unauthorized";
+const CODE_USER_ID_REQUIRED: &str = "user_id_required";
+const CODE_USER_ID_MISMATCH: &str = "user_id_mismatch";
+const CODE_FORBIDDEN: &str = "forbidden";
+const CODE_HTTP_STATUS: &str = "http_status";
+const CODE_PARSE: &str = "parse";
+const CODE_OVERSIZE: &str = "oversize";
+const CODE_ENDPOINT: &str = "endpoint_override";
+const CODE_SECRET: &str = "secret_reflected";
+
+const SRC_V1_MODELS: &str = "v1_models";
+const SRC_TOKEN_LIMITS: &str = "token_limits";
+#[cfg(test)]
+#[path = "tests.rs"]
+mod tests;
+
+/// Read one platform snapshot. Failures are recorded as fixed codes on the
+/// snapshot; this never returns upstream bodies or credentials.
+pub async fn read(client: &reqwest::Client, request: &PlatformReadRequest<'_>) -> PlatformSnapshot {
+    let mut snapshot = PlatformSnapshot {
+        observed_at: request.now,
+        stale: false,
+        errors: Vec::new(),
+        quotas: Vec::new(),
+        models: Vec::new(),
+        prices: Vec::new(),
+        groups: Vec::new(),
+        billing_preference: None,
+        wallet_overflow: None,
+    };
+
+    let Ok(base) = super::validate_platform_base_url(request.base_url) else {
+        snapshot.errors.push(ERR_BASE_URL_INVALID.to_string());
+        snapshot.stale = true;
+        return snapshot;
+    };
+    let root = base.strip_suffix("/v1").unwrap_or(&base);
+    let Ok(base_url) = reqwest::Url::parse(root) else {
+        snapshot.errors.push(ERR_BASE_URL_INVALID.to_string());
+        snapshot.stale = true;
+        return snapshot;
+    };
+
+    let user = trim_secret(request.user_credential);
+    let key = trim_secret(request.key);
+    if user.is_none() && key.is_none() {
+        snapshot.errors.push(ERR_AUTH_MISSING.to_string());
+        snapshot.stale = true;
+        return snapshot;
+    }
+
+    match request.kind {
+        PlatformKind::NewApi => {
+            read_new_api(client, &base_url, request, user, key, &mut snapshot).await
+        }
+        PlatformKind::Sub2api => {
+            read_sub2(client, &base_url, request, user, key, &mut snapshot).await
+        }
+    }
+
+    scrub_secrets(&mut snapshot, user, key);
+    snapshot.stale = snapshot.quotas.is_empty()
+        && snapshot.models.is_empty()
+        && snapshot.prices.is_empty()
+        && snapshot.groups.is_empty()
+        && !snapshot.errors.is_empty();
+    snapshot
+}
+
+/// Observe one linked inference Key's quota only. Page-driven automatic
+/// refreshes must not discover model catalogs, prices, or platform groups.
+pub(crate) async fn read_observation(
+    client: &reqwest::Client,
+    request: &PlatformReadRequest<'_>,
+) -> PlatformSnapshot {
+    let mut snapshot = PlatformSnapshot {
+        observed_at: request.now,
+        ..PlatformSnapshot::default()
+    };
+    let Ok(base) = super::validate_platform_base_url(request.base_url)
+        .and_then(|root| reqwest::Url::parse(&root).map_err(Into::into))
+    else {
+        snapshot.errors.push(ERR_BASE_URL_INVALID.into());
+        snapshot.stale = true;
+        return snapshot;
+    };
+    let Some(key) = trim_secret(request.key) else {
+        snapshot.errors.push(ERR_AUTH_MISSING.into());
+        snapshot.stale = true;
+        return snapshot;
+    };
+    match request.kind {
+        PlatformKind::NewApi => {
+            let quota_per_unit =
+                match get_json(client, &base, "api/status", "new_api.status", None, None).await {
+                    Ok(fetched) => match new_api_data(&fetched.value, "new_api.status") {
+                        Ok(data) => json_f64(data.get("quota_per_unit")).filter(|v| *v > 0.0),
+                        Err(error) => {
+                            push_error(&mut snapshot, error);
+                            None
+                        }
+                    },
+                    Err(error) => {
+                        push_error(&mut snapshot, error);
+                        None
+                    }
+                };
+            match get_json(
+                client,
+                &base,
+                "api/usage/token/",
+                "new_api.token_usage",
+                Some(key),
+                None,
+            )
+            .await
+            {
+                Ok(fetched) => {
+                    match new_api_token_usage_data(&fetched.value, "new_api.token_usage") {
+                        Ok(data) => parse_new_api_token_usage(
+                            data,
+                            &mut BTreeSet::new(),
+                            &mut snapshot,
+                            quota_per_unit,
+                        ),
+                        Err(error) => push_error(&mut snapshot, error),
+                    }
+                }
+                Err(error) => push_error(&mut snapshot, error),
+            }
+        }
+        PlatformKind::Sub2api => {
+            match get_json(client, &base, "v1/usage", "sub2api.usage", Some(key), None).await {
+                Ok(fetched) => {
+                    if let Err(error) = parse_sub2_usage(&fetched.value, &mut snapshot) {
+                        push_error(&mut snapshot, error);
+                    }
+                }
+                Err(error) => push_error(&mut snapshot, error),
+            }
+        }
+    }
+    snapshot.models.clear();
+    snapshot.prices.clear();
+    snapshot.groups.clear();
+    scrub_secrets(
+        &mut snapshot,
+        trim_secret(request.user_credential),
+        Some(key),
+    );
+    snapshot.stale = !snapshot.errors.is_empty();
+    snapshot
+}
+
+fn trim_secret(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|value| !value.is_empty())
+}
+
+fn component_error(component: &str, code: &str) -> String {
+    format!("{component}.{code}")
+}
+
+fn same_origin(left: &reqwest::Url, right: &reqwest::Url) -> bool {
+    left.scheme() == right.scheme()
+        && left.host() == right.host()
+        && left.port_or_known_default() == right.port_or_known_default()
+}
+
+pub(crate) struct Fetched {
+    pub value: Value,
+}
+
+async fn get_json(
+    client: &reqwest::Client,
+    base: &reqwest::Url,
+    path: &str,
+    component: &str,
+    auth: Option<&str>,
+    new_api_user: Option<&str>,
+) -> Result<Fetched, String> {
+    get_json_query(client, base, path, component, auth, new_api_user, &[]).await
+}
+
+pub(crate) async fn get_json_query(
+    client: &reqwest::Client,
+    base: &reqwest::Url,
+    path: &str,
+    component: &str,
+    auth: Option<&str>,
+    new_api_user: Option<&str>,
+    query: &[(&str, &str)],
+) -> Result<Fetched, String> {
+    request_json(
+        client,
+        reqwest::Method::GET,
+        base,
+        path,
+        component,
+        auth,
+        new_api_user,
+        query,
+    )
+    .await
+}
+
+pub(crate) async fn post_json(
+    client: &reqwest::Client,
+    base: &reqwest::Url,
+    path: &str,
+    component: &str,
+    auth: Option<&str>,
+    new_api_user: Option<&str>,
+) -> Result<Fetched, String> {
+    request_json(
+        client,
+        reqwest::Method::POST,
+        base,
+        path,
+        component,
+        auth,
+        new_api_user,
+        &[],
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn request_json(
+    client: &reqwest::Client,
+    method: reqwest::Method,
+    base: &reqwest::Url,
+    path: &str,
+    component: &str,
+    auth: Option<&str>,
+    new_api_user: Option<&str>,
+    query: &[(&str, &str)],
+) -> Result<Fetched, String> {
+    let mut url = join_inference_endpoint(base.as_str(), path)
+        .map_err(|_| component_error(component, CODE_ENDPOINT))?;
+    if !query.is_empty() {
+        let mut pairs = url.query_pairs_mut();
+        for (key, value) in query {
+            pairs.append_pair(key, value);
+        }
+    }
+    if !same_origin(base, &url) {
+        return Err(component_error(component, CODE_ENDPOINT));
+    }
+
+    let mut builder = client
+        .request(method, url.clone())
+        .header(reqwest::header::ACCEPT, "application/json")
+        .timeout(REQUEST_TIMEOUT);
+    if let Some(token) = auth {
+        let value = HeaderValue::from_str(&format!("Bearer {token}"))
+            .map_err(|_| component_error(component, CODE_PARSE))?;
+        builder = builder.header(reqwest::header::AUTHORIZATION, value);
+    }
+    if let Some(user_id) = new_api_user {
+        let value =
+            HeaderValue::from_str(user_id).map_err(|_| component_error(component, CODE_PARSE))?;
+        builder = builder.header("New-Api-User", value);
+    }
+
+    let response = builder.send().await.map_err(|error| {
+        if error.is_timeout() {
+            component_error(component, CODE_TIMEOUT)
+        } else {
+            component_error(component, CODE_NETWORK)
+        }
+    })?;
+
+    if response.status().is_redirection() || !same_origin(&url, response.url()) {
+        return Err(component_error(component, CODE_REDIRECT));
+    }
+    let status = response.status();
+    let mut body = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|error| {
+            if error.is_timeout() {
+                component_error(component, CODE_TIMEOUT)
+            } else {
+                component_error(component, CODE_NETWORK)
+            }
+        })?;
+        if body.len().saturating_add(chunk.len()) > MAX_BODY_BYTES {
+            return Err(component_error(component, CODE_OVERSIZE));
+        }
+        body.extend_from_slice(&chunk);
+    }
+
+    match status {
+        StatusCode::OK | StatusCode::CREATED => {}
+        StatusCode::UNAUTHORIZED => {
+            return Err(classify_unauthorized(component, &body));
+        }
+        StatusCode::FORBIDDEN => return Err(component_error(component, CODE_FORBIDDEN)),
+        _ => return Err(component_error(component, CODE_HTTP_STATUS)),
+    }
+
+    let value: Value =
+        serde_json::from_slice(&body).map_err(|_| component_error(component, CODE_PARSE))?;
+    Ok(Fetched { value })
+}
+
+fn strip_bearer_prefix(value: &str) -> &str {
+    value
+        .strip_prefix("Bearer ")
+        .or_else(|| value.strip_prefix("bearer "))
+        .unwrap_or(value)
+        .trim()
+}
+
+/// New API v0.4.6+ PAT calls need `New-Api-User: <numeric id>` alongside Bearer.
+/// Store that as `userId:token`. Newer builds ignore the extra header.
+pub(crate) fn split_new_api_user_credential(raw: &str) -> (Option<&str>, &str) {
+    let raw = strip_bearer_prefix(raw.trim());
+    if let Some((id, token)) = raw.split_once(':') {
+        let id = id.trim();
+        let token = strip_bearer_prefix(token.trim());
+        if !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()) && !token.is_empty() {
+            return (Some(id), token);
+        }
+    }
+    (None, raw)
+}
+
+fn classify_unauthorized(component: &str, body: &[u8]) -> String {
+    let parsed = serde_json::from_slice::<Value>(body).ok();
+    let message = parsed
+        .as_ref()
+        .and_then(|value| json_str(value.get("message")))
+        .unwrap_or("");
+    let lower = message.to_ascii_lowercase();
+    let code = if message.contains("New-Api-User") || lower.contains("new-api-user") {
+        if lower.contains("match") || message.contains("不匹配") || message.contains("不符") {
+            CODE_USER_ID_MISMATCH
+        } else {
+            CODE_USER_ID_REQUIRED
+        }
+    } else {
+        CODE_UNAUTHORIZED
+    };
+    component_error(component, code)
+}
+
+fn payload(value: &Value) -> &Value {
+    value.get("data").unwrap_or(value)
+}
+
+pub(crate) fn new_api_data<'a>(value: &'a Value, component: &str) -> Result<&'a Value, String> {
+    match value.get("success") {
+        Some(Value::Bool(true)) => value
+            .get("data")
+            .ok_or_else(|| component_error(component, CODE_PARSE)),
+        _ => Err(component_error(component, CODE_PARSE)),
+    }
+}
+
+fn new_api_token_usage_data<'a>(value: &'a Value, component: &str) -> Result<&'a Value, String> {
+    match value.get("code") {
+        Some(Value::Bool(true)) => value
+            .get("data")
+            .filter(|value| value.is_object())
+            .ok_or_else(|| component_error(component, CODE_PARSE)),
+        _ => Err(component_error(component, CODE_PARSE)),
+    }
+}
+
+fn sub2_data<'a>(value: &'a Value, component: &str) -> Result<&'a Value, String> {
+    match json_i64(value.get("code")) {
+        Some(0) => value
+            .get("data")
+            .ok_or_else(|| component_error(component, CODE_PARSE)),
+        _ => Err(component_error(component, CODE_PARSE)),
+    }
+}
+
+fn models_rows<'a>(value: &'a Value, component: &str) -> Result<&'a Vec<Value>, String> {
+    let payload = payload(value);
+    payload
+        .as_array()
+        .or_else(|| payload.get("data").and_then(Value::as_array))
+        .or_else(|| value.get("data").and_then(Value::as_array))
+        .ok_or_else(|| component_error(component, CODE_PARSE))
+}
+
+fn json_f64(value: Option<&Value>) -> Option<f64> {
+    let value = value?;
+    let parsed: Option<f64> = match value {
+        Value::Null => None,
+        Value::Number(number) => number.as_f64(),
+        Value::String(text) => {
+            let text = text.trim();
+            if text.is_empty() {
+                None
+            } else {
+                text.parse().ok()
+            }
+        }
+        _ => None,
+    };
+    parsed.filter(|number| number.is_finite())
+}
+
+fn json_i64(value: Option<&Value>) -> Option<i64> {
+    let value = value?;
+    match value {
+        Value::Null => None,
+        Value::Number(number) => number.as_i64(),
+        Value::String(text) => text.trim().parse().ok(),
+        _ => None,
+    }
+}
+
+fn json_bool(value: Option<&Value>) -> Option<bool> {
+    match value? {
+        Value::Bool(flag) => Some(*flag),
+        _ => None,
+    }
+}
+
+fn json_str(value: Option<&Value>) -> Option<&str> {
+    value
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+}
+
+fn leaks_secret(text: &str, secrets: &[&str]) -> bool {
+    secrets
+        .iter()
+        .any(|secret| !secret.is_empty() && (text == *secret || text.contains(secret)))
+}
+
+fn snapshot_record_leaks<T: serde::Serialize>(record: &T, secrets: &[&str]) -> bool {
+    fn inspect(value: &Value, secrets: &[&str]) -> bool {
+        match value {
+            Value::String(text) => leaks_secret(text, secrets),
+            Value::Array(values) => values.iter().any(|v| inspect(v, secrets)),
+            Value::Object(values) => values.values().any(|v| inspect(v, secrets)),
+            _ => false,
+        }
+    }
+    serde_json::to_value(record).map_or(true, |value| inspect(&value, secrets))
+}
+
+fn scrub_secrets(snapshot: &mut PlatformSnapshot, user: Option<&str>, key: Option<&str>) {
+    let secrets: Vec<&str> = [user, key].into_iter().flatten().collect();
+    if secrets.is_empty() {
+        return;
+    }
+    let mut leaked = false;
+    snapshot.models.retain(|row| {
+        let safe = !snapshot_record_leaks(row, &secrets);
+        leaked |= !safe;
+        safe
+    });
+    snapshot.groups.retain(|row| {
+        let safe = !snapshot_record_leaks(row, &secrets);
+        leaked |= !safe;
+        safe
+    });
+    snapshot.quotas.retain(|row| {
+        let safe = !snapshot_record_leaks(row, &secrets);
+        leaked |= !safe;
+        safe
+    });
+    snapshot.prices.retain(|row| {
+        let safe = !snapshot_record_leaks(row, &secrets);
+        leaked |= !safe;
+        safe
+    });
+    if snapshot_record_leaks(&snapshot.billing_preference, &secrets) {
+        leaked = true;
+        snapshot.billing_preference = None;
+    }
+    if leaked {
+        push_error(snapshot, component_error("snapshot", CODE_SECRET));
+    }
+}
+fn push_error(snapshot: &mut PlatformSnapshot, error: String) {
+    if !snapshot.errors.iter().any(|existing| existing == &error) {
+        snapshot.errors.push(error);
+    }
+}
+
+async fn read_new_api(
+    client: &reqwest::Client,
+    base: &reqwest::Url,
+    request: &PlatformReadRequest<'_>,
+    user: Option<&str>,
+    key: Option<&str>,
+    snapshot: &mut PlatformSnapshot,
+) {
+    let (new_api_user, bearer) = match user {
+        Some(raw) => {
+            let (id, token) = split_new_api_user_credential(raw);
+            (id, Some(token))
+        }
+        None => (None, None),
+    };
+
+    let mut quota_per_unit: Option<f64> = None;
+    match get_json(client, base, "api/status", "new_api.status", None, None).await {
+        Ok(fetched) => match new_api_data(&fetched.value, "new_api.status") {
+            Ok(data) => {
+                quota_per_unit = json_f64(data.get("quota_per_unit")).filter(|value| *value > 0.0);
+            }
+            Err(error) => push_error(snapshot, error),
+        },
+        Err(error) => push_error(snapshot, error),
+    }
+
+    let mut user_group: Option<String> = None;
+    // A Key refresh must not read the site wallet. User-scoped endpoints stay
+    // on the parent refresh (no inference Key).
+    if let Some(user) = bearer
+        && key.is_none()
+    {
+        match get_json(
+            client,
+            base,
+            "api/user/self",
+            "new_api.user_self",
+            Some(user),
+            new_api_user,
+        )
+        .await
+        {
+            Ok(fetched) => match new_api_data(&fetched.value, "new_api.user_self") {
+                Ok(data) => parse_new_api_self(data, snapshot, &mut user_group, quota_per_unit),
+                Err(error) => push_error(snapshot, error),
+            },
+            Err(error) => push_error(snapshot, error),
+        }
+
+        match get_json(
+            client,
+            base,
+            "api/user/self/groups",
+            "new_api.user_groups",
+            Some(user),
+            new_api_user,
+        )
+        .await
+        {
+            Ok(fetched) => match new_api_data(&fetched.value, "new_api.user_groups") {
+                Ok(data) => {
+                    if let Err(error) = parse_new_api_groups(data, snapshot) {
+                        push_error(snapshot, error);
+                    }
+                }
+                Err(error) => push_error(snapshot, error),
+            },
+            Err(error) => push_error(snapshot, error),
+        }
+
+        match get_json(
+            client,
+            base,
+            "api/subscription/self",
+            "new_api.subscription_self",
+            Some(user),
+            new_api_user,
+        )
+        .await
+        {
+            Ok(fetched) => match new_api_data(&fetched.value, "new_api.subscription_self") {
+                Ok(data) => parse_new_api_subscriptions(data, snapshot, quota_per_unit),
+                Err(error) => push_error(snapshot, error),
+            },
+            Err(error) => push_error(snapshot, error),
+        }
+
+        // Optional catalog: older sites omit or change this envelope, so a
+        // fetch or envelope error is not recorded.
+        if let Ok(fetched) = get_json(
+            client,
+            base,
+            "api/token/auto-groups",
+            "new_api.token_auto_groups",
+            Some(user),
+            new_api_user,
+        )
+        .await
+            && let Ok(data) = new_api_data(&fetched.value, "new_api.token_auto_groups")
+        {
+            parse_new_api_auto_groups(data, snapshot);
+        }
+
+        // Optional: current UTC-month consume total. Missing or forked sites
+        // must not stale the wallet snapshot.
+        if let Some(start) = utc_month_start_secs(request.now) {
+            let start_s = start.to_string();
+            let end_s = request.now.to_string();
+            if let Ok(fetched) = get_json_query(
+                client,
+                base,
+                "api/log/self/stat",
+                "new_api.log_self_stat",
+                Some(user),
+                new_api_user,
+                &[
+                    ("type", "2"),
+                    ("start_timestamp", &start_s),
+                    ("end_timestamp", &end_s),
+                ],
+            )
+            .await
+                && let Ok(data) = new_api_data(&fetched.value, "new_api.log_self_stat")
+            {
+                parse_new_api_month_stat(data, snapshot, quota_per_unit);
+            }
+        }
+    }
+
+    let mut allowed_models: BTreeSet<String> = BTreeSet::new();
+    if let Some(key) = key {
+        match get_json(client, base, "v1/models", "new_api.models", Some(key), None).await {
+            Ok(fetched) => {
+                if let Err(error) = collect_models(
+                    &fetched.value,
+                    request.group.id.as_deref(),
+                    request.group.platform.as_deref(),
+                    SRC_V1_MODELS,
+                    "new_api.models",
+                    &mut allowed_models,
+                    snapshot,
+                ) {
+                    push_error(snapshot, error);
+                }
+            }
+            Err(error) => push_error(snapshot, error),
+        }
+
+        match get_json(
+            client,
+            base,
+            "api/usage/token/",
+            "new_api.token_usage",
+            Some(key),
+            None,
+        )
+        .await
+        {
+            Ok(fetched) => match new_api_token_usage_data(&fetched.value, "new_api.token_usage") {
+                Ok(data) => {
+                    parse_new_api_token_usage(data, &mut allowed_models, snapshot, quota_per_unit)
+                }
+                Err(error) => push_error(snapshot, error),
+            },
+            Err(error) => push_error(snapshot, error),
+        }
+    }
+    let _ = (bearer, new_api_user, request, user_group, quota_per_unit);
+}
+
+/// New API stores wallet/token amounts as integer quota points. The site
+/// `quota_per_unit` (typically 500000) is the observed points-per-dollar rate
+/// from `GET /api/status`. Convert when that rate is known so remaining is a
+/// dollar balance; otherwise keep the native `quota` unit.
+fn scale_new_api_quota(value: Option<f64>, quota_per_unit: Option<f64>) -> Option<f64> {
+    match (value, quota_per_unit) {
+        (Some(raw), Some(unit)) if unit > 0.0 && raw.is_finite() => Some(raw / unit),
+        (Some(raw), _) if raw.is_finite() => Some(raw),
+        _ => None,
+    }
+}
+
+fn new_api_quota_unit(quota_per_unit: Option<f64>) -> &'static str {
+    if quota_per_unit.filter(|unit| *unit > 0.0).is_some() {
+        "usd"
+    } else {
+        "quota"
+    }
+}
+
+fn utc_month_start_secs(now: i64) -> Option<i64> {
+    let dt = DateTime::from_timestamp(now, 0)?;
+    Utc.with_ymd_and_hms(dt.year(), dt.month(), 1, 0, 0, 0)
+        .single()
+        .map(|start| start.timestamp())
+}
+
+fn parse_new_api_month_stat(
+    data: &Value,
+    snapshot: &mut PlatformSnapshot,
+    quota_per_unit: Option<f64>,
+) {
+    let Some(used) = scale_new_api_quota(json_f64(data.get("quota")), quota_per_unit) else {
+        return;
+    };
+    snapshot.quotas.push(PlatformQuota {
+        kind: PlatformQuotaKind::Wallet,
+        scope_id: "wallet:month".to_string(),
+        unit: new_api_quota_unit(quota_per_unit).to_string(),
+        used: Some(used),
+        remaining: None,
+        limit: None,
+        unlimited: false,
+        period: Some("month".to_string()),
+        resets_at: None,
+        expires_at: None,
+        source: "new_api.log_self_stat".to_string(),
+    });
+}
+
+fn parse_new_api_self(
+    data: &Value,
+    snapshot: &mut PlatformSnapshot,
+    user_group: &mut Option<String>,
+    quota_per_unit: Option<f64>,
+) {
+    if !data.is_object() {
+        push_error(snapshot, component_error("new_api.user_self", CODE_PARSE));
+        return;
+    }
+    if let Some(group) = json_str(data.get("group")) {
+        *user_group = Some(group.to_string());
+        if !snapshot
+            .groups
+            .iter()
+            .any(|item| item.id.as_deref() == Some(group))
+        {
+            snapshot.groups.push(PlatformGroup {
+                subscription_type: None,
+                id: Some(group.to_string()),
+                platform: None,
+                auto_groups: Vec::new(),
+                verified: true,
+            });
+        }
+    }
+
+    let remaining = scale_new_api_quota(json_f64(data.get("quota")), quota_per_unit);
+    let used = scale_new_api_quota(json_f64(data.get("used_quota")), quota_per_unit);
+    if remaining.is_some() || used.is_some() {
+        snapshot.quotas.push(PlatformQuota {
+            kind: PlatformQuotaKind::Wallet,
+            scope_id: "wallet".to_string(),
+            unit: new_api_quota_unit(quota_per_unit).to_string(),
+            used,
+            remaining,
+            // Wallet balance + lifetime consumption is not an observed limit.
+            limit: None,
+            unlimited: false,
+            period: None,
+            resets_at: None,
+            expires_at: None,
+            source: "new_api.user_self".to_string(),
+        });
+    }
+}
+
+fn parse_new_api_groups(data: &Value, snapshot: &mut PlatformSnapshot) -> Result<(), String> {
+    let Some(map) = data.as_object() else {
+        return Err(component_error("new_api.user_groups", CODE_PARSE));
+    };
+    for (name, _meta) in map {
+        let auto = name == "auto";
+        if !snapshot
+            .groups
+            .iter()
+            .any(|item| item.id.as_deref() == Some(name))
+        {
+            snapshot.groups.push(PlatformGroup {
+                subscription_type: None,
+                id: Some(name.clone()),
+                platform: None,
+                auto_groups: Vec::new(),
+                verified: !auto,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn parse_new_api_auto_groups(data: &Value, snapshot: &mut PlatformSnapshot) {
+    let groups = data
+        .get("groups")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let auto: Vec<String> = groups
+        .iter()
+        .filter_map(|value| json_str(Some(value)).map(str::to_string))
+        .collect();
+    if auto.is_empty() {
+        return;
+    }
+    if let Some(existing) = snapshot
+        .groups
+        .iter_mut()
+        .find(|group| group.id.as_deref() == Some("auto"))
+    {
+        existing.auto_groups = auto;
+        existing.verified = true;
+        return;
+    }
+    snapshot.groups.push(PlatformGroup {
+        subscription_type: None,
+        id: Some("auto".to_string()),
+        platform: None,
+        auto_groups: auto,
+        verified: true,
+    });
+}
+
+fn parse_new_api_subscriptions(
+    data: &Value,
+    snapshot: &mut PlatformSnapshot,
+    quota_per_unit: Option<f64>,
+) {
+    if !data.is_object() {
+        push_error(
+            snapshot,
+            component_error("new_api.subscription_self", CODE_PARSE),
+        );
+        return;
+    }
+    snapshot.billing_preference = json_str(data.get("billing_preference")).map(str::to_string);
+
+    let mut overflow: Option<bool> = None;
+    if let Some(items) = data.get("subscriptions").and_then(Value::as_array) {
+        for item in items {
+            let sub = item.get("subscription").unwrap_or(item);
+            let scope = json_i64(sub.get("id"))
+                .map(|id| id.to_string())
+                .or_else(|| json_str(sub.get("id")).map(str::to_string))
+                .unwrap_or_else(|| "subscription".to_string());
+            let total = scale_new_api_quota(json_f64(sub.get("amount_total")), quota_per_unit);
+            let used = scale_new_api_quota(json_f64(sub.get("amount_used")), quota_per_unit);
+            let remaining = match (total, used) {
+                (Some(total), Some(used)) => Some(total - used),
+                _ => None,
+            };
+            let unlimited = total == Some(0.0);
+            snapshot.quotas.push(PlatformQuota {
+                kind: PlatformQuotaKind::Subscription,
+                scope_id: scope,
+                unit: new_api_quota_unit(quota_per_unit).to_string(),
+                used,
+                remaining: if unlimited { None } else { remaining },
+                limit: if unlimited { None } else { total },
+                unlimited,
+                period: json_str(sub.get("quota_reset_period")).map(str::to_string),
+                resets_at: json_i64(sub.get("next_reset_time")).filter(|ts| *ts > 0),
+                expires_at: json_i64(sub.get("end_time")).filter(|ts| *ts > 0),
+                source: "new_api.subscription_self".to_string(),
+            });
+            if let Some(flag) = json_bool(sub.get("allow_wallet_overflow")) {
+                overflow = Some(overflow.unwrap_or(true) && flag);
+            }
+        }
+    }
+    if overflow.is_some() {
+        snapshot.wallet_overflow = overflow;
+    }
+}
+
+fn parse_new_api_token_usage(
+    data: &Value,
+    allowed_models: &mut BTreeSet<String>,
+    snapshot: &mut PlatformSnapshot,
+    quota_per_unit: Option<f64>,
+) {
+    let unlimited = json_bool(data.get("unlimited_quota")).unwrap_or(false);
+    let used = scale_new_api_quota(json_f64(data.get("total_used")), quota_per_unit);
+    let remaining = scale_new_api_quota(json_f64(data.get("total_available")), quota_per_unit);
+    let granted = scale_new_api_quota(json_f64(data.get("total_granted")), quota_per_unit);
+    snapshot.quotas.push(PlatformQuota {
+        kind: PlatformQuotaKind::KeyLimit,
+        scope_id: json_str(data.get("name")).unwrap_or("key").to_string(),
+        unit: new_api_quota_unit(quota_per_unit).to_string(),
+        used,
+        remaining: if unlimited { None } else { remaining },
+        limit: if unlimited { None } else { granted },
+        unlimited,
+        period: None,
+        resets_at: None,
+        expires_at: json_i64(data.get("expires_at")).filter(|ts| *ts > 0),
+        source: "new_api.token_usage".to_string(),
+    });
+    if let Some(group) = json_str(data.get("group"))
+        && !snapshot
+            .groups
+            .iter()
+            .any(|item| item.id.as_deref() == Some(group))
+    {
+        snapshot.groups.push(PlatformGroup {
+            subscription_type: None,
+            id: Some(group.to_string()),
+            platform: None,
+            auto_groups: Vec::new(),
+            verified: true,
+        });
+    }
+
+    if json_bool(data.get("model_limits_enabled")) == Some(true) {
+        if let Some(limits) = data.get("model_limits").and_then(Value::as_object) {
+            for (model, allowed) in limits {
+                if allowed.as_bool() == Some(true) {
+                    allowed_models.insert(model.clone());
+                }
+            }
+        }
+        for model in allowed_models.iter() {
+            if snapshot.models.iter().any(|item| item.id == *model) {
+                continue;
+            }
+            snapshot.models.push(PlatformModel {
+                id: model.clone(),
+                platform: None,
+                group_id: None,
+                source: SRC_TOKEN_LIMITS.to_string(),
+            });
+        }
+    }
+}
+
+fn collect_models(
+    value: &Value,
+    group_id: Option<&str>,
+    platform: Option<&str>,
+    source: &str,
+    component: &str,
+    allowed: &mut BTreeSet<String>,
+    snapshot: &mut PlatformSnapshot,
+) -> Result<(), String> {
+    let rows = models_rows(value, component)?;
+    for row in rows {
+        let id = json_str(Some(row))
+            .or_else(|| json_str(row.get("id")))
+            .or_else(|| json_str(row.get("name")))
+            .map(str::to_string);
+        let Some(id) = id else {
+            continue;
+        };
+        if !allowed.insert(id.clone()) {
+            continue;
+        }
+        snapshot.models.push(PlatformModel {
+            id,
+            platform: json_str(row.get("platform"))
+                .or_else(|| json_str(row.get("owned_by")))
+                .or(platform)
+                .map(str::to_string),
+            group_id: group_id.map(str::to_string),
+            source: source.to_string(),
+        });
+    }
+    Ok(())
+}
+
+async fn read_sub2(
+    client: &reqwest::Client,
+    base: &reqwest::Url,
+    request: &PlatformReadRequest<'_>,
+    user: Option<&str>,
+    key: Option<&str>,
+    snapshot: &mut PlatformSnapshot,
+) {
+    let mut allowed_models: BTreeSet<String> = BTreeSet::new();
+
+    if let Some(user) = user
+        && key.is_none()
+    {
+        match get_json(
+            client,
+            base,
+            "api/v1/user/profile",
+            "sub2api.profile",
+            Some(user),
+            None,
+        )
+        .await
+        {
+            Ok(fetched) => match sub2_data(&fetched.value, "sub2api.profile") {
+                Ok(data) => parse_sub2_profile(data, snapshot),
+                Err(error) => push_error(snapshot, error),
+            },
+            Err(error) => push_error(snapshot, error),
+        }
+
+        match get_json(
+            client,
+            base,
+            "api/v1/subscriptions/summary",
+            "sub2api.subscriptions",
+            Some(user),
+            None,
+        )
+        .await
+        {
+            Ok(fetched) => match sub2_data(&fetched.value, "sub2api.subscriptions") {
+                Ok(data) => parse_sub2_subscriptions(data, snapshot),
+                Err(error) => push_error(snapshot, error),
+            },
+            Err(error) => push_error(snapshot, error),
+        }
+
+        match get_json(
+            client,
+            base,
+            "api/v1/groups/available",
+            "sub2api.groups",
+            Some(user),
+            None,
+        )
+        .await
+        {
+            Ok(fetched) => match sub2_data(&fetched.value, "sub2api.groups") {
+                Ok(data) => parse_sub2_groups(data, snapshot),
+                Err(error) => push_error(snapshot, error),
+            },
+            Err(error) => push_error(snapshot, error),
+        }
+    }
+
+    if let Some(key) = key {
+        match get_json(client, base, "v1/models", "sub2api.models", Some(key), None).await {
+            Ok(fetched) => {
+                if let Err(error) = collect_models(
+                    &fetched.value,
+                    request.group.id.as_deref(),
+                    request.group.platform.as_deref(),
+                    SRC_V1_MODELS,
+                    "sub2api.models",
+                    &mut allowed_models,
+                    snapshot,
+                ) {
+                    push_error(snapshot, error);
+                }
+            }
+            Err(error) => push_error(snapshot, error),
+        }
+
+        match get_json(client, base, "v1/usage", "sub2api.usage", Some(key), None).await {
+            Ok(fetched) => {
+                if let Err(error) = parse_sub2_usage(&fetched.value, snapshot) {
+                    push_error(snapshot, error);
+                }
+            }
+            Err(error) => push_error(snapshot, error),
+        }
+    }
+    let _ = (user, request, allowed_models);
+}
+
+fn parse_sub2_profile(data: &Value, snapshot: &mut PlatformSnapshot) {
+    if !data.is_object() {
+        push_error(snapshot, component_error("sub2api.profile", CODE_PARSE));
+        return;
+    }
+    let remaining = json_f64(data.get("balance"));
+    if remaining.is_none() && data.get("balance").is_none() {
+        push_error(snapshot, component_error("sub2api.profile", CODE_PARSE));
+        return;
+    }
+    snapshot.quotas.push(PlatformQuota {
+        kind: PlatformQuotaKind::Wallet,
+        scope_id: "wallet".to_string(),
+        unit: "usd".to_string(),
+        used: None,
+        remaining,
+        limit: None,
+        unlimited: false,
+        period: None,
+        resets_at: None,
+        expires_at: None,
+        source: "sub2api.user.profile".to_string(),
+    });
+}
+
+fn parse_sub2_usage(value: &Value, snapshot: &mut PlatformSnapshot) -> Result<(), String> {
+    let mode =
+        json_str(value.get("mode")).ok_or_else(|| component_error("sub2api.usage", CODE_PARSE))?;
+    match mode {
+        "quota_limited" => {
+            let absent = Value::Null;
+            let quota = value
+                .get("quota")
+                .filter(|value| value.is_object())
+                .unwrap_or(&absent);
+            snapshot.quotas.push(PlatformQuota {
+                kind: PlatformQuotaKind::KeyLimit,
+                scope_id: "key".to_string(),
+                unit: json_str(quota.get("unit"))
+                    .or_else(|| json_str(value.get("unit")))
+                    .unwrap_or("usd")
+                    .to_ascii_lowercase(),
+                used: json_f64(quota.get("used"))
+                    .or_else(|| json_f64(value.pointer("/usage/total/actual_cost"))),
+                remaining: json_f64(quota.get("remaining"))
+                    .or_else(|| json_f64(value.get("remaining"))),
+                limit: json_f64(quota.get("limit")),
+                unlimited: false,
+                period: None,
+                resets_at: None,
+                expires_at: json_str(value.get("expires_at")).and_then(parse_rfc3339_secs),
+                source: "sub2api.v1.usage".to_string(),
+            });
+            if let Some(windows) = value.get("rate_limits").and_then(Value::as_array) {
+                for window in windows {
+                    let period = json_str(window.get("window")).map(str::to_string);
+                    snapshot.quotas.push(PlatformQuota {
+                        kind: PlatformQuotaKind::KeyLimit,
+                        scope_id: format!("key:{}", period.as_deref().unwrap_or("window")),
+                        unit: "usd".into(),
+                        used: json_f64(window.get("used")),
+                        remaining: json_f64(window.get("remaining")),
+                        limit: json_f64(window.get("limit")),
+                        unlimited: false,
+                        period,
+                        resets_at: json_str(window.get("reset_at")).and_then(parse_rfc3339_secs),
+                        expires_at: None,
+                        source: "sub2api.v1.usage".into(),
+                    });
+                }
+            }
+            Ok(())
+        }
+        "unrestricted" => {
+            snapshot.quotas.push(PlatformQuota {
+                kind: PlatformQuotaKind::KeyLimit,
+                scope_id: "key".into(),
+                unit: "usd".into(),
+                used: json_f64(value.pointer("/usage/total/actual_cost")),
+                remaining: None,
+                limit: None,
+                unlimited: true,
+                period: None,
+                resets_at: None,
+                expires_at: None,
+                source: "sub2api.v1.usage".into(),
+            });
+            if let Some(subscription) = value.get("subscription").filter(|v| v.is_object()) {
+                for period in ["daily", "weekly", "monthly"] {
+                    let used = json_f64(subscription.get(format!("{period}_usage_usd")));
+                    let limit = json_f64(subscription.get(format!("{period}_limit_usd")));
+                    if used.is_none() && limit.is_none() {
+                        continue;
+                    }
+                    snapshot.quotas.push(PlatformQuota {
+                        kind: PlatformQuotaKind::Subscription,
+                        scope_id: format!("key_subscription:{period}"),
+                        unit: "usd".into(),
+                        used,
+                        limit,
+                        remaining: limit.zip(used).map(|(l, u)| l - u),
+                        unlimited: false,
+                        period: Some(period.into()),
+                        resets_at: if period == "weekly" {
+                            json_str(subscription.get("weekly_window_start"))
+                                .and_then(parse_rfc3339_secs)
+                                .map(|t| t + 7 * 86400)
+                        } else {
+                            None
+                        },
+                        expires_at: json_str(subscription.get("expires_at"))
+                            .and_then(parse_rfc3339_secs),
+                        source: "sub2api.v1.usage".into(),
+                    });
+                }
+                return Ok(());
+            }
+            if snapshot.quotas.iter().any(|quota| {
+                matches!(quota.kind, PlatformQuotaKind::Wallet)
+                    && quota.source == "sub2api.v1.usage"
+            }) {
+                return Ok(());
+            }
+            // Subscription mode may expose a limiting-window `remaining` too.
+            // Only the explicit `balance` field proves a wallet observation.
+            let remaining = json_f64(value.get("balance"));
+            if remaining.is_none() {
+                return Ok(());
+            }
+            snapshot.quotas.push(PlatformQuota {
+                kind: PlatformQuotaKind::Wallet,
+                scope_id: "wallet".to_string(),
+                unit: json_str(value.get("unit"))
+                    .unwrap_or("usd")
+                    .to_ascii_lowercase(),
+                used: None,
+                remaining,
+                limit: None,
+                unlimited: false,
+                period: None,
+                resets_at: None,
+                expires_at: None,
+                source: "sub2api.v1.usage".to_string(),
+            });
+            Ok(())
+        }
+        _ => Err(component_error("sub2api.usage", CODE_PARSE)),
+    }
+}
+
+fn parse_sub2_subscriptions(data: &Value, snapshot: &mut PlatformSnapshot) {
+    if !data.is_object() {
+        push_error(
+            snapshot,
+            component_error("sub2api.subscriptions", CODE_PARSE),
+        );
+        return;
+    }
+    let items = data
+        .get("subscriptions")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    for item in items {
+        let scope = json_i64(item.get("id"))
+            .map(|id| id.to_string())
+            .or_else(|| json_str(item.get("id")).map(str::to_string))
+            .unwrap_or_else(|| "subscription".to_string());
+        let expires = json_str(item.get("expires_at")).and_then(parse_rfc3339_secs);
+        for (period, used_key, limit_key) in [
+            ("daily", "daily_used_usd", "daily_limit_usd"),
+            ("weekly", "weekly_used_usd", "weekly_limit_usd"),
+            ("monthly", "monthly_used_usd", "monthly_limit_usd"),
+        ] {
+            let used = json_f64(item.get(used_key));
+            let limit = json_f64(item.get(limit_key));
+            if used.is_none() && limit.is_none() {
+                continue;
+            }
+            let remaining = match (limit, used) {
+                (Some(limit), Some(used)) => Some(limit - used),
+                _ => None,
+            };
+            snapshot.quotas.push(PlatformQuota {
+                kind: PlatformQuotaKind::Subscription,
+                scope_id: format!("{scope}:{period}"),
+                unit: "usd".to_string(),
+                used,
+                remaining,
+                limit,
+                unlimited: false,
+                period: Some(period.to_string()),
+                resets_at: None,
+                expires_at: expires,
+                source: "sub2api.subscriptions.summary".to_string(),
+            });
+        }
+        if let Some(name) = json_str(item.get("group_name")) {
+            let id = json_i64(item.get("group_id")).map(|id| id.to_string());
+            if !snapshot
+                .groups
+                .iter()
+                .any(|group| group.id == id || group.id.as_deref() == Some(name))
+            {
+                snapshot.groups.push(PlatformGroup {
+                    subscription_type: None,
+                    id: id.or_else(|| Some(name.to_string())),
+                    platform: None,
+                    auto_groups: Vec::new(),
+                    verified: true,
+                });
+            }
+        }
+    }
+}
+
+fn parse_sub2_groups(data: &Value, snapshot: &mut PlatformSnapshot) {
+    let rows = data
+        .as_array()
+        .or_else(|| data.get("items").and_then(Value::as_array));
+    let Some(rows) = rows else {
+        push_error(snapshot, component_error("sub2api.groups", CODE_PARSE));
+        return;
+    };
+    for row in rows {
+        let id = json_i64(row.get("id"))
+            .map(|id| id.to_string())
+            .or_else(|| json_str(row.get("id")).map(str::to_string))
+            .or_else(|| json_str(row.get("name")).map(str::to_string));
+        let platform = json_str(row.get("platform")).map(str::to_string);
+        if let Some(existing) = snapshot.groups.iter_mut().find(|group| group.id == id) {
+            if existing.platform.is_none() {
+                existing.platform = platform;
+            }
+            existing.verified = true;
+            existing.subscription_type = json_str(row.get("subscription_type")).map(str::to_string);
+            continue;
+        }
+        snapshot.groups.push(PlatformGroup {
+            subscription_type: json_str(row.get("subscription_type")).map(str::to_string),
+            id,
+            platform,
+            auto_groups: Vec::new(),
+            verified: true,
+        });
+    }
+}
+
+fn parse_rfc3339_secs(value: &str) -> Option<i64> {
+    chrono::DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|dt| dt.timestamp())
+}

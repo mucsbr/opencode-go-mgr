@@ -2,7 +2,7 @@ use super::*;
 use crate::custom::CustomAccountRuntime;
 use crate::kernel::ids::{
     COMMAND_CODE_GOAT_DEEPSEEK_V4_FLASH_UPSTREAM, KIMI_PROVIDER_ID, MINIMAX_PROVIDER_ID,
-    OPENCODE_ZEN_FREE_PROVIDER_ID,
+    OPENCODE_PROVIDER_ID, OPENCODE_ZEN_FREE_PROVIDER_ID,
 };
 use crate::models::{AccountCustomConfig, AccountModelCapability};
 use crate::provider::ConnectionVerificationStatus;
@@ -15,8 +15,70 @@ fn zen_seed() -> ZenFreeModelCatalog {
     ZenFreeModelCatalog::default()
 }
 
+fn persist_catalog(persisted: &mut PersistedContracts, provider_id: &str, models: &[&str]) {
+    let now = Utc::now();
+    let scope = ContractScope::provider(provider_id);
+    persisted.scopes.insert(
+        scope.clone(),
+        PersistedScopeRow {
+            scope,
+            catalog_models: models.iter().map(|model| (*model).to_string()).collect(),
+            catalog_refreshed_at: Some(now),
+            catalog_source: "test".into(),
+            catalog_source_url: "https://example.test/models".into(),
+            revision: 1,
+            updated_at: now,
+        },
+    );
+}
+
+fn persist_official_docs(
+    persisted: &mut PersistedContracts,
+    provider_id: &str,
+    pairs: &[(&str, UpstreamProtocolKind)],
+) {
+    let scope = ContractScope::provider(provider_id);
+    persisted.evidence.insert(
+        scope.clone(),
+        pairs
+            .iter()
+            .map(|(model_id, protocol)| PersistedModelProtocol {
+                scope: scope.clone(),
+                model_id: (*model_id).into(),
+                protocol: *protocol,
+                source: ContractEvidenceSource::Static,
+                verified_at: None,
+                observed_at: None,
+                last_probe_result: None,
+                last_probe_at: None,
+                last_probe_error: None,
+            })
+            .collect(),
+    );
+}
+
+fn standard_go_persisted() -> PersistedContracts {
+    let mut persisted = empty_persisted();
+    persist_catalog(
+        &mut persisted,
+        OPENCODE_PROVIDER_ID,
+        &["glm-5.2", "glm-5.3", "grok-4.5", "grok-4.6"],
+    );
+    persist_official_docs(
+        &mut persisted,
+        OPENCODE_PROVIDER_ID,
+        &[
+            ("glm-5.2", UpstreamProtocolKind::ChatCompletions),
+            ("glm-5.3", UpstreamProtocolKind::ChatCompletions),
+            ("grok-4.5", UpstreamProtocolKind::Responses),
+            ("grok-4.6", UpstreamProtocolKind::Responses),
+        ],
+    );
+    persisted
+}
+
 fn go_contract() -> EffectiveScopeContract {
-    build_effective_contracts(&zen_seed(), &[], empty_persisted())
+    build_effective_contracts(&zen_seed(), &[], standard_go_persisted())
         .providers
         .remove(OPENCODE_PROVIDER_ID)
         .unwrap()
@@ -45,13 +107,12 @@ fn provider_scopes_identify_one_exact_registered_offering() {
             .expect("effective provider scope must identify a registered offering");
         assert_eq!(descriptor.kind, contract.adapter_kind);
         assert_eq!(descriptor.provider_id, contract.provider_id);
-        assert_eq!(descriptor.provider_id, contract.provider_id);
     }
     assert!(ContractScope::parse("provider", "unknown-scope").is_err());
 }
 
 #[test]
-fn probe_success_adds_inside_ceiling_and_failure_does_not_remove_static() {
+fn connection_test_records_observation_without_changing_protocol_configuration() {
     let now = Utc::now();
     let scope = ContractScope::provider(OPENCODE_PROVIDER_ID);
     let static_row = PersistedModelProtocol {
@@ -91,7 +152,9 @@ fn probe_success_adds_inside_ceiling_and_failure_does_not_remove_static() {
         true,
     )
     .unwrap();
-    assert_eq!(added.source, ContractEvidenceSource::ProbeConfirmed);
+    assert_eq!(added.source, ContractEvidenceSource::ProbeObserved);
+    assert!(!added.source.confers_support());
+    assert_eq!(added.last_probe_result, Some(ProbeResultKind::Success));
 
     let rejected = apply_probe_observation(
         None,
@@ -113,7 +176,7 @@ fn opencode_ceiling_is_constructable_paths_not_static_model_protocols() {
     assert!(grok_ceiling.contains(&UpstreamProtocolKind::ChatCompletions));
     assert!(grok_ceiling.contains(&UpstreamProtocolKind::Responses));
     assert!(grok_ceiling.contains(&UpstreamProtocolKind::Messages));
-    assert_eq!(grok_static, vec![UpstreamProtocolKind::Responses]);
+    assert_eq!(grok_static, Vec::<UpstreamProtocolKind>::new());
     assert!(probe_may_add(
         probe_for(OPENCODE_PROVIDER_ID),
         "grok-4.5",
@@ -151,68 +214,430 @@ fn opencode_ceiling_is_constructable_paths_not_static_model_protocols() {
             "new-catalog-model",
             UpstreamProtocolKind::Messages,
         ));
-        assert!(!probe_may_add(
-            probe_for(provider_id),
-            "new-catalog-model",
-            UpstreamProtocolKind::Responses,
-        ));
     }
+    assert!(probe_may_add(
+        probe_for(MINIMAX_PROVIDER_ID),
+        "new-catalog-model",
+        UpstreamProtocolKind::Responses,
+    ));
+    assert!(!probe_may_add(
+        probe_for(KIMI_PROVIDER_ID),
+        "new-catalog-model",
+        UpstreamProtocolKind::Responses,
+    ));
 }
 
 #[test]
-fn unknown_zen_free_catalog_row_defaults_to_chat_and_honors_force_off() {
+fn unknown_zen_free_catalog_row_requires_explicit_protocol_enablement() {
     let catalog = ZenFreeModelCatalog {
         models: vec!["brand-new-promo-free".into()],
         refreshed_at: None,
         source_url: crate::kernel::zen::ZEN_MODELS_SOURCE_URL.to_string(),
     };
-    let set = build_effective_contracts(&catalog, &[], empty_persisted());
+    let mut persisted = empty_persisted();
+    let scope = ContractScope::provider(OPENCODE_ZEN_FREE_PROVIDER_ID);
+    // A catalog ID and the non-null preferred-protocol placeholder are not
+    // protocol evidence. Auto must remain off, including after a ForceOn reset.
+    for state in [
+        ProtocolOverrideState::Auto,
+        ProtocolOverrideState::ForceOn,
+        ProtocolOverrideState::ForceOff,
+        ProtocolOverrideState::Auto,
+    ] {
+        persisted.overrides.insert(
+            scope.clone(),
+            vec![PersistedModelProtocolOverride {
+                scope: scope.clone(),
+                model_id: "brand-new-promo-free".into(),
+                protocol: UpstreamProtocolKind::ChatCompletions,
+                state,
+                updated_at: Utc::now(),
+            }],
+        );
+        let set = build_effective_contracts(&catalog, &[], persisted.clone());
+        let zen = set.providers.get(OPENCODE_ZEN_FREE_PROVIDER_ID).unwrap();
+        let model = zen.model("brand-new-promo-free").unwrap();
+        let chat = model.protocols.get("chat_completions").unwrap();
+        let explicitly_enabled = state == ProtocolOverrideState::ForceOn;
+        assert_eq!(
+            model.preferred_protocol,
+            UpstreamProtocolKind::ChatCompletions
+        );
+        assert_eq!(chat.r#override, state);
+        assert_eq!(chat.available, explicitly_enabled);
+        assert_eq!(chat.enabled, explicitly_enabled);
+        assert_eq!(model.routable, explicitly_enabled);
+        let selected =
+            select_upstream_protocol(zen, ApiFormat::ChatCompletions, "brand-new-promo-free");
+        if explicitly_enabled {
+            assert_eq!(selected.unwrap(), ApiFormat::ChatCompletions);
+            assert_eq!(
+                model.enabled_protocols(),
+                vec![UpstreamProtocolKind::ChatCompletions]
+            );
+        } else {
+            assert!(selected.is_err());
+            assert!(model.enabled_protocols().is_empty());
+        }
+    }
+}
+
+fn zen_snapshot(models: &[&str]) -> ZenFreeModelCatalog {
+    ZenFreeModelCatalog {
+        models: models.iter().map(|model| (*model).to_string()).collect(),
+        refreshed_at: Some(Utc::now()),
+        source_url: crate::kernel::zen::ZEN_MODELS_SOURCE_URL.to_string(),
+    }
+}
+
+#[test]
+fn explicit_empty_zen_catalog_does_not_resurrect_snapshot_models() {
+    let snapshot = zen_snapshot(&["review-model-free", "second-free"]);
+    let mut persisted = empty_persisted();
+    persist_catalog(&mut persisted, OPENCODE_ZEN_FREE_PROVIDER_ID, &[]);
+    let set = build_effective_contracts(&snapshot, &[], persisted);
     let zen = set.providers.get(OPENCODE_ZEN_FREE_PROVIDER_ID).unwrap();
-    let model = zen.model("brand-new-promo-free").unwrap();
-    let chat = model.protocols.get("chat_completions").unwrap();
+    assert!(zen.catalog.models.is_empty());
+    assert!(zen.model("review-model-free").is_none());
+    assert!(zen.model("second-free").is_none());
+    assert!(!zen.model_has_enabled_protocol("review-model-free"));
+}
+
+#[test]
+fn deleting_last_zen_model_keeps_persisted_empty_catalog() {
+    let snapshot = zen_snapshot(&["review-model-free"]);
+    let mut persisted = empty_persisted();
+    persist_catalog(
+        &mut persisted,
+        OPENCODE_ZEN_FREE_PROVIDER_ID,
+        &["review-model-free"],
+    );
+    persist_catalog(&mut persisted, OPENCODE_ZEN_FREE_PROVIDER_ID, &[]);
+    let set = build_effective_contracts(&snapshot, &[], persisted);
+    let zen = set.providers.get(OPENCODE_ZEN_FREE_PROVIDER_ID).unwrap();
+    assert!(zen.catalog.models.is_empty());
+    assert!(zen.model("review-model-free").is_none());
+    assert!(!zen.model_has_enabled_protocol("review-model-free"));
+}
+
+#[test]
+fn placeholder_empty_zen_scope_still_uses_snapshot_until_a_catalog_is_saved() {
+    let snapshot = zen_snapshot(&["review-model-free"]);
+    let mut persisted = empty_persisted();
+    let scope = ContractScope::provider(OPENCODE_ZEN_FREE_PROVIDER_ID);
+    persisted.scopes.insert(
+        scope.clone(),
+        PersistedScopeRow {
+            scope,
+            catalog_models: Vec::new(),
+            catalog_refreshed_at: None,
+            catalog_source: String::new(),
+            catalog_source_url: String::new(),
+            revision: 1,
+            updated_at: Utc::now(),
+        },
+    );
+    let set = build_effective_contracts(&snapshot, &[], persisted);
+    let zen = set.providers.get(OPENCODE_ZEN_FREE_PROVIDER_ID).unwrap();
+    assert_eq!(zen.catalog.models, vec!["review-model-free"]);
+    assert!(
+        zen.model("review-model-free")
+            .is_some_and(|model| { model.enabled_protocols().is_empty() && !model.routable })
+    );
+}
+
+#[test]
+fn zen_official_static_responses_and_messages_are_admitted_probe_rows_are_not() {
+    let snapshot = zen_snapshot(&["review-model-free", "messages-model-free"]);
+    let mut persisted = empty_persisted();
+    persist_catalog(
+        &mut persisted,
+        OPENCODE_ZEN_FREE_PROVIDER_ID,
+        &["review-model-free", "messages-model-free"],
+    );
+    persist_official_docs(
+        &mut persisted,
+        OPENCODE_ZEN_FREE_PROVIDER_ID,
+        &[
+            ("review-model-free", UpstreamProtocolKind::Responses),
+            ("messages-model-free", UpstreamProtocolKind::Messages),
+        ],
+    );
+    let scope = ContractScope::provider(OPENCODE_ZEN_FREE_PROVIDER_ID);
+    persisted
+        .evidence
+        .entry(scope.clone())
+        .or_default()
+        .push(PersistedModelProtocol {
+            scope,
+            model_id: "review-model-free".into(),
+            protocol: UpstreamProtocolKind::Messages,
+            source: ContractEvidenceSource::ProbeObserved,
+            verified_at: None,
+            observed_at: Some(Utc::now()),
+            last_probe_result: Some(ProbeResultKind::Success),
+            last_probe_at: Some(Utc::now()),
+            last_probe_error: None,
+        });
+
+    let descriptor = provider_scope_descriptor(OPENCODE_ZEN_FREE_PROVIDER_ID).unwrap();
+    let evidence = persisted
+        .evidence
+        .get(&ContractScope::provider(OPENCODE_ZEN_FREE_PROVIDER_ID))
+        .cloned()
+        .unwrap_or_default();
+    let responses_admitted = admitted_protocols(
+        descriptor.kind,
+        descriptor.protocol_probe,
+        "review-model-free",
+        &evidence,
+    );
+    assert!(responses_admitted.contains(&UpstreamProtocolKind::ChatCompletions));
+    assert!(responses_admitted.contains(&UpstreamProtocolKind::Responses));
+    assert!(!responses_admitted.contains(&UpstreamProtocolKind::Messages));
+    let messages_admitted = admitted_protocols(
+        descriptor.kind,
+        descriptor.protocol_probe,
+        "messages-model-free",
+        &evidence,
+    );
+    assert!(messages_admitted.contains(&UpstreamProtocolKind::Messages));
+    assert!(!messages_admitted.contains(&UpstreamProtocolKind::Responses));
+
+    let set = build_effective_contracts(&snapshot, &[], persisted);
+    let zen = set.providers.get(OPENCODE_ZEN_FREE_PROVIDER_ID).unwrap();
+    let responses = zen.model("review-model-free").unwrap();
+    assert!(responses.protocols.contains_key("responses"));
+    assert!(responses.protocols["responses"].available);
+    assert!(responses.protocols["responses"].enabled);
+    assert!(!responses.protocols.contains_key("messages"));
+    let messages = zen.model("messages-model-free").unwrap();
+    assert!(messages.protocols.contains_key("messages"));
+    assert!(messages.protocols["messages"].available);
+    assert!(messages.protocols["messages"].enabled);
+    assert!(!messages.protocols.contains_key("responses"));
+}
+
+#[test]
+fn unfetched_builtin_catalogs_are_empty() {
+    let set = build_effective_contracts(&zen_seed(), &[], empty_persisted());
+    for provider_id in [
+        OPENCODE_PROVIDER_ID,
+        OPENCODE_ZEN_FREE_PROVIDER_ID,
+        crate::kernel::ids::COMMAND_CODE_PROVIDER_ID,
+        MINIMAX_PROVIDER_ID,
+        KIMI_PROVIDER_ID,
+        crate::kernel::ids::OLLAMA_PROVIDER_ID,
+    ] {
+        let contract = set.providers.get(provider_id).unwrap();
+        assert!(
+            contract.catalog.models.is_empty(),
+            "{provider_id} must not seed a leftover preset catalog"
+        );
+        assert!(contract.models.is_empty(), "{provider_id}");
+    }
+}
+
+#[test]
+fn catalog_discovered_go_model_without_evidence_stays_off_until_explicitly_enabled() {
+    let now = Utc::now();
+    let scope = ContractScope::provider(OPENCODE_PROVIDER_ID);
+    let mut persisted = empty_persisted();
+    persisted.scopes.insert(
+        scope.clone(),
+        PersistedScopeRow {
+            scope: scope.clone(),
+            catalog_models: vec!["omen-alpha".to_string()],
+            catalog_refreshed_at: Some(now),
+            catalog_source: CATALOG_SOURCE_OPENCODE_MODELS.to_string(),
+            catalog_source_url: "https://example.test/models".to_string(),
+            revision: 2,
+            updated_at: now,
+        },
+    );
+
+    let set = build_effective_contracts(&zen_seed(), &[], persisted.clone());
+    let go = set.providers.get(OPENCODE_PROVIDER_ID).unwrap();
+    let model = go.model("omen-alpha").unwrap();
     assert_eq!(
         model.preferred_protocol,
         UpstreamProtocolKind::ChatCompletions
     );
-    assert!(chat.available);
-    assert!(chat.enabled);
-    assert_eq!(chat.r#override, ProtocolOverrideState::Auto);
-    assert!(model.routable);
-    assert_eq!(
-        select_upstream_protocol(zen, ApiFormat::ChatCompletions, "brand-new-promo-free").unwrap(),
-        ApiFormat::ChatCompletions
+    assert!(model.enabled_protocols().is_empty());
+    assert!(!model.routable);
+    assert!(
+        model
+            .protocols
+            .values()
+            .all(|row| row.r#override == ProtocolOverrideState::Auto)
     );
+    assert!(select_upstream_protocol(go, ApiFormat::ChatCompletions, "omen-alpha").is_err());
 
-    let mut persisted = empty_persisted();
-    let scope = ContractScope::provider(OPENCODE_ZEN_FREE_PROVIDER_ID);
     persisted.overrides.insert(
         scope.clone(),
         vec![PersistedModelProtocolOverride {
             scope,
-            model_id: "brand-new-promo-free".into(),
+            model_id: "omen-alpha".into(),
+            protocol: UpstreamProtocolKind::ChatCompletions,
+            state: ProtocolOverrideState::ForceOn,
+            updated_at: now,
+        }],
+    );
+    let set = build_effective_contracts(&zen_seed(), &[], persisted);
+    let go = set.providers.get(OPENCODE_PROVIDER_ID).unwrap();
+    let model = go.model("omen-alpha").unwrap();
+    let chat = model.protocols.get("chat_completions").unwrap();
+    assert!(chat.available);
+    assert!(chat.enabled);
+    assert!(model.routable);
+    assert_eq!(
+        select_upstream_protocol(go, ApiFormat::ChatCompletions, "omen-alpha").unwrap(),
+        ApiFormat::ChatCompletions
+    );
+}
+
+#[test]
+fn catalog_discovered_go_model_with_official_static_defaults_on() {
+    let mut persisted = empty_persisted();
+    persist_catalog(&mut persisted, OPENCODE_PROVIDER_ID, &["future-go-model"]);
+    persist_official_docs(
+        &mut persisted,
+        OPENCODE_PROVIDER_ID,
+        &[("future-go-model", UpstreamProtocolKind::Responses)],
+    );
+    let go = build_effective_contracts(&zen_seed(), &[], persisted)
+        .providers
+        .remove(OPENCODE_PROVIDER_ID)
+        .unwrap();
+    let model = go.model("future-go-model").unwrap();
+    let responses = model.protocols.get("responses").unwrap();
+    assert!(responses.available);
+    assert!(responses.enabled);
+    assert_eq!(responses.r#override, ProtocolOverrideState::Auto);
+    assert!(model.routable);
+    assert!(
+        model
+            .protocols
+            .get("chat_completions")
+            .is_none_or(|row| !row.enabled && !row.available)
+    );
+}
+
+#[test]
+fn catalog_discovered_go_model_with_known_offline_default_defaults_on() {
+    let mut persisted = empty_persisted();
+    persist_catalog(&mut persisted, OPENCODE_PROVIDER_ID, &["glm-5.2"]);
+    let go = build_effective_contracts(&zen_seed(), &[], persisted)
+        .providers
+        .remove(OPENCODE_PROVIDER_ID)
+        .unwrap();
+    let glm = go.model("glm-5.2").unwrap();
+    assert!(glm.protocols["chat_completions"].enabled);
+    assert_eq!(
+        glm.protocols["chat_completions"].r#override,
+        ProtocolOverrideState::Auto
+    );
+    assert!(glm.routable);
+}
+
+#[test]
+fn persisted_force_off_keeps_a_supported_go_model_off() {
+    let mut persisted = empty_persisted();
+    persist_catalog(&mut persisted, OPENCODE_PROVIDER_ID, &["glm-5.2"]);
+    persist_official_docs(
+        &mut persisted,
+        OPENCODE_PROVIDER_ID,
+        &[("glm-5.2", UpstreamProtocolKind::ChatCompletions)],
+    );
+    let scope = ContractScope::provider(OPENCODE_PROVIDER_ID);
+    persisted.overrides.insert(
+        scope.clone(),
+        vec![PersistedModelProtocolOverride {
+            scope,
+            model_id: "glm-5.2".into(),
             protocol: UpstreamProtocolKind::ChatCompletions,
             state: ProtocolOverrideState::ForceOff,
             updated_at: Utc::now(),
         }],
     );
-    let set = build_effective_contracts(&catalog, &[], persisted);
-    let zen = set.providers.get(OPENCODE_ZEN_FREE_PROVIDER_ID).unwrap();
-    let model = zen.model("brand-new-promo-free").unwrap();
-    let chat = model.protocols.get("chat_completions").unwrap();
-    assert!(chat.available);
-    assert!(!chat.enabled);
-    assert_eq!(chat.r#override, ProtocolOverrideState::ForceOff);
+    let glm = build_effective_contracts(&zen_seed(), &[], persisted)
+        .providers
+        .remove(OPENCODE_PROVIDER_ID)
+        .unwrap()
+        .model("glm-5.2")
+        .unwrap()
+        .clone();
+    assert!(glm.protocols["chat_completions"].available);
+    assert!(!glm.protocols["chat_completions"].enabled);
+    assert_eq!(
+        glm.protocols["chat_completions"].r#override,
+        ProtocolOverrideState::ForceOff
+    );
+    assert!(!glm.routable);
+}
+
+#[test]
+fn goat_extra_stays_off_without_official_static_and_defaults_on_with_it() {
+    let extra = "vendor/future-command-model";
+    let mut persisted = empty_persisted();
+    persist_catalog(&mut persisted, COMMAND_CODE_PROVIDER_ID, &[extra]);
+    let goat = build_effective_contracts(&zen_seed(), &[], persisted.clone())
+        .providers
+        .remove(COMMAND_CODE_PROVIDER_ID)
+        .unwrap();
+    let model = goat.model(extra).unwrap();
+    assert!(!model.has_enabled_protocol());
     assert!(!model.routable);
+    assert!(
+        model
+            .protocols
+            .get("chat_completions")
+            .is_none_or(|row| { !row.enabled && row.r#override == ProtocolOverrideState::Auto })
+    );
+
+    persist_official_docs(
+        &mut persisted,
+        COMMAND_CODE_PROVIDER_ID,
+        &[(extra, UpstreamProtocolKind::ChatCompletions)],
+    );
+    let goat = build_effective_contracts(&zen_seed(), &[], persisted)
+        .providers
+        .remove(COMMAND_CODE_PROVIDER_ID)
+        .unwrap();
+    let model = goat.model(extra).unwrap();
+    assert!(model.protocols["chat_completions"].enabled);
+    assert_eq!(
+        model.protocols["chat_completions"].r#override,
+        ProtocolOverrideState::Auto
+    );
+    assert!(model.routable);
+}
+
+#[test]
+fn minimax_new_catalog_model_defaults_on_from_family_baseline() {
+    let mut persisted = empty_persisted();
+    persist_catalog(&mut persisted, MINIMAX_PROVIDER_ID, &["MiniMax-New"]);
+    let minimax = build_effective_contracts(&zen_seed(), &[], persisted)
+        .providers
+        .remove(MINIMAX_PROVIDER_ID)
+        .unwrap();
+    let model = minimax.model("MiniMax-New").unwrap();
+    assert!(model.protocols["chat_completions"].enabled);
+    assert!(model.protocols["messages"].enabled);
+    assert!(model.protocols["responses"].enabled);
+    assert!(model.routable);
 }
 
 #[test]
 fn probe_confirmed_opencode_extra_protocol_becomes_effective() {
-    let mut persisted = empty_persisted();
+    let mut persisted = standard_go_persisted();
     let now = Utc::now();
     let scope = ContractScope::provider(OPENCODE_PROVIDER_ID);
-    persisted.evidence.insert(
-        scope.clone(),
-        vec![PersistedModelProtocol {
+    persisted
+        .evidence
+        .entry(scope.clone())
+        .or_default()
+        .push(PersistedModelProtocol {
             scope,
             model_id: "grok-4.5".into(),
             protocol: UpstreamProtocolKind::ChatCompletions,
@@ -222,8 +647,7 @@ fn probe_confirmed_opencode_extra_protocol_becomes_effective() {
             last_probe_result: Some(ProbeResultKind::Success),
             last_probe_at: Some(now),
             last_probe_error: None,
-        }],
-    );
+        });
     let go = build_effective_contracts(&zen_seed(), &[], persisted)
         .providers
         .remove(OPENCODE_PROVIDER_ID)
@@ -240,12 +664,14 @@ fn probe_confirmed_opencode_extra_protocol_becomes_effective() {
 
 #[test]
 fn probe_failure_does_not_add_or_remove_static_support() {
-    let mut persisted = empty_persisted();
+    let mut persisted = standard_go_persisted();
     let now = Utc::now();
     let scope = ContractScope::provider(OPENCODE_PROVIDER_ID);
-    persisted.evidence.insert(
-        scope.clone(),
-        vec![PersistedModelProtocol {
+    persisted
+        .evidence
+        .entry(scope.clone())
+        .or_default()
+        .push(PersistedModelProtocol {
             scope,
             model_id: "grok-4.5".into(),
             protocol: UpstreamProtocolKind::ChatCompletions,
@@ -255,8 +681,7 @@ fn probe_failure_does_not_add_or_remove_static_support() {
             last_probe_result: Some(ProbeResultKind::Failure),
             last_probe_at: Some(now),
             last_probe_error: Some("upstream 500".into()),
-        }],
-    );
+        });
     let go = build_effective_contracts(&zen_seed(), &[], persisted)
         .providers
         .remove(OPENCODE_PROVIDER_ID)
@@ -269,7 +694,7 @@ fn probe_failure_does_not_add_or_remove_static_support() {
 
 #[test]
 fn override_force_off_disables_without_destroying_evidence() {
-    let mut persisted = empty_persisted();
+    let mut persisted = standard_go_persisted();
     let scope = ContractScope::provider(OPENCODE_PROVIDER_ID);
     persisted.overrides.insert(
         scope.clone(),
@@ -297,7 +722,7 @@ fn override_force_off_disables_without_destroying_evidence() {
 
 #[test]
 fn override_force_on_enables_supported_protocol_without_evidence() {
-    let mut persisted = empty_persisted();
+    let mut persisted = standard_go_persisted();
     let scope = ContractScope::provider(OPENCODE_PROVIDER_ID);
     persisted.overrides.insert(
         scope.clone(),
@@ -361,7 +786,7 @@ fn override_force_on_enables_protocol_beyond_static_and_ceiling() {
 }
 
 #[test]
-fn refreshed_catalog_is_authoritative_and_new_models_can_start_fully_off() {
+fn refreshed_catalog_is_authoritative_and_persisted_force_off_keeps_new_models_off() {
     let mut persisted = empty_persisted();
     let now = Utc::now();
     let scope = ContractScope::provider(OPENCODE_PROVIDER_ID);
@@ -427,6 +852,7 @@ fn refreshed_catalog_is_authoritative_and_new_models_can_start_fully_off() {
 #[test]
 fn stale_probe_failure_does_not_demote_static_support() {
     let mut persisted = empty_persisted();
+    persist_catalog(&mut persisted, OPENCODE_PROVIDER_ID, &["glm-5.3"]);
     let now = Utc::now();
     let scope = ContractScope::provider(OPENCODE_PROVIDER_ID);
     persisted.evidence.insert(
@@ -464,7 +890,7 @@ fn stale_probe_failure_does_not_demote_static_support() {
 }
 
 #[test]
-fn protocol_fallback_prefers_client_then_adapter_priority() {
+fn protocol_fallback_uses_adapter_priority_independent_of_client() {
     let mut go = go_contract();
     let glm = go.models.get_mut("glm-5.2").unwrap();
     glm.protocols.get_mut("chat_completions").unwrap().enabled = false;
@@ -548,6 +974,7 @@ fn custom_discovery_does_not_become_routable_without_declaration() {
         verification_status: ConnectionVerificationStatus::Verified,
         setup_ready: true,
         has_key: true,
+        auth_kind: ocg_domain::dynamic::DynamicAuthKind::Bearer,
         config: AccountCustomConfig {
             account_id: "custom-1".into(),
             endpoint_url: "https://api.example.com/v1/chat/completions".into(),
@@ -563,6 +990,8 @@ fn custom_discovery_does_not_become_routable_without_declaration() {
             verified_at: None,
             source: "manual".into(),
         }],
+        route_overrides: Vec::new(),
+        protocol_passthrough: false,
     };
     let mut persisted = empty_persisted();
     let scope = ContractScope::custom_endpoint("custom-1");
@@ -595,6 +1024,7 @@ fn custom_declared_protocol_is_preferred_and_other_clients_fall_back_to_it() {
         verification_status: ConnectionVerificationStatus::Verified,
         setup_ready: true,
         has_key: true,
+        auth_kind: ocg_domain::dynamic::DynamicAuthKind::XApiKey,
         config: AccountCustomConfig {
             account_id: "custom-single".into(),
             endpoint_url: "https://api.example.com/v1/messages".into(),
@@ -613,6 +1043,8 @@ fn custom_declared_protocol_is_preferred_and_other_clients_fall_back_to_it() {
                 source: "manual".into(),
             })
             .collect(),
+        route_overrides: Vec::new(),
+        protocol_passthrough: false,
     };
     let ceiling = safety_ceiling_protocols(probe_for(CUSTOM_PROVIDER_ID), "declared-model");
     assert!(
@@ -675,6 +1107,115 @@ fn custom_declared_protocol_is_preferred_and_other_clients_fall_back_to_it() {
 }
 
 #[test]
+fn platform_passthrough_enables_chat_messages_and_responses() {
+    let runtime = CustomAccountRuntime {
+        account_id: "platform-key".into(),
+        enabled: true,
+        verification_status: ConnectionVerificationStatus::Verified,
+        setup_ready: true,
+        has_key: true,
+        auth_kind: ocg_domain::dynamic::DynamicAuthKind::Bearer,
+        config: AccountCustomConfig {
+            account_id: "platform-key".into(),
+            endpoint_url: "https://api.example.com".into(),
+            upstream_protocol: UpstreamProtocolKind::ChatCompletions,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        },
+        capabilities: vec![AccountModelCapability {
+            account_id: "platform-key".into(),
+            public_model: "claude-sonnet".into(),
+            upstream_model: "claude-sonnet".into(),
+            protocol: UpstreamProtocolKind::ChatCompletions,
+            verified_at: None,
+            source: "discovery".into(),
+        }],
+        route_overrides: Vec::new(),
+        protocol_passthrough: true,
+    };
+    let set = build_effective_contracts(
+        &zen_seed(),
+        std::slice::from_ref(&runtime),
+        empty_persisted(),
+    );
+    let custom = set.custom_endpoints.get("platform-key").unwrap();
+    let model = custom.model("claude-sonnet").unwrap();
+    assert!(model.routable);
+    assert_eq!(
+        model.preferred_protocol,
+        UpstreamProtocolKind::ChatCompletions
+    );
+    let enabled = model.enabled_protocols();
+    for protocol in [
+        UpstreamProtocolKind::ChatCompletions,
+        UpstreamProtocolKind::Responses,
+        UpstreamProtocolKind::Messages,
+    ] {
+        assert!(
+            enabled.contains(&protocol),
+            "passthrough still enables {protocol:?}"
+        );
+    }
+    let scope = ContractScope::custom_endpoint("platform-key");
+    for client in [
+        ApiFormat::ChatCompletions,
+        ApiFormat::Messages,
+        ApiFormat::Responses,
+        ApiFormat::Gemini,
+    ] {
+        assert_eq!(
+            set.select_upstream(&scope, client, "claude-sonnet")
+                .unwrap(),
+            ApiFormat::ChatCompletions,
+            "{client:?} uses the enabled preferred protocol"
+        );
+    }
+
+    let mut persisted = empty_persisted();
+    persisted.overrides.insert(
+        scope.clone(),
+        vec![PersistedModelProtocolOverride {
+            scope: scope.clone(),
+            model_id: "claude-sonnet".into(),
+            protocol: UpstreamProtocolKind::ChatCompletions,
+            state: ProtocolOverrideState::ForceOff,
+            updated_at: Utc::now(),
+        }],
+    );
+    let set = build_effective_contracts(&zen_seed(), &[runtime], persisted);
+    let disabled = &set.custom_endpoints["platform-key"]
+        .model("claude-sonnet")
+        .unwrap();
+    assert_eq!(
+        disabled.preferred_protocol,
+        UpstreamProtocolKind::ChatCompletions
+    );
+    assert!(
+        !disabled
+            .enabled_protocols()
+            .contains(&UpstreamProtocolKind::ChatCompletions)
+    );
+    assert_eq!(
+        set.select_upstream(&scope, ApiFormat::Messages, "claude-sonnet")
+            .unwrap(),
+        ApiFormat::Messages,
+        "a disabled preferred protocol is not executed"
+    );
+    assert_eq!(
+        set.select_upstream(&scope, ApiFormat::Responses, "claude-sonnet")
+            .unwrap(),
+        ApiFormat::Responses,
+        "a disabled preferred protocol is not executed"
+    );
+    assert_eq!(
+        set.select_upstream(&scope, ApiFormat::Gemini, "claude-sonnet")
+            .unwrap(),
+        ApiFormat::Responses,
+        "Gemini uses the enabled fallback when preferred is disabled"
+    );
+}
+
+#[test]
 fn sanitize_probe_error_strips_userinfo_and_truncates() {
     let raw = format!(
         "failed https://user:secret@api.example.com/v1 {}",
@@ -698,17 +1239,42 @@ fn official_protocol_baselines_cover_every_builtin_provider_shape() {
     );
     assert_eq!(
         static_verified_protocols(ProviderAdapterKind::OpenCodeGo, "deepseek-v4-flash", &[],),
-        vec![UpstreamProtocolKind::ChatCompletions]
+        Vec::<UpstreamProtocolKind>::new()
+    );
+    assert_eq!(
+        static_verified_protocols(ProviderAdapterKind::OpenCodeGo, "kimi-k3", &[]),
+        Vec::<UpstreamProtocolKind>::new()
     );
     assert_eq!(
         static_verified_protocols(ProviderAdapterKind::OpenCodeGo, "grok-4.6", &[]),
-        vec![UpstreamProtocolKind::Responses]
+        Vec::<UpstreamProtocolKind>::new()
     );
     assert_eq!(
         static_verified_protocols(ProviderAdapterKind::CommandCodeGoat, "claude-fable-5", &[],),
         vec![UpstreamProtocolKind::Messages]
     );
-    for adapter in [ProviderAdapterKind::MiniMaxCn, ProviderAdapterKind::KimiCn] {
+    assert_eq!(
+        static_verified_protocols(ProviderAdapterKind::MiniMaxCn, "catalog-model", &[]),
+        vec![
+            UpstreamProtocolKind::ChatCompletions,
+            UpstreamProtocolKind::Messages,
+            UpstreamProtocolKind::Responses,
+        ]
+    );
+    let minimax_probe = ProviderRegistry::iter()
+        .find(|descriptor| descriptor.kind == ProviderAdapterKind::MiniMaxCn)
+        .unwrap()
+        .protocol_probe;
+    assert_eq!(
+        safety_ceiling_protocols(minimax_probe, "catalog-model"),
+        vec![
+            UpstreamProtocolKind::ChatCompletions,
+            UpstreamProtocolKind::Responses,
+            UpstreamProtocolKind::Messages,
+        ]
+    );
+    let adapter = ProviderAdapterKind::KimiCn;
+    {
         assert_eq!(
             static_verified_protocols(adapter, "catalog-model", &[]),
             vec![
@@ -741,12 +1307,13 @@ fn official_protocol_baselines_cover_every_builtin_provider_shape() {
 #[test]
 fn stale_override_outside_fixed_provider_ceiling_is_not_materialized() {
     let mut persisted = empty_persisted();
-    let scope = ContractScope::provider(MINIMAX_PROVIDER_ID);
+    persist_catalog(&mut persisted, KIMI_PROVIDER_ID, &["kimi-for-coding"]);
+    let scope = ContractScope::provider(KIMI_PROVIDER_ID);
     persisted.overrides.insert(
         scope.clone(),
         vec![PersistedModelProtocolOverride {
             scope,
-            model_id: "MiniMax-M3".into(),
+            model_id: "kimi-for-coding".into(),
             protocol: UpstreamProtocolKind::Responses,
             state: ProtocolOverrideState::ForceOff,
             updated_at: Utc::now(),
@@ -754,9 +1321,285 @@ fn stale_override_outside_fixed_provider_ceiling_is_not_materialized() {
     );
 
     let set = build_effective_contracts(&zen_seed(), &[], persisted);
-    let minimax = set.providers.get(MINIMAX_PROVIDER_ID).unwrap();
-    let model = minimax.model("MiniMax-M3").unwrap();
+    let kimi = set.providers.get(KIMI_PROVIDER_ID).unwrap();
+    let model = kimi.model("kimi-for-coding").unwrap();
     assert!(model.protocols.contains_key("chat_completions"));
     assert!(model.protocols.contains_key("messages"));
     assert!(!model.protocols.contains_key("responses"));
+}
+
+#[test]
+fn minimax_recommended_default_wins_over_client_and_respects_manual_disable() {
+    let mut persisted = empty_persisted();
+    persist_catalog(&mut persisted, MINIMAX_PROVIDER_ID, &["MiniMax-M3"]);
+    let set = build_effective_contracts(&zen_seed(), &[], persisted);
+    let minimax = set.providers.get(MINIMAX_PROVIDER_ID).unwrap();
+    let model_id = "MiniMax-M3";
+    assert_eq!(
+        minimax.model(model_id).unwrap().preferred_protocol,
+        UpstreamProtocolKind::Messages
+    );
+    assert_eq!(
+        select_upstream_protocol(minimax, ApiFormat::Responses, model_id).unwrap(),
+        ApiFormat::Messages,
+        "an enabled preferred protocol wins over the client protocol"
+    );
+    assert_eq!(
+        select_upstream_protocol(minimax, ApiFormat::ChatCompletions, model_id).unwrap(),
+        ApiFormat::Messages,
+        "an enabled preferred protocol wins over the client protocol"
+    );
+    assert_eq!(
+        select_upstream_protocol(minimax, ApiFormat::Messages, model_id).unwrap(),
+        ApiFormat::Messages
+    );
+    let mut persisted = empty_persisted();
+    persist_catalog(&mut persisted, MINIMAX_PROVIDER_ID, &[model_id]);
+    let scope = ContractScope::provider(MINIMAX_PROVIDER_ID);
+    persisted.overrides.insert(
+        scope.clone(),
+        vec![PersistedModelProtocolOverride {
+            scope,
+            model_id: model_id.into(),
+            protocol: UpstreamProtocolKind::Messages,
+            state: ProtocolOverrideState::ForceOff,
+            updated_at: Utc::now(),
+        }],
+    );
+    let set = build_effective_contracts(&zen_seed(), &[], persisted);
+    let minimax = set.providers.get(MINIMAX_PROVIDER_ID).unwrap();
+    let disabled = minimax.model(model_id).unwrap();
+    assert_eq!(
+        disabled.preferred_protocol,
+        UpstreamProtocolKind::Messages,
+        "a disabled preference stays recorded"
+    );
+    assert!(
+        !disabled
+            .enabled_protocols()
+            .contains(&UpstreamProtocolKind::Messages),
+        "force_off removes the preferred protocol from the enabled set"
+    );
+    assert_eq!(
+        select_upstream_protocol(minimax, ApiFormat::ChatCompletions, model_id).unwrap(),
+        ApiFormat::ChatCompletions,
+        "a disabled preferred protocol is not executed"
+    );
+    assert_eq!(
+        select_upstream_protocol(minimax, ApiFormat::Responses, model_id).unwrap(),
+        ApiFormat::Responses,
+        "a disabled preferred protocol is not executed"
+    );
+}
+
+#[test]
+fn cpa_uses_enabled_preferred_and_does_not_force_a_disabled_one() {
+    let mut cpa = go_contract();
+    cpa.adapter_kind = ProviderAdapterKind::Cpa;
+    let model = cpa.models.get_mut("glm-5.2").unwrap();
+    assert_eq!(
+        model.preferred_protocol,
+        UpstreamProtocolKind::ChatCompletions
+    );
+    for protocol in model.protocols.values_mut() {
+        protocol.enabled = true;
+    }
+    for client in [
+        ApiFormat::ChatCompletions,
+        ApiFormat::Responses,
+        ApiFormat::Messages,
+        ApiFormat::Gemini,
+    ] {
+        assert_eq!(
+            select_upstream_protocol(&cpa, client, "glm-5.2").unwrap(),
+            ApiFormat::ChatCompletions,
+            "{client:?} uses the enabled preferred protocol"
+        );
+    }
+
+    let model = cpa.models.get_mut("glm-5.2").unwrap();
+    model.protocols.get_mut("chat_completions").unwrap().enabled = false;
+    assert_eq!(
+        select_upstream_protocol(&cpa, ApiFormat::Responses, "glm-5.2").unwrap(),
+        ApiFormat::Responses,
+        "a disabled preferred protocol is not executed"
+    );
+    assert_eq!(
+        select_upstream_protocol(&cpa, ApiFormat::Messages, "glm-5.2").unwrap(),
+        ApiFormat::Messages,
+        "a disabled preferred protocol is not executed"
+    );
+    assert_eq!(
+        select_upstream_protocol(&cpa, ApiFormat::Gemini, "glm-5.2").unwrap(),
+        ApiFormat::Responses,
+        "Gemini falls through the enabled fallback after preferred is disabled"
+    );
+    assert_eq!(
+        select_upstream_protocol(&cpa, ApiFormat::ChatCompletions, "glm-5.2").unwrap(),
+        ApiFormat::Responses,
+        "a disabled client protocol is not invented from the disabled preference"
+    );
+}
+
+#[test]
+fn exclusive_available_force_off_repairs_cn_radio_and_skips_unavailable_siblings() {
+    let mut persisted = empty_persisted();
+    persist_catalog(&mut persisted, MINIMAX_PROVIDER_ID, &["MiniMax-M3"]);
+    persist_catalog(&mut persisted, OPENCODE_PROVIDER_ID, &["glm-5.2"]);
+    let scope = ContractScope::provider(MINIMAX_PROVIDER_ID);
+    persisted.overrides.insert(
+        scope.clone(),
+        vec![
+            PersistedModelProtocolOverride {
+                scope: scope.clone(),
+                model_id: "MiniMax-M3".into(),
+                protocol: UpstreamProtocolKind::ChatCompletions,
+                state: ProtocolOverrideState::ForceOn,
+                updated_at: Utc::now(),
+            },
+            PersistedModelProtocolOverride {
+                scope: scope.clone(),
+                model_id: "MiniMax-M3".into(),
+                protocol: UpstreamProtocolKind::Messages,
+                state: ProtocolOverrideState::ForceOff,
+                updated_at: Utc::now(),
+            },
+            PersistedModelProtocolOverride {
+                scope: scope.clone(),
+                model_id: "MiniMax-M3".into(),
+                protocol: UpstreamProtocolKind::Responses,
+                state: ProtocolOverrideState::ForceOff,
+                updated_at: Utc::now(),
+            },
+        ],
+    );
+    let go_scope = ContractScope::provider(OPENCODE_PROVIDER_ID);
+    persisted.overrides.insert(
+        go_scope.clone(),
+        vec![
+            PersistedModelProtocolOverride {
+                scope: go_scope.clone(),
+                model_id: "glm-5.2".into(),
+                protocol: UpstreamProtocolKind::ChatCompletions,
+                state: ProtocolOverrideState::ForceOn,
+                updated_at: Utc::now(),
+            },
+            PersistedModelProtocolOverride {
+                scope: go_scope,
+                model_id: "glm-5.2".into(),
+                protocol: UpstreamProtocolKind::Responses,
+                state: ProtocolOverrideState::ForceOff,
+                updated_at: Utc::now(),
+            },
+        ],
+    );
+    let set = build_effective_contracts(&zen_seed(), &[], persisted.clone());
+    let repairs = exclusive_available_force_off_repairs(&set, &persisted);
+    assert_eq!(repairs.len(), 2);
+    assert_eq!(repairs[0].0, scope);
+    assert_eq!(repairs[0].1, "MiniMax-M3");
+    assert_eq!(repairs[0].2, UpstreamProtocolKind::Messages);
+    assert_eq!(repairs[1].0, scope);
+    assert_eq!(repairs[1].1, "MiniMax-M3");
+    assert_eq!(repairs[1].2, UpstreamProtocolKind::Responses);
+}
+
+#[test]
+fn select_enabled_upstream_passthroughs_a_one_protocol_mapping() {
+    let protocol = UpstreamProtocolKind::ChatCompletions;
+    assert_eq!(
+        select_enabled_upstream(
+            ApiFormat::ChatCompletions,
+            protocol,
+            &[protocol],
+            &[protocol],
+        )
+        .unwrap(),
+        ApiFormat::ChatCompletions
+    );
+    assert_eq!(
+        select_enabled_upstream(ApiFormat::Messages, protocol, &[protocol], &[protocol]).unwrap(),
+        ApiFormat::ChatCompletions
+    );
+}
+
+#[test]
+fn select_enabled_upstream_prefers_enabled_preferred_without_adding_protocols() {
+    let enabled = [
+        UpstreamProtocolKind::ChatCompletions,
+        UpstreamProtocolKind::Responses,
+        UpstreamProtocolKind::Messages,
+    ];
+    let fallback = enabled;
+    assert_eq!(
+        select_enabled_upstream(
+            ApiFormat::ChatCompletions,
+            UpstreamProtocolKind::Messages,
+            &enabled,
+            &fallback,
+        )
+        .unwrap(),
+        ApiFormat::Messages,
+        "enabled preferred wins over the same client protocol"
+    );
+    assert_eq!(
+        select_enabled_upstream(
+            ApiFormat::ChatCompletions,
+            UpstreamProtocolKind::Messages,
+            &[
+                UpstreamProtocolKind::ChatCompletions,
+                UpstreamProtocolKind::Responses,
+            ],
+            &fallback,
+        )
+        .unwrap(),
+        ApiFormat::ChatCompletions,
+        "an unenabled preferred protocol is not executed"
+    );
+    assert_eq!(
+        select_enabled_upstream(
+            ApiFormat::Responses,
+            UpstreamProtocolKind::Messages,
+            &[
+                UpstreamProtocolKind::ChatCompletions,
+                UpstreamProtocolKind::Responses,
+            ],
+            &[
+                UpstreamProtocolKind::ChatCompletions,
+                UpstreamProtocolKind::Responses,
+                UpstreamProtocolKind::Messages,
+            ],
+        )
+        .unwrap(),
+        ApiFormat::Responses,
+        "same client is next after a missing preferred protocol"
+    );
+    assert_eq!(
+        select_enabled_upstream(
+            ApiFormat::Gemini,
+            UpstreamProtocolKind::Messages,
+            &[
+                UpstreamProtocolKind::ChatCompletions,
+                UpstreamProtocolKind::Responses,
+            ],
+            &[
+                UpstreamProtocolKind::ChatCompletions,
+                UpstreamProtocolKind::Responses,
+            ],
+        )
+        .unwrap(),
+        ApiFormat::ChatCompletions,
+        "Gemini uses the enabled fallback when preferred is absent"
+    );
+    let error = select_enabled_upstream(
+        ApiFormat::Gemini,
+        UpstreamProtocolKind::ChatCompletions,
+        &[UpstreamProtocolKind::Messages],
+        &[UpstreamProtocolKind::ChatCompletions],
+    )
+    .unwrap_err();
+    assert_eq!(
+        error.message, NO_ENABLED_UPSTREAM_PROTOCOL,
+        "an enabled protocol outside preferred, client, and fallback is not added"
+    );
 }

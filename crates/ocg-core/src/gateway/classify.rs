@@ -1,22 +1,10 @@
-//! Compatibility facade for [`ocg_gateway::classify`].
-//!
-//! Crate-private items match the historical `ocg_core::gateway::classify`
-//! surface. The public module path is unchanged; item visibility is not
-//! widened. Do not glob-reexport or reexport the module itself.
-//!
-//! Pure classification policy lives in `ocg-gateway`. This module keeps the
-//! host `classify_http` signature, GOAT credit-exhaustion refinement,
-//! window/cooldown parsing, and fallback derived from [`UsageWindowKind`].
-
-use crate::gateway::limit::{parse_free_reset_or_default, parse_reset, parse_usage_limit_window};
+//! Host facade for pure status/auth/transport decoding.
+//! Limit facts and their unified policy live in `failure`; recovery scheduling
+//! lives in `recovery`, separate from durable account quota windows.
 use crate::models::{UpstreamChannel, UsageWindowKind};
-use crate::provider::COMMAND_CODE_PROVIDER_ID;
-use chrono::{DateTime, Duration, Utc};
-
 pub(crate) use ocg_gateway::classify::{
-    PreflightKind, ProviderErrorClass, RateLimitFallback, RateLimitPolicy, StreamClassifyInput,
+    PreflightKind, ProviderErrorClass, RateLimitFallback, StreamClassifyInput,
     TransportClassifyInput, classify_preflight, classify_stream, classify_transport,
-    schedule_go_usage_sync,
 };
 
 /// Host compatibility wrapper: converts [`UpstreamChannel::Free`] to the
@@ -43,73 +31,13 @@ pub(crate) fn classify_http_response(
     anonymous: bool,
     response_body: &str,
 ) -> ProviderErrorClass {
-    let base = ocg_gateway::classify::classify_http_response(
+    ocg_gateway::classify::classify_http_response(
         status,
         provider_id,
         channel == UpstreamChannel::Free,
         anonymous,
         response_body,
-    );
-    if status == 400
-        && provider_id == COMMAND_CODE_PROVIDER_ID
-        && crate::command_code_rate_limit::is_command_code_insufficient_credits(response_body)
-    {
-        ProviderErrorClass::RateLimited {
-            policy: RateLimitPolicy::GenericFiveMinute,
-        }
-    } else {
-        base
-    }
-}
-
-pub(crate) fn rate_limit_window_and_cooldown(
-    policy: RateLimitPolicy,
-    text: &str,
-) -> (Option<UsageWindowKind>, Duration) {
-    match policy {
-        RateLimitPolicy::GenericFiveMinute => (None, Duration::minutes(5)),
-        RateLimitPolicy::ZenFreeShared => (
-            Some(UsageWindowKind::Free),
-            parse_free_reset_or_default(text),
-        ),
-        RateLimitPolicy::GoWindow => {
-            let window = parse_usage_limit_window(text);
-            let cooldown = if window == Some(UsageWindowKind::Free) {
-                parse_free_reset_or_default(text)
-            } else {
-                parse_reset(text).unwrap_or_else(|| Duration::minutes(5))
-            };
-            (window, cooldown)
-        }
-    }
-}
-
-pub(crate) fn rate_limit_window_and_deadline(
-    provider_id: &str,
-    purchase_date: Option<&str>,
-    policy: RateLimitPolicy,
-    text: &str,
-    observed_at: DateTime<Utc>,
-) -> (Option<UsageWindowKind>, DateTime<Utc>) {
-    if provider_id == COMMAND_CODE_PROVIDER_ID
-        && matches!(policy, RateLimitPolicy::GenericFiveMinute)
-        && let Some(limit) =
-            crate::command_code_rate_limit::parse_command_code_rate_limit(text, observed_at)
-    {
-        return (Some(limit.window), limit.resets_at);
-    }
-    if provider_id == COMMAND_CODE_PROVIDER_ID
-        && matches!(policy, RateLimitPolicy::GenericFiveMinute)
-        && crate::command_code_rate_limit::is_command_code_insufficient_credits(text)
-        && let Some(resets_at) = purchase_date.and_then(|value| {
-            crate::command_code_rate_limit::command_code_monthly_reset(value, observed_at)
-        })
-    {
-        return (Some(UsageWindowKind::Month), resets_at);
-    }
-
-    let (window, cooldown) = rate_limit_window_and_cooldown(policy, text);
-    (window, observed_at + cooldown)
+    )
 }
 
 pub(crate) fn rate_limit_fallback(window: Option<UsageWindowKind>) -> RateLimitFallback {
@@ -121,153 +49,4 @@ pub(crate) fn rate_limit_fallback(window: Option<UsageWindowKind>) -> RateLimitF
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn free_429_does_not_rotate_keys() {
-        for misleading_body in [
-            "5-hour usage limit reached. Resets in 13min.",
-            "Weekly usage limit reached. Resets in 4 days.",
-            "Monthly usage limit reached. Resets in 13 days.",
-        ] {
-            let (window, _) =
-                rate_limit_window_and_cooldown(RateLimitPolicy::ZenFreeShared, misleading_body);
-            assert_eq!(window, Some(UsageWindowKind::Free), "{misleading_body}");
-            assert_eq!(
-                rate_limit_fallback(window),
-                RateLimitFallback::ExhaustFreeChannel
-            );
-        }
-        assert_eq!(
-            rate_limit_fallback(Some(UsageWindowKind::FiveHours)),
-            RateLimitFallback::TryNextAccount
-        );
-        assert_eq!(rate_limit_fallback(None), RateLimitFallback::TryNextAccount);
-    }
-
-    #[test]
-    fn goat_429_is_generic_and_ignores_go_limit_windows() {
-        for misleading_body in [
-            "5-hour usage limit reached. Resets in 13min.",
-            "Weekly usage limit reached. Resets in 4 days.",
-            "Monthly usage limit reached. Resets in 13 days.",
-            r#"{"type":"GoUsageLimitError","message":"Weekly usage limit reached. Resets in 3 days."}"#,
-        ] {
-            let (window, cooldown) =
-                rate_limit_window_and_cooldown(RateLimitPolicy::GenericFiveMinute, misleading_body);
-            assert_eq!(window, None, "{misleading_body}");
-            assert_eq!(cooldown, Duration::minutes(5), "{misleading_body}");
-        }
-        let (go_window, go_cooldown) = rate_limit_window_and_cooldown(
-            RateLimitPolicy::GoWindow,
-            "Weekly usage limit reached. Resets in 4 days.",
-        );
-        assert_eq!(go_window, Some(UsageWindowKind::Week));
-        assert_eq!(go_cooldown, Duration::days(4));
-    }
-
-    #[test]
-    fn command_code_plan_window_uses_the_exact_provider_deadline() {
-        let observed_at = DateTime::parse_from_rfc3339("2026-09-08T06:27:42.402Z")
-            .unwrap()
-            .with_timezone(&Utc);
-        let body = r#"{"error":{"code":"RATE_LIMITED","message":"You've reached your weekly usage limit for your plan. Your limit resets at 2026-09-08T09:56:18.379Z. Please wait for the window to reset or upgrade your plan to continue.","type":"rate_limit_error"}}"#;
-        let (window, deadline) = rate_limit_window_and_deadline(
-            COMMAND_CODE_PROVIDER_ID,
-            None,
-            RateLimitPolicy::GenericFiveMinute,
-            body,
-            observed_at,
-        );
-        assert_eq!(window, Some(UsageWindowKind::Week));
-        assert_eq!(
-            deadline,
-            DateTime::parse_from_rfc3339("2026-09-08T09:56:18.379Z")
-                .unwrap()
-                .with_timezone(&Utc)
-        );
-
-        let (_, other_deadline) = rate_limit_window_and_deadline(
-            "another-provider",
-            None,
-            RateLimitPolicy::GenericFiveMinute,
-            body,
-            observed_at,
-        );
-        assert_eq!(other_deadline, observed_at + Duration::minutes(5));
-    }
-
-    #[test]
-    fn command_code_insufficient_credits_rotates_with_monthly_cooldown() {
-        let observed_at = DateTime::parse_from_rfc3339("2026-09-11T02:51:52Z")
-            .unwrap()
-            .with_timezone(&Utc);
-        let body = r#"{"error":{"code":"BAD_REQUEST","message":"You have insufficient credits to make this request. Please purchase more credits to continue using the service.","type":"invalid_request_error"}}"#;
-        let class = classify_http_response(
-            400,
-            COMMAND_CODE_PROVIDER_ID,
-            UpstreamChannel::Go,
-            false,
-            body,
-        );
-        assert_eq!(
-            class,
-            ProviderErrorClass::RateLimited {
-                policy: RateLimitPolicy::GenericFiveMinute
-            }
-        );
-        let (window, deadline) = rate_limit_window_and_deadline(
-            COMMAND_CODE_PROVIDER_ID,
-            Some("2026-09-01"),
-            RateLimitPolicy::GenericFiveMinute,
-            body,
-            observed_at,
-        );
-        assert_eq!(window, Some(UsageWindowKind::Month));
-        assert_eq!(
-            deadline
-                .with_timezone(&chrono::Local)
-                .date_naive()
-                .to_string(),
-            "2026-10-01"
-        );
-        assert_eq!(
-            rate_limit_fallback(window),
-            RateLimitFallback::TryNextAccount
-        );
-    }
-
-    #[test]
-    fn command_code_credit_lookalikes_remain_ordinary_client_errors() {
-        let body = r#"{"error":{"code":"BAD_REQUEST","message":"Invalid base64 data","type":"invalid_request_error"}}"#;
-        assert_eq!(
-            classify_http_response(
-                400,
-                COMMAND_CODE_PROVIDER_ID,
-                UpstreamChannel::Go,
-                false,
-                body,
-            ),
-            ProviderErrorClass::ClientError
-        );
-        let credits = r#"{"error":{"code":"BAD_REQUEST","message":"You have insufficient credits to make this request. Please purchase more credits to continue using the service.","type":"invalid_request_error"}}"#;
-        assert_eq!(
-            classify_http_response(400, "another-provider", UpstreamChannel::Go, false, credits),
-            ProviderErrorClass::ClientError
-        );
-    }
-
-    #[test]
-    fn go_429_free_wording_still_exhausts_the_free_window() {
-        let (window, _) = rate_limit_window_and_cooldown(
-            RateLimitPolicy::GoWindow,
-            "Free usage limit reached. Resets in 13min.",
-        );
-        assert_eq!(window, Some(UsageWindowKind::Free));
-        assert_eq!(
-            rate_limit_fallback(window),
-            RateLimitFallback::ExhaustFreeChannel
-        );
-    }
-}
+mod tests;

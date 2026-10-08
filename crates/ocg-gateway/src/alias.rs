@@ -9,7 +9,8 @@
 //! Case-folded kebab spellings such as `GLM-5.2` are accepted. Names containing `/`, `_`,
 //! or whitespace are treated as raw IDs and never folded onto a kebab alias
 //! (`glm/5.2` is not `glm-5.2`). A raw upstream model ID is accepted only
-//! when it uniquely selects one provider mapping; ambiguity returns
+//! when it uniquely selects one provider mapping or is also a declared shared
+//! public name; other ambiguity returns
 //! [`ResolveError::Ambiguous`] with code [`AMBIGUOUS_MODEL_ID`].
 //!
 //! Command Code GOAT rows join a code-owned Alias by leaf name where possible.
@@ -35,6 +36,8 @@ use ocg_domain::ids::{
 use ocg_domain::protocol::supported_model_ids;
 use ocg_domain::provider::is_custom_api;
 use ocg_domain::zen::{ZenFreeModelCatalog, stripped_free_alias};
+#[cfg(test)]
+use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::sync::OnceLock;
 
@@ -50,8 +53,10 @@ const MINIMAX_CN_ALIASES: &[(&str, &str)] = &[
 ];
 
 const KIMI_CN_ALIASES: &[(&str, &str)] = &[
-    ("kimi-for-coding", "kimi-k2.7-code"),
-    ("kimi-for-coding-highspeed", "kimi-k2.7-code-highspeed"),
+    // Kimi upgrades these product IDs in place. Keep their public identity
+    // stable instead of relabelling the rolling target as a fixed version.
+    ("kimi-for-coding", "kimi-for-coding"),
+    ("kimi-for-coding-highspeed", "kimi-for-coding-highspeed"),
     ("k3", "kimi-k3"),
     ("k3-256k", "kimi-k3-256k"),
 ];
@@ -74,24 +79,14 @@ pub struct ProviderMapping {
     pub routeable: bool,
 }
 
-/// One extra (non-sealed) provider's public-to-upstream mappings.
+/// One provider's explicit public-to-upstream mappings.
 ///
-/// Used by dynamic Providers. Built-in and Custom catalogs stay on the named
-/// fields of [`RuntimeCatalogs`]; this collection avoids adding a new optional
-/// field per Provider.
+/// Used by dynamic Providers and by the separate builtin alias overrides in
+/// [`RuntimeCatalogs`]. Provider identity does not change the sealed adapter.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExtraProviderCatalog {
     pub provider_id: String,
     pub mappings: Vec<(String, String)>,
-}
-
-/// Administrator-confirmed public Alias binding for one sealed Provider.
-/// Discovery never creates these rows.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UserAliasBinding {
-    pub alias: String,
-    pub provider_id: String,
-    pub upstream_model: String,
 }
 
 /// Borrowed runtime catalog inputs used to overlay the sealed Alias registry.
@@ -110,7 +105,9 @@ pub struct RuntimeCatalogs<'a> {
     pub cpa: &'a [String],
     pub ollama: &'a [String],
     pub ollama_pinned: &'a [String],
-    pub user_aliases: &'a [UserAliasBinding],
+    /// Explicit aliases for saved builtin rows, with exact upstream spelling.
+    /// An override replaces only that provider/upstream's generated aliases.
+    pub builtin_aliases: &'a [ExtraProviderCatalog],
     pub extra: &'a [ExtraProviderCatalog],
 }
 
@@ -242,6 +239,15 @@ impl ResolveError {
 }
 
 static REGISTRY: OnceLock<Registry> = OnceLock::new();
+#[cfg(test)]
+thread_local! {
+    static RUNTIME_REGISTRY_BUILDS: Cell<usize> = const { Cell::new(0) };
+}
+
+#[cfg(test)]
+pub fn take_runtime_registry_build_count() -> usize {
+    RUNTIME_REGISTRY_BUILDS.with(|count| count.replace(0))
+}
 
 fn registry() -> &'static Registry {
     REGISTRY.get_or_init(build_builtin_registry)
@@ -277,7 +283,44 @@ fn build_registry(zen_free_models: &[String]) -> Registry {
     registry
 }
 
+fn validated_builtin_aliases(catalogs: RuntimeCatalogs<'_>) -> Vec<ExtraProviderCatalog> {
+    catalogs
+        .builtin_aliases
+        .iter()
+        .filter_map(|catalog| {
+            let models = match catalog.provider_id.as_str() {
+                OPENCODE_PROVIDER_ID => catalogs.go,
+                OPENCODE_ZEN_FREE_PROVIDER_ID => catalogs.zen_free,
+                COMMAND_CODE_PROVIDER_ID => catalogs.command_code,
+                MINIMAX_PROVIDER_ID => catalogs.minimax,
+                KIMI_PROVIDER_ID => catalogs.kimi,
+                OLLAMA_PROVIDER_ID => catalogs.ollama,
+                _ => return None,
+            };
+            let mappings = catalog
+                .mappings
+                .iter()
+                .filter(|(public, upstream)| {
+                    public != upstream && !public.trim().is_empty() && models.contains(upstream)
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            (!mappings.is_empty()).then(|| ExtraProviderCatalog {
+                provider_id: catalog.provider_id.clone(),
+                mappings,
+            })
+        })
+        .collect()
+}
+
 fn build_runtime_registry(catalogs: RuntimeCatalogs<'_>) -> Registry {
+    #[cfg(test)]
+    RUNTIME_REGISTRY_BUILDS.with(|count| count.set(count.get() + 1));
+    let overrides = validated_builtin_aliases(catalogs);
+    let catalogs = RuntimeCatalogs {
+        builtin_aliases: &overrides,
+        ..catalogs
+    };
     let mut registry = build_registry(catalogs.zen_free);
     insert_sealed_catalog(
         &mut registry,
@@ -291,57 +334,310 @@ fn build_runtime_registry(catalogs: RuntimeCatalogs<'_>) -> Registry {
         kimi_mapping,
         kimi_catalog_alias,
     );
-    insert_goat_catalog(&mut registry, catalogs.command_code);
+    insert_goat_catalog(&mut registry, catalogs.command_code, catalogs.go);
     insert_cpa_catalog(&mut registry, catalogs.cpa);
     insert_ollama_catalog(&mut registry, catalogs.ollama, catalogs.ollama_pinned);
     insert_extra_catalogs(&mut registry, catalogs.extra);
-    insert_user_alias_bindings(&mut registry, catalogs.user_aliases);
+    if !catalogs.builtin_aliases.is_empty() {
+        for id in catalogs.go {
+            if !is_free_model(id) {
+                insert_raw_mapping(&mut registry, go_mapping(id));
+            }
+        }
+    }
+    replace_builtin_aliases(&mut registry, catalogs.builtin_aliases);
+    join_cpa_shared_public_names(&mut registry, catalogs);
     registry
 }
 
-fn insert_user_alias_bindings(registry: &mut Registry, bindings: &[UserAliasBinding]) {
-    for binding in bindings {
-        let alias = binding.alias.trim();
-        let provider_id = binding.provider_id.trim();
-        let upstream_model = binding.upstream_model.trim();
-        if !valid_user_alias(alias) || provider_id.is_empty() || upstream_model.is_empty() {
-            continue;
+/// One runtime alias table plus the overlay lists `resolve` needs.
+///
+/// Building this table walks every saved catalog row. Callers that resolve or
+/// advertise many names must reuse one index: [`resolve_with_runtime_catalogs`]
+/// rebuilds it on every call.
+pub struct RuntimeCatalogIndex {
+    registry: Registry,
+    go: Vec<String>,
+    go_all: Vec<String>,
+    command_code: Vec<String>,
+    command_code_all: Vec<String>,
+    custom: Vec<String>,
+    extra: Vec<ExtraProviderCatalog>,
+    builtin_aliases: Vec<ExtraProviderCatalog>,
+}
+
+impl RuntimeCatalogIndex {
+    pub fn from_catalogs(catalogs: RuntimeCatalogs<'_>) -> Self {
+        let builtin_aliases = validated_builtin_aliases(catalogs);
+        let catalogs = RuntimeCatalogs {
+            builtin_aliases: &builtin_aliases,
+            ..catalogs
+        };
+        let registry = build_runtime_registry(catalogs);
+        let go = catalogs
+            .go
+            .iter()
+            .filter(|id| !has_builtin_override(catalogs, OPENCODE_PROVIDER_ID, id))
+            .cloned()
+            .collect();
+        let command_code = catalogs
+            .command_code
+            .iter()
+            .filter(|id| !has_builtin_override(catalogs, COMMAND_CODE_PROVIDER_ID, id))
+            .cloned()
+            .collect();
+        Self {
+            registry,
+            go,
+            go_all: catalogs.go.to_vec(),
+            command_code,
+            command_code_all: catalogs.command_code.to_vec(),
+            custom: catalogs.custom.to_vec(),
+            extra: catalogs.extra.to_vec(),
+            builtin_aliases,
         }
-        let replacement = mapping(provider_id, upstream_model, true);
-        let key = alias.to_ascii_lowercase();
-        if let Some(entry) = registry.aliases.get_mut(&key) {
-            if let Some(existing) = entry
-                .mappings
-                .iter()
-                .find(|mapping| mapping.provider_id == provider_id)
-            {
-                if existing.upstream_model != upstream_model {
-                    continue;
-                }
-                continue;
-            }
-            entry.mappings.push(replacement);
-        } else {
-            insert_mapping(registry, alias, replacement);
+    }
+
+    fn catalogs(&self) -> RuntimeCatalogs<'_> {
+        RuntimeCatalogs {
+            go: &self.go_all,
+            zen_free: &[],
+            custom: &self.custom,
+            command_code: &self.command_code_all,
+            minimax: &[],
+            kimi: &[],
+            cpa: &[],
+            ollama: &[],
+            ollama_pinned: &[],
+            extra: &self.extra,
+            builtin_aliases: &self.builtin_aliases,
         }
+    }
+
+    pub fn resolve(&self, requested: &str) -> Result<ResolvedModel, ResolveError> {
+        resolve_in_runtime(
+            &self.registry,
+            self.catalogs(),
+            &self.go,
+            &self.command_code,
+            requested,
+        )
+    }
+
+    pub fn published_models(&self) -> Vec<PublishedAlias> {
+        published_routeable_from_index(self)
     }
 }
 
-fn valid_user_alias(alias: &str) -> bool {
-    !alias.is_empty()
-        && alias.len() <= 128
-        && alias == alias.to_ascii_lowercase()
-        && alias
-            .chars()
-            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '.'))
-        && alias
-            .chars()
-            .next()
-            .is_some_and(|character| character.is_ascii_alphanumeric())
-        && alias
-            .chars()
-            .last()
-            .is_some_and(|character| character.is_ascii_alphanumeric())
+fn resolve_in_runtime(
+    registry: &Registry,
+    catalogs: RuntimeCatalogs<'_>,
+    go: &[String],
+    command_code: &[String],
+    requested: &str,
+) -> Result<ResolvedModel, ResolveError> {
+    let explicit_public = |provider: &str| {
+        catalogs.builtin_aliases.iter().any(|catalog| {
+            catalog.provider_id == provider && extra_public_hit(catalog, requested).is_some()
+        })
+    };
+    let initial = resolve_in(registry, requested);
+    if catalogs
+        .builtin_aliases
+        .iter()
+        .any(|catalog| extra_public_hit(catalog, requested).is_some())
+        && let Ok(ResolvedModel::Alias { mappings, .. }) = &initial
+        && let Some(raw) = registry.raw_exact.get(requested.trim())
+    {
+        let conflicts = raw
+            .iter()
+            .filter(|mapping| !mappings.contains(mapping))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !conflicts.is_empty() {
+            let mut mappings = mappings.clone();
+            mappings.extend(conflicts);
+            return Err(ResolveError::Ambiguous {
+                requested: requested.to_string(),
+                mappings,
+            });
+        }
+    }
+    let go_resolved = match initial {
+        Ok(resolved) if explicit_public(OPENCODE_PROVIDER_ID) => Ok(resolved),
+        Ok(resolved) => overlay_go_catalog(resolved, go),
+        Err(ResolveError::Unknown { requested }) => overlay_unknown_go(requested, go),
+        other => other,
+    };
+    let custom_resolved = match go_resolved {
+        Ok(resolved) => overlay_custom_catalog(resolved, catalogs.custom),
+        Err(ResolveError::Unknown { requested }) => match catalogs
+            .custom
+            .iter()
+            .find(|id| custom_model_id_matches(id, &requested))
+        {
+            Some(alias) => Ok(ResolvedModel::Alias {
+                requested,
+                alias: alias.clone(),
+                mappings: vec![custom_mapping(CUSTOM_DYNAMIC_UPSTREAM)],
+            }),
+            None => Err(ResolveError::Unknown { requested }),
+        },
+        other => other,
+    };
+    let goat_resolved = match custom_resolved {
+        Ok(resolved) if explicit_public(COMMAND_CODE_PROVIDER_ID) => Ok(resolved),
+        Ok(resolved) => {
+            let models = if resolved.is_pinned() {
+                catalogs.command_code
+            } else {
+                command_code
+            };
+            overlay_goat_catalog(resolved, models, registry)
+        }
+        Err(ResolveError::Unknown { requested }) => {
+            overlay_unknown_goat(requested, command_code, registry)
+        }
+        other => other,
+    };
+    let builtin_resolved = match goat_resolved {
+        Ok(resolved) => overlay_extra_catalogs(resolved, catalogs.builtin_aliases, false),
+        Err(ResolveError::Unknown { requested }) => {
+            overlay_unknown_extra(requested, catalogs.builtin_aliases)
+        }
+        other => other,
+    };
+    match builtin_resolved {
+        Ok(resolved) => overlay_extra_catalogs(resolved, catalogs.extra, true),
+        Err(ResolveError::Unknown { requested }) => {
+            overlay_unknown_extra(requested, catalogs.extra)
+        }
+        other => other,
+    }
+}
+
+fn published_routeable_from_index(index: &RuntimeCatalogIndex) -> Vec<PublishedAlias> {
+    let catalogs = index.catalogs();
+    let mut published = published_routeable_in(&index.registry);
+    for catalog in catalogs.builtin_aliases {
+        for (public, _) in catalog
+            .mappings
+            .iter()
+            .filter(|(public, _)| looks_raw_shaped(public))
+        {
+            if !published.iter().any(|item| item.alias == *public)
+                && let Ok(resolved) = index.resolve(public)
+                && let Some(mapping) = resolved.routeable_mappings().first()
+            {
+                published.push(PublishedAlias {
+                    alias: public.clone(),
+                    owned_by: mapping.provider_id.clone(),
+                });
+            }
+        }
+    }
+    if !catalogs.builtin_aliases.is_empty() {
+        published.retain(|item| {
+            index
+                .resolve(&item.alias)
+                .is_ok_and(|resolved| !resolved.routeable_mappings().is_empty())
+        });
+    }
+    for id in catalogs.go {
+        if is_free_model(id)
+            || has_builtin_override(catalogs, OPENCODE_PROVIDER_ID, id)
+            || published.iter().any(|item| item.alias == *id)
+        {
+            continue;
+        }
+        if matches!(
+            index.resolve(id),
+            Ok(ResolvedModel::PinnedRaw { mapping, .. })
+                if mapping.routeable && mapping.is_opencode_go() && mapping.upstream_model == *id
+        ) {
+            published.push(PublishedAlias {
+                alias: id.clone(),
+                owned_by: OPENCODE_PROVIDER_ID.to_string(),
+            });
+        }
+    }
+    published.sort_by(|left, right| left.alias.cmp(&right.alias));
+    published
+}
+
+fn has_builtin_override(catalogs: RuntimeCatalogs<'_>, provider_id: &str, upstream: &str) -> bool {
+    catalogs.builtin_aliases.iter().any(|catalog| {
+        catalog.provider_id == provider_id
+            && catalog.mappings.iter().any(|(_, model)| model == upstream)
+    })
+}
+
+fn replace_builtin_aliases(registry: &mut Registry, overrides: &[ExtraProviderCatalog]) {
+    for catalog in overrides {
+        for (_, upstream) in &catalog.mappings {
+            for entry in registry.aliases.values_mut() {
+                entry.mappings.retain(|mapping| {
+                    mapping.provider_id != catalog.provider_id
+                        || mapping.upstream_model != *upstream
+                });
+            }
+        }
+    }
+    registry
+        .aliases
+        .retain(|_, entry| !entry.mappings.is_empty());
+    insert_extra_catalogs(registry, overrides);
+}
+
+/// A CPA ID that another saved catalog declares under the same public name
+/// is a shared Alias. Raw-shaped IDs and differently named raw pins retain
+/// their ambiguity checks.
+fn join_cpa_shared_public_names(registry: &mut Registry, catalogs: RuntimeCatalogs<'_>) {
+    for id in catalogs.cpa {
+        if looks_raw_shaped(id) {
+            continue;
+        }
+        let exact = |models: &[String]| models.iter().any(|model| model == id);
+        let same_public_extra =
+            catalogs
+                .extra
+                .iter()
+                .chain(catalogs.builtin_aliases)
+                .any(|catalog| {
+                    catalog
+                        .mappings
+                        .iter()
+                        .any(|(public, _)| public.eq_ignore_ascii_case(id))
+                });
+        let builtin = registry
+            .raw_exact
+            .get(id)
+            .into_iter()
+            .flatten()
+            .filter(|mapping| !has_builtin_override(catalogs, &mapping.provider_id, id))
+            .filter(|mapping| match mapping.provider_id.as_str() {
+                COMMAND_CODE_PROVIDER_ID => exact(catalogs.command_code),
+                MINIMAX_PROVIDER_ID => exact(catalogs.minimax),
+                KIMI_PROVIDER_ID => exact(catalogs.kimi),
+                OLLAMA_PROVIDER_ID => exact(catalogs.ollama),
+                OPENCODE_ZEN_FREE_PROVIDER_ID => exact(catalogs.zen_free),
+                _ => false,
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let same_public_go =
+            exact(catalogs.go) && !has_builtin_override(catalogs, OPENCODE_PROVIDER_ID, id);
+        if !same_public_extra && !same_public_go && builtin.is_empty() {
+            continue;
+        }
+        if same_public_go {
+            insert_mapping(registry, id, go_mapping(id));
+        }
+        for mapping in builtin {
+            insert_mapping(registry, id, mapping);
+        }
+        insert_mapping(registry, id, cpa_mapping(id));
+    }
 }
 
 fn insert_extra_catalogs(registry: &mut Registry, extras: &[ExtraProviderCatalog]) {
@@ -360,7 +656,7 @@ fn insert_extra_catalogs(registry: &mut Registry, extras: &[ExtraProviderCatalog
     }
 }
 
-fn insert_goat_catalog(registry: &mut Registry, model_ids: &[String]) {
+fn insert_goat_catalog(registry: &mut Registry, model_ids: &[String], go_model_ids: &[String]) {
     for model_id in model_ids {
         upsert_mapping(registry, None, goat_mapping(model_id, true));
     }
@@ -373,7 +669,7 @@ fn insert_goat_catalog(registry: &mut Registry, model_ids: &[String]) {
             })
             .count()
             == 1;
-        if unique && is_code_owned_alias(registry, &alias) {
+        if goat_leaf_alias_is_publishable(model_id, &alias, unique, go_model_ids, registry) {
             upsert_mapping(registry, Some(&alias), goat_mapping(model_id, true));
         }
     }
@@ -394,8 +690,8 @@ fn insert_sealed_catalog(
     }
 }
 
-/// CPA catalog rows may join only an already code-owned Alias. Every row also
-/// keeps its exact upstream raw pin; CPA never authors arbitrary aliases.
+/// CPA catalog rows first join code-owned Aliases. Every row keeps its exact
+/// upstream raw pin; later, exact shared public names may also become Aliases.
 fn insert_cpa_catalog(registry: &mut Registry, model_ids: &[String]) {
     for model_id in model_ids {
         let mapping = cpa_mapping(model_id);
@@ -661,48 +957,15 @@ pub fn resolve(requested: &str) -> Result<ResolvedModel, ResolveError> {
 
 /// Resolve one client model against all runtime catalog inputs.
 ///
-/// Catalog rows may activate code-owned aliases or exact raw pins, but they do
-/// not become a dynamic Alias registry and cannot bypass ambiguity checks.
+/// Catalog rows activate generated aliases or exact raw pins. Explicit builtin
+/// aliases replace only their own generated mappings and retain raw ambiguity checks.
+/// Prefer [`RuntimeCatalogIndex`] when resolving more than one name against the
+/// same catalogs.
 pub fn resolve_with_runtime_catalogs(
     requested: &str,
     catalogs: RuntimeCatalogs<'_>,
 ) -> Result<ResolvedModel, ResolveError> {
-    let registry = build_runtime_registry(catalogs);
-    let go_resolved = match resolve_in(&registry, requested) {
-        Ok(resolved) => overlay_go_catalog(resolved, catalogs.go),
-        Err(ResolveError::Unknown { requested }) => overlay_unknown_go(requested, catalogs.go),
-        other => other,
-    };
-    let custom_resolved = match go_resolved {
-        Ok(resolved) => overlay_custom_catalog(resolved, catalogs.custom),
-        Err(ResolveError::Unknown { requested }) => match catalogs
-            .custom
-            .iter()
-            .find(|id| custom_model_id_matches(id, &requested))
-        {
-            Some(alias) => Ok(ResolvedModel::Alias {
-                requested,
-                alias: alias.clone(),
-                mappings: vec![custom_mapping(CUSTOM_DYNAMIC_UPSTREAM)],
-            }),
-            None => Err(ResolveError::Unknown { requested }),
-        },
-        other => other,
-    };
-    let goat_resolved = match custom_resolved {
-        Ok(resolved) => overlay_goat_catalog(resolved, catalogs.command_code, &registry),
-        Err(ResolveError::Unknown { requested }) => {
-            overlay_unknown_goat(requested, catalogs.command_code, &registry)
-        }
-        other => other,
-    };
-    match goat_resolved {
-        Ok(resolved) => overlay_extra_catalogs(resolved, catalogs.extra),
-        Err(ResolveError::Unknown { requested }) => {
-            overlay_unknown_extra(requested, catalogs.extra)
-        }
-        other => other,
-    }
+    RuntimeCatalogIndex::from_catalogs(catalogs).resolve(requested)
 }
 
 fn extra_mapping(extra: &ExtraProviderCatalog, upstream_model: &str) -> ProviderMapping {
@@ -735,10 +998,11 @@ fn extra_raw_only_hit<'a>(
 fn overlay_extra_catalogs(
     resolved: ResolvedModel,
     extras: &[ExtraProviderCatalog],
+    replace_provider_mapping: bool,
 ) -> Result<ResolvedModel, ResolveError> {
     let mut current = resolved;
     for extra in extras {
-        current = overlay_one_extra(current, extra)?;
+        current = overlay_one_extra(current, extra, replace_provider_mapping)?;
     }
     Ok(current)
 }
@@ -746,14 +1010,24 @@ fn overlay_extra_catalogs(
 fn overlay_one_extra(
     resolved: ResolvedModel,
     extra: &ExtraProviderCatalog,
+    replace_provider_mapping: bool,
 ) -> Result<ResolvedModel, ResolveError> {
     let requested_name = resolved.requested();
     let public_hit = extra_public_hit(extra, requested_name);
     let raw_only_hit = extra_raw_only_hit(extra, requested_name);
     if let Some((_, upstream_model)) = raw_only_hit {
         let raw_mapping = extra_mapping(extra, upstream_model);
+        // A renamed builtin may have used its exact upstream as a generated
+        // shared alias. Keep the other providers on that existing name; the
+        // rename removes this mapping, not the shared alias's authority.
+        let remaining_generated_alias = !replace_provider_mapping
+            && matches!(&resolved, ResolvedModel::Alias { alias, .. }
+                if *alias == canonical_alias_for_provider_model(
+                    &extra.provider_id, upstream_model, &[], &[]));
         let conflicts = match &resolved {
-            ResolvedModel::Alias { mappings, .. } => !mappings.contains(&raw_mapping),
+            ResolvedModel::Alias { mappings, .. } => {
+                !remaining_generated_alias && !mappings.contains(&raw_mapping)
+            }
             ResolvedModel::PinnedRaw { mapping, .. } => mapping != &raw_mapping,
         };
         if conflicts {
@@ -782,12 +1056,13 @@ fn overlay_one_extra(
             alias,
             mut mappings,
         } => {
-            if let Some(existing) = mappings
-                .iter_mut()
-                .find(|mapping| mapping.provider_id.eq_ignore_ascii_case(&extra.provider_id))
+            if replace_provider_mapping
+                && let Some(existing) = mappings
+                    .iter_mut()
+                    .find(|mapping| mapping.provider_id.eq_ignore_ascii_case(&extra.provider_id))
             {
                 *existing = replacement;
-            } else {
+            } else if !mappings.contains(&replacement) {
                 mappings.push(replacement);
             }
             Ok(ResolvedModel::Alias {
@@ -1179,6 +1454,38 @@ pub fn published_routeable_aliases_with_runtime_catalogs(
     published_routeable_in(&build_runtime_registry(catalogs))
 }
 
+/// Client-visible names: generated and explicit aliases plus uniquely resolved
+/// exact Go IDs. Discovery alone does not create shared aliases. Hosts
+/// still apply protocol enablement and the operator publication switch.
+pub fn published_routeable_models_with_runtime_catalogs(
+    catalogs: RuntimeCatalogs<'_>,
+) -> Vec<PublishedAlias> {
+    RuntimeCatalogIndex::from_catalogs(catalogs).published_models()
+}
+
+/// Public names that resolve to this provider, independent of first-wins ownership.
+pub fn routeable_models_for_with_runtime_catalogs(
+    provider_id: &str,
+    catalogs: RuntimeCatalogs<'_>,
+) -> Vec<String> {
+    let index = RuntimeCatalogIndex::from_catalogs(catalogs);
+    let go = catalogs.go;
+    index
+        .published_models()
+        .into_iter()
+        .filter(|item| {
+            index.resolve(&item.alias).is_ok_and(|resolved| {
+                resolved.routeable_mappings().iter().any(|mapping| {
+                    mapping.provider_id == provider_id
+                        && (provider_id != OPENCODE_PROVIDER_ID
+                            || go.contains(&mapping.upstream_model))
+                })
+            })
+        })
+        .map(|item| item.alias)
+        .collect()
+}
+
 fn go_catalog_alias(model_id: &str) -> String {
     model_id
         .trim()
@@ -1206,6 +1513,29 @@ fn kimi_catalog_alias(model_id: &str) -> Option<&'static str> {
 
 fn command_catalog_alias(model_id: &str) -> Option<&'static str> {
     sealed_catalog_alias(model_id, COMMAND_CODE_GOAT_ALIASES)
+}
+
+/// Unique last-segment kebab names from slash (or other raw-shaped) Command
+/// IDs become Aliases even when they are not already code-owned. Slash-free
+/// unmatched rows stay raw pins. Existing Go/Zen names still join instead of
+/// stealing the alias.
+fn goat_leaf_alias_is_publishable(
+    model_id: &str,
+    alias: &str,
+    unique: bool,
+    go_model_ids: &[String],
+    registry: &Registry,
+) -> bool {
+    if !unique || alias.is_empty() || looks_raw_shaped(alias) {
+        return false;
+    }
+    if is_code_owned_alias(registry, alias) {
+        return true;
+    }
+    if !looks_raw_shaped(model_id) {
+        return false;
+    }
+    !go_model_ids.iter().any(|id| id.eq_ignore_ascii_case(alias))
 }
 
 fn is_code_owned_alias(registry: &Registry, alias: &str) -> bool {
@@ -1293,7 +1623,7 @@ pub fn canonical_alias_for_provider_model(
     }
     if provider_id == COMMAND_CODE_PROVIDER_ID {
         let candidate = command_alias_for_catalog(upstream_model, &registry);
-        return if is_code_owned_alias(&registry, &candidate) {
+        return if goat_leaf_alias_is_publishable(upstream_model, &candidate, true, &[], &registry) {
             candidate
         } else {
             String::new()

@@ -2,8 +2,8 @@
 
 # 手动客户端配置
 
-[旧应用子系统](applications.zh-CN.md)已退役。本指南用于通过普通 Gateway API 直接连接客户端。
-新的应用教程与自动连接器属于后续另行设计的替代方案。
+本指南通过普通 Gateway API 直接连接客户端。[应用页面](applications.zh-CN.md)还提供 Codex、Kimi Code、MiniMax Code 和 ZCode 的本机 BYOK 配置，以及 DSH 插件接入流程。
+这些流程自动创建或复用对应 harness 名称的普通 Key，使用全部已发布模型，无需再次单独选择模型。
 
 ## 接入未收录客户端
 
@@ -15,7 +15,6 @@
 | OpenAI Responses | `http://127.0.0.1:9042/v1` | `POST /v1/responses` | `Authorization: Bearer <key>` |
 | Anthropic Messages | 客户端会追加 `/v1/messages` 时使用 `http://127.0.0.1:9042` | `POST /v1/messages` | `x-api-key: <key>` |
 | Gemini | `http://127.0.0.1:9042`，API 版本为 `v1beta` | `POST /v1beta/models/{model}:generateContent` 或 `:streamGenerateContent` | `x-goog-api-key: <key>` |
-| Claude Desktop Gateway | `http://127.0.0.1:9042/claude-desktop` | `POST /claude-desktop/v1/messages` | Static API key / Bearer |
 
 若客户端要求填写 **完整 Endpoint** 而不是 Base URL，就使用表中的请求路径。若它会自动追加 `/v1`，填写根地址；若它要求 OpenAI API Base，通常填写带 `/v1` 的地址。最终以该客户端的官方文档为准。
 
@@ -26,8 +25,10 @@ curl http://127.0.0.1:9042/v1/models \
   -H "Authorization: Bearer <key>"
 ```
 
-这份列表是本地读取，包含当前可路由且由代码持有的 Alias 与合格 Custom ID。五类接口的最小请求体见[接入第一个客户端](first-client.zh-CN.md)。
+这份列表是本地读取，包含当前可路由且由代码持有的 Alias 与合格 Custom ID。四类接口的最小请求体见[接入第一个客户端](first-client.zh-CN.md)。
 
 配置完成后发送一次真实请求，并在 **日志** 中确认。
 
-[用户指南索引](../USER.zh-CN.md) · [文档索引](../README.zh-CN.md)
+---
+
+[用户指南索引](../USER.zh-CN.md) · [English](add-application.md) · [文档索引](../README.zh-CN.md)

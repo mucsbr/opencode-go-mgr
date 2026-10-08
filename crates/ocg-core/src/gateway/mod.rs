@@ -1,16 +1,22 @@
 pub mod attempt;
+pub(crate) mod attempt_pricing;
 pub mod classify;
+pub(crate) mod debug_capture;
 pub mod diagnostics;
 pub mod executor;
+pub(crate) mod failure;
 pub mod forwarder;
 pub mod free_models;
 pub mod handler;
 pub mod limit;
 pub mod listener;
 pub mod materialize;
+pub(crate) mod policy;
 pub mod protocol;
 pub mod protocol_stream;
 pub mod provider_adapter;
+pub(crate) mod recovery;
+pub(crate) mod replay;
 mod response;
 pub mod routing;
 pub mod wire;
@@ -40,7 +46,7 @@ fn request_body_limit(value: Option<&str>) -> usize {
     match value.trim().parse::<usize>() {
         Ok(bytes) if bytes > 0 => bytes,
         _ => {
-            eprintln!("Invalid OCG_MAX_REQUEST_BODY_BYTES; using the default 64 MiB limit");
+            tracing::warn!("Invalid OCG_MAX_REQUEST_BODY_BYTES; using the default 64 MiB limit");
             DEFAULT_GATEWAY_REQUEST_BODY_BYTES
         }
     }
@@ -64,14 +70,6 @@ fn inference_router_with_body_limit(state: CoreState, body_limit: usize) -> Rout
         .route("/v1/responses", post(handler::responses))
         .route("/v1/messages", post(handler::messages))
         .route("/v1/models", get(handler::models))
-        .route(
-            "/claude-desktop/v1/messages",
-            post(handler::claude_desktop_messages),
-        )
-        .route(
-            "/claude-desktop/v1/models",
-            get(handler::claude_desktop_models),
-        )
         .route(
             "/v1beta/models/{*model_action}",
             post(handler::gemini_model_action),

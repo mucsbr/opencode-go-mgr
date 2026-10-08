@@ -214,8 +214,8 @@ fn assemble_credential_snapshot(
             .get(&key.key)
             .is_some_and(|entry| entry.id == PRIMARY_KEY_ID)
         {
-            eprintln!(
-                "warning: enabled sub key `{}` shares the primary key's value; \
+            tracing::warn!(
+                "enabled sub key `{}` shares the primary key's value; \
                  attributing the value to the primary key",
                 key.id
             );
@@ -244,7 +244,7 @@ pub fn refresh_snapshot(host: &impl KeyHost) {
     match next {
         Ok(next) => host.replace_credential_snapshot(next),
         Err(error) => {
-            eprintln!("warning: failed to rebuild the credential snapshot: {error}");
+            tracing::warn!("failed to rebuild the credential snapshot: {error}");
         }
     }
 }
@@ -348,8 +348,8 @@ fn revoke_snapshot_value(
     host.with_credential_snapshot_mut(|snapshot| match snapshot.get(value) {
         Some(entry) if entry.id == key_id => snapshot.remove(value),
         Some(entry) => {
-            eprintln!(
-                "warning: value of sub key `{key_id}` collides with the primary key entry \
+            tracing::warn!(
+                "value of sub key `{key_id}` collides with the primary key entry \
                  (`{}`); keeping the primary snapshot entry",
                 entry.id
             );
@@ -400,6 +400,29 @@ pub fn create_sub_key(host: &impl KeyHost, name: &str) -> Result<SubGatewayKey, 
             Ok(entry)
         }
         Err(error) => Err(error),
+    }
+}
+
+/// Reuses an authenticating named application Key or creates one through the
+/// ordinary Key lifecycle. Caller holds `settings_update` across lookup/create.
+pub fn get_or_create_named_sub_key(
+    host: &impl KeyHost,
+    name: &str,
+) -> Result<(SubGatewayKey, bool), KeyError> {
+    let name = validate_name(name)?;
+    let existing = host
+        .list_active_sub_gateway_keys()
+        .map_err(|error| KeyError::internal("failed to list application keys", error))?
+        .into_iter()
+        .filter(|key| key.authenticates() && key.name.eq_ignore_ascii_case(&name))
+        .min_by(|left, right| {
+            left.created_at
+                .cmp(&right.created_at)
+                .then(left.id.cmp(&right.id))
+        });
+    match existing {
+        Some(key) => Ok((key, false)),
+        None => create_sub_key(host, &name).map(|key| (key, true)),
     }
 }
 

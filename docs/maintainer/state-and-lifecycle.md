@@ -2,7 +2,7 @@
 
 # State, Credentials, And Lifecycle
 
-## State, credentials, and settings
+## State, Credentials, And Settings
 
 `CoreStateInner` (`state.rs`) is shared by gateway, dashboard, and CLI.
 
@@ -13,27 +13,33 @@ Never acquire in reverse. Do not hold the routing lock across DB or
 network I/O. Async gates: `settings_host_effects` (persist → listener
 rebind → compensation) is acquired before `gateway_lifecycle` when a
 settings write also rebinds. Never hold a `parking_lot` lock across those
-awaits.
+awaits. Startup does not seed, repair, or activate price snapshots and does not
+start a price-fetch task. Opening the database does not settle historical
+credit receipts. A billing read reports active `pendingRequests` as 0. The
+stored receipt stays exact. Explicit calibration is not blocked by that receipt
+and does not delete it. The published `GatewayPreparationSnapshot` has no price
+field. Lock ordinal (6) `pricing` remains the in-memory pricing snapshot lock
+on `CoreStateInner`.
 
-From schema v27 the authoritative table is `access_keys`. Two credential
-tiers share that table (current schema v38) and one auth snapshot:
+The authoritative table for access keys is `access_keys`. Two credential
+tiers share that table (current schema; see
+[storage migration](storage-migration.md)) and one auth snapshot:
 
 - Primary key: fixed id `00000000-0000-0000-0000-000000000001`, display
   name `"Primary"`. Always enabled, never deleted. Public `AppConfig` and
-  dashboard APIs still expose `gateway_key`; sanitized config JSON stores
-  `gateway_key` as `""` after v27.
+  dashboard APIs expose `gateway_key`; sanitized config JSON stores
+  `gateway_key` as `""`.
 - Sub keys: non-primary rows, active ceiling 64, soft-delete keeps
   identity/name and clears the value. Lifecycle only through
-  `/dashboard/api/v3/keys*`. CLI has no sub-key commands.
+  `/dashboard/api/v4/keys*`. CLI has no sub-key commands.
 
 Primary/sub values are mutually exclusive
 (`gateway_keys::ensure_primary_value_allowed`) on dashboard, settings, and
 sub-key enable paths.
 
-`AppConfig` uses serde defaults for backward-compatible loading. A pre-1.3
-config without `claude_desktop_models` receives default Sonnet
-`minimax-m3` and is rewritten. Ordinary settings saves preserve the
-dedicated Claude Desktop mapping. Downstream client root URL priority:
+`AppConfig` uses serde defaults for backward-compatible loading. Unknown
+historical fields are ignored on load and omitted by the next canonical
+settings write. Downstream client root URL priority:
 non-empty `OCG_CLIENT_ROOT_URL` (read-only, never written back) > SQLite
 manual value > frontend derivation from production origin / dev Gateway
 port.
@@ -46,16 +52,18 @@ bootstrap the first administrator with **both** `OCG_ADMIN_USERNAME` and
 `OCG_ADMIN_PASSWORD`; setting only one fails startup; otherwise the first
 registration wins.
 
-Settings fetches GitHub Release metadata via `GET /dashboard/api/v3/settings/check-update`.
-Installed desktop runtimes with updater support can download, verify, and install
-signed updates; development builds, CLI, and Docker only receive metadata and
-release links. The outbound request is triggered by the user.
+Settings fetches GitHub Release metadata via
+`GET /dashboard/api/v4/settings/check-update`.
+Installed desktop runtimes with updater support can download, verify, and
+install signed updates; development builds, CLI, and Docker only receive
+metadata and release links. The outbound request is triggered by the user.
 
-## Account lifecycle and browser runtime
+## Account Lifecycle And Browser Runtime
 
-Schema v16 added `account_type` (`key | managed`) and `setup_step`
+`credentials` carry `account_type` (`key | managed`) and `setup_step`
 (`google_account → opencode_registration → payment → key_verification → ready`).
-Existing rows migrate to `key + ready`. A managed draft is persisted
+non-managed rows are `key + ready`. The leftover `accounts` table is gone after
+v52. A managed draft is persisted
 immediately with an empty key and `enabled=false`; selector, enable, and
 the request path all require both `ready` and a non-empty key.
 `google_account` is labeled **sign-in identity** in the UI and is
@@ -65,7 +73,8 @@ skippable.
 `DEFAULT_OPENCODE_INVITE_URL` (demo). Normalized values must be a
 credential-free HTTPS URL up to 2,048 characters whose host is exactly
 `opencode.ai` or `console.opencode.ai`. The dashboard edits that value on
-the OpenCode Go provider **Other** tab. Creating a managed draft can edit the invite
+the OpenCode Go provider **Settings** tab. Creating a managed draft can edit
+the invite
 URL and write it back to `opencode_invite_url` when it differs. Signup,
 registration, and payment remain manual in the isolated browser; the user
 copies the key back. Never add CDP autofill or automated payment clicks.
@@ -93,7 +102,7 @@ retry or rewind.
 
 Official Go usage (`go_usage.rs`, `https://opencode.ai/zen/go/v1/usage`) is
 the calibration baseline; `usage_sync.rs` coordinates it. Manual
-`POST /dashboard/api/v3/accounts/{id}/usage/refresh` and the background
+`POST /dashboard/api/v4/accounts/{id}/usage/refresh` and the background
 reconciler share one fetch + key-CAS + three-window calibration path.
 
 Ready+enabled accounts reconcile about hourly when they had local activity
@@ -112,8 +121,8 @@ around the earliest `resetsAt` with bounded jitter while respecting the
 active/inactive cadence. Failure backoff is 5m → 15m → 1h → 6h; never erase
 last success or the previous baseline.
 
-Sync metadata lives in `provider_usage_sync_state`; v27 drops the leftover
-`accounts.usage_sync_*` columns. The public Go docs have not listed this path.
+Sync metadata lives in `provider_usage_sync_state`.
+The public Go docs have not listed this path.
 
 Zen Free is database-owned: it can be enabled, disabled, and reordered,
 but cannot be created or deleted through generic account APIs. Command Code
@@ -121,7 +130,7 @@ accounts are routable when enabled, ready, and keyed; the Provider matrix owns
 their model supply, with GOAT preset rows on and additional rows off by default.
 Custom is catalog-routable after declaration; verification is optional.
 
-Browser: `GET /dashboard/api/v3/browser/capabilities`,
+Browser: `GET /dashboard/api/v4/browser/capabilities`,
 `POST /accounts/{id}/browser`, `DELETE /accounts/{id}/browser-profile`,
 and `/browser/sessions/{token}/ws`. Targets include Google signup/login,
 GitHub signup/login, the configured invite, and the OpenCode console
@@ -160,23 +169,43 @@ and profile are removed.
 ## Persistence
 
 `crates/ocg-core/src/db.rs` defines the SQLite schema, migrations, and
-queries. Current schema is **v38**. `provider_contracts.rs` owns provider
-contract scopes, per-model/per-protocol overrides, effective contract
-derivation, and model-protocol evidence. `models.rs` defines shared
-serde types and `AppConfig`. Key obfuscation is `ocg-infra::crypto`
-(facade `ocg_core::crypto`): this is lightweight obfuscation, not a KMS.
-Windows desktop uses `MachineBoundCipher`; CLI/Docker use
-`StaticKeyCipher` from `OCG_MANAGER_ENCRYPTION_KEY` or
-`<data-dir>/.encryption-key`. Production hosts must call
-`Database::open_with_cipher` so v27 ciphertext probes use the already
-resolved cipher. Account `key_cipher` / `password_cipher` are validated in
-place and **never re-encrypted**. A schema newer than this build supports
-fails closed.
+queries. The current schema version and its history live in
+[storage-migration.md](storage-migration.md). The current schema is v66.
+v60 additively stores the
+local per-Key recovery runtime column `credentials.quota_recovery_json`;
+portable export excludes it. Restart retains wait and backoff, not the
+probe lease. v66 additively stores nullable
+`credentials.goat_plan_cooldowns_json`: a closed `five_hours` / `week` /
+`month` map of absolute UTC deadlines for the receiving GOAT Key. Existing
+rows backfill NULL. Ordinary cooldown columns stay ordinary. Each window
+keeps the later deadline. When every active deadline has passed, the Key
+is eligible again; expiry does not force a sticky reset. The column
+survives restart. A longer `Retry-After` on that response stays
+process-local: it is not in the column and is not exported. Portable
+payload V12 carries the map separately from ordinary cooldowns; the
+envelope stays version 1. Schema 66 and payload V12 are internal versions,
+not the product release version. Pool joins, shared ordinary cooldown
+writes, and a sibling reset do not copy or clear the map. Manual cooldown
+reset of the selected Key clears that Key's map and fences an older
+in-flight reply; replacing the Key clears it; the same Key and a card move
+keep it. `provider_contracts.rs` owns
+provider contract scopes, per-model/per-protocol overrides, effective
+contract derivation, and model-protocol evidence. `models.rs` defines
+shared serde types and `AppConfig`. Local Key storage is
+`ocg-infra::crypto` (facade `ocg_core::crypto`): AES-256-GCM `v2:`
+ciphertext, not a KMS. Legacy XOR still decrypts; a correct
+`open_with_cipher` rewrites remaining account `key_cipher` /
+`password_cipher` rows to v2 in one transaction. Windows desktop uses
+`MachineBoundCipher`; CLI/Docker use `StaticKeyCipher` from
+`OCG_MANAGER_ENCRYPTION_KEY` or `<data-dir>/.encryption-key`. Production
+hosts must call `Database::open_with_cipher` so ciphertext probes use the
+already resolved cipher. A schema newer than this build supports fails
+closed.
 
-Historical versions still matter on upgrade:
+Historical schema versions matter on upgrade:
 
 - v16: managed setup columns.
-- v21: usage-sync metadata (later moved off `accounts` in v27).
+- v21: usage-sync metadata (now in `provider_usage_sync_state`).
 - v22: immutable provider/offering bindings, provider pricing/usage,
   quota windows, provider-aware forward logs.
 - v23: Plan verification, Alias / upstream log identity, optional native
@@ -232,7 +261,7 @@ Forward-log inserts go through `ocg-infra::sqlite_logs` (one explicit
 statement per helper). Callers own timestamps, diagnostics, cost policy,
 redaction, and transactions.
 
-## Per-node boundaries
+## Per-Node Boundaries
 
 Each node owns its account data and is managed through its own dashboard.
 
@@ -257,6 +286,7 @@ Updater is configured as a `CoreState` starter.
 `src-tauri/capabilities/default.json` has no updater permission.
 Updater outbound follows the process-wide **default-leg** proxy policy
 (List mode included).
+
 ---
 
 [Maintainer guide index](../MAINTAINER.md) · [简体中文](state-and-lifecycle.zh-CN.md) · [Docs index](../README.md)

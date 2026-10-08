@@ -8,7 +8,6 @@ export type DashboardApiV3 =
   | ControlRevision
   | MutationAck
   | MutationExpectation
-  | PricingRevision
   | V3Error
   | ConnectionInfo
   | ConnectionSubKey
@@ -42,6 +41,9 @@ export type DashboardApiV3 =
   | ZenFreeModels
   | ZenFreeModel
   | ProviderContracts
+  | ProviderCatalogPresentation
+  | ProviderModelPresentation
+  | ProviderModelAction
   | ProviderContractGroup
   | CustomEndpointContract
   | ProviderAccountChoice
@@ -57,20 +59,6 @@ export type DashboardApiV3 =
   | ProtocolProbeRequest
   | ProtocolProbeResult
   | ProtocolProbeResponse
-  | PricingSnapshot
-  | PricingLimits
-  | PricingModel
-  | PricingAdjustment
-  | PricingTimeWindow
-  | PricingRefresh
-  | PricingRefreshStatus
-  | PricingMultiplierChange
-  | PricingRefreshUpdate
-  | PricingRefreshPolicy
-  | PricingMultipliersUpdate
-  | PricingMultiplierWrite
-  | ProviderPricing
-  | PricingAvailability
   | GatewayStatus
   | ApplicationModels
   | DashboardSummary
@@ -103,8 +91,6 @@ export type DashboardApiV3 =
   | ProxyTestResponse
   | CustomModelDiscoveryRequest
   | CustomModelDiscoveryResponse
-  | ClaudeDesktopModels
-  | ClaudeDesktopModelsUpdate
   | AccountVerify
   | BrowserMode
   | BrowserTarget
@@ -120,10 +106,6 @@ export type DashboardApiV3 =
   | UsageRefreshThrottleError
   | ProviderModelsRefreshUpdate
   | ProviderModels
-  | ProviderPricingSnapshot
-  | ProviderPricingValue
-  | ProviderPricingRefresh
-  | ProviderPricingRefreshUpdate
   | AccountExportRequest
   | AccountExport
   | AccountImportPreviewRequest
@@ -132,15 +114,6 @@ export type DashboardApiV3 =
   | AccountImportDisposition
   | AccountImportRequest
   | AccountImportResult
-  | ApplicationConnectorAction
-  | ApplicationConnectorStatus
-  | ApplicationConnectorChange
-  | ApplicationConnectorItem
-  | ApplicationConnectors
-  | ApplicationConnectorPreviewRequest
-  | ApplicationConnectorPreview
-  | ApplicationConnectorCommitRequest
-  | ApplicationConnectorCommitResult
   | CpaIntegration
   | CpaIntegrationUpdate
   | CpaTestRequest
@@ -162,6 +135,7 @@ export type DashboardApiV3 =
   | CpaCliImportRequest
   | CpaCliImportResult
   | CpaRuntime
+  | CpaRuntimeActions1
   | CpaRuntimePhase
   | CpaRuntimeCheck
   | CpaRuntimeInstall
@@ -169,19 +143,25 @@ export type DashboardApiV3 =
   | CpaRuntimeKey
   | CpaRuntimeKeys
   | CpaRuntimeKeyCreated
-  | DynamicProviderAuthKind
-  | DynamicProviderModel
-  | DynamicProvider
-  | DynamicProviderCreate
-  | DynamicProviderUpdate
-  | DynamicProviderMutation
-  | DynamicProviderDiscoverRequest
-  | DynamicProviderDiscoverResponse
-  | DynamicProviderTestRequest
-  | DynamicProviderTestResponse
+  | ProviderDefinitionAuthKind
+  | ProviderDefinitionModel
+  | ProviderDefinition
+  | ProviderDefinitionCreate
+  | ProviderDefinitionUpdate
+  | ProviderDefinitionMutation
+  | ProviderDefinitionDiscoverRequest
+  | ProviderDefinitionDiscoverResponse
+  | ProviderDefinitionTestRequest
+  | ProviderDefinitionTestResponse
   | OllamaBillingTier
-  | ModelAliasBinding
-  | ModelAliasBindingsUpdate;
+  | PlatformAccounts
+  | PlatformAccount
+  | PlatformLink
+  | PlatformSnapshot
+  | PlatformCreate
+  | PlatformUpdate
+  | PlatformLinkWrite
+  | PlatformRefresh;
 /**
  * Which listed models take the list-mode exception leg.
  */
@@ -233,7 +213,7 @@ export type AccountModelCapabilityWrite = AccountModelCapabilityWriteCanonical |
 /**
  * Custom auth scheme. Wire values match V2 kebab-case.
  */
-export type AccountAuthScheme = "bearer" | "x-api-key";
+export type AccountAuthScheme = "bearer" | "x-api-key" | "api-key";
 /**
  * Last explicit probe outcome stored on evidence. Distinct from
  * [`ProtocolProbeResult`].
@@ -252,22 +232,6 @@ export type ContractEvidenceSource = "static" | "preset" | "probe_confirmed" | "
  */
 export type ContractScopeKind = "provider" | "custom_endpoint";
 /**
- * Official Peak / Off-Peak row. Wire values stay snake_case.
- */
-export type PricingTimeWindow = "always" | "off_peak" | "peak";
-/**
- * Refresh outcome. Wire values stay snake_case.
- */
-export type PricingRefreshStatus = "success" | "unchanged" | "needs_confirmation" | "failed_no_change";
-/**
- * Refresh confirmation policy. Wire values stay snake_case.
- */
-export type PricingRefreshPolicy = "keep_current" | "use_official";
-/**
- * Registry pricing availability. Wire values stay snake_case.
- */
-export type PricingAvailability = "available" | "unavailable" | "not_applicable" | "unpriced";
-/**
  * Registry usage availability. Wire values stay snake_case.
  */
 export type UsageAvailability = "available" | "unavailable" | "local_state";
@@ -285,23 +249,16 @@ export type BrowserTarget = "google_signup" | "google_login" | "github_signup" |
  */
 export type DesktopUpdatePhase = "idle" | "checking" | "downloading" | "installing" | "failed";
 export type AccountImportDisposition = "import" | "imported" | "merge" | "merged" | "duplicate";
-/**
- * Operation supported by the local Desktop application-connector Host.
- */
-export type ApplicationConnectorAction = "connect" | "restore";
-/**
- * Secret-free connector state. Automatic writes exist only in the local
- * Desktop Host; every other runtime reports `unsupported_runtime`.
- */
-export type ApplicationConnectorStatus =
-  "unsupported_runtime" | "not_detected" | "manual_only" | "ready" | "connected" | "conflict" | "partial";
 export type CpaOAuthProvider = "codex" | "anthropic" | "antigravity" | "kimi" | "xai";
 export type CpaCliImportOutcome = "imported" | "alreadyImported" | "unconfirmed";
 export type CpaRuntimePhase = "idle" | "checking" | "downloading" | "installing" | "starting" | "failed";
 /**
- * Auth kind owned by a dynamic Provider. Independent of protocol.
+ * Auth kind owned by a Provider definition. Independent of protocol.
+ * Nullable on the wire because builtin rows leave the field empty.
  */
-export type DynamicProviderAuthKind = "bearer" | "x-api-key" | "none";
+export type ProviderDefinitionAuthKind = "bearer" | "x-api-key" | "api-key" | "none";
+export type PlatformKind = "new_api" | "sub2api";
+export type PlatformQuotaKind = "wallet" | "subscription" | "key_limit";
 
 /**
  * Live CAS token, process generation, and pricing snapshot id.
@@ -328,12 +285,6 @@ export interface MutationAck {
 export interface MutationExpectation {
   expectedRevision: number;
   processGeneration: number;
-}
-/**
- * Pricing snapshot identity. Distinct from the u64 settings CAS token.
- */
-export interface PricingRevision {
-  pricingRevision: string;
 }
 /**
  * Stable non-2xx JSON envelope for every Dashboard V3 error.
@@ -659,14 +610,34 @@ export interface ProviderCatalogEntry {
   creationAvailability: string;
   creationUnavailableReason: string | null;
   credentialKind: AccountCredentialKind;
+  /**
+   * Whether the dashboard may DELETE this entry. Same rules as `editable`.
+   */
+  deletable: boolean;
   displayFamily: string;
   displayName: string;
+  /**
+   * Whether the dashboard may PATCH this entry. Always `false` for
+   * `builtin` rows; `true` for `preset`/`custom`.
+   */
+  editable: boolean;
   formFields: ProviderCatalogFormField[];
   keyPrefix: string | null;
   managedRegistration: boolean;
   manualUsageCalibration: boolean;
   modelAliases: string[];
   modelSource: string;
+  /**
+   * Plan/api offering label carried by the catalog row. Builtin rows use
+   * the sealed builtin map; dynamic rows mirror the persisted `offering`.
+   */
+  offering: string;
+  /**
+   * Row provenance in the unified `providers` table. Wire values:
+   * `builtin` (sealed adapter), `preset` (preset-derived dynamic row),
+   * `custom` (manual dynamic row).
+   */
+  origin: "builtin" | "preset" | "custom";
   pricingAvailability: string;
   providerId: string;
   quotaScope: AccountQuotaScope;
@@ -741,20 +712,11 @@ export interface ZenFreeModel {
  * are display-only and must not be sent as `expectedRevision`.
  */
 export interface ProviderContracts {
-  aliasBindings: ModelAliasBinding[];
   customEndpoints: CustomEndpointContract[];
   pricingRevision: string;
   processGeneration: number;
   providers: ProviderContractGroup[];
   revision: number;
-}
-/**
- * One administrator-confirmed public Alias mapping for a sealed Provider.
- */
-export interface ModelAliasBinding {
-  alias: string;
-  providerId: string;
-  upstreamModel: string;
 }
 /**
  * One Custom API account scope. Distinct from built-in provider groups.
@@ -766,6 +728,7 @@ export interface CustomEndpointContract {
   catalogRoutable: boolean;
   disabledReasons: string[];
   models: EffectiveModelContract[];
+  presentation: ProviderCatalogPresentation | null;
   pricing: CapabilitySummary;
   productionInference: boolean;
   providerId: string;
@@ -841,6 +804,37 @@ export interface EffectiveProtocolEvidence {
   verifiedAt: string | null;
 }
 /**
+ * Canonical catalog facts committed directly from a mutation receipt.
+ */
+export interface ProviderCatalogPresentation {
+  allDisabled: boolean;
+  models: ProviderModelPresentation[];
+  total: number;
+}
+export interface ProviderModelPresentation {
+  actions: ProviderModelAction[];
+  contract: EffectiveModelContract;
+  effectiveOn: boolean;
+  publicModel: string;
+  targetProtocol: AccountUpstreamProtocol | null;
+  testProtocol: AccountUpstreamProtocol | null;
+  upstreamModel: string;
+  upstreamOverride: ProviderModelUpstreamOverride | null;
+  writableProtocols: AccountUpstreamProtocol[];
+}
+export interface ProviderModelAction {
+  allowed: boolean;
+  key: string;
+  reason: string | null;
+}
+/**
+ * One public-to-upstream mapping owned by a Provider definition.
+ */
+export interface ProviderModelUpstreamOverride {
+  endpointUrl: string;
+  protocol: AccountUpstreamProtocol;
+}
+/**
  * Registry pricing or usage availability copied as display data.
  */
 export interface CapabilitySummary {
@@ -856,6 +850,7 @@ export interface ProviderContractGroup {
   catalogRoutable: boolean;
   disabledReasons: string[];
   models: EffectiveModelContract[];
+  presentation: ProviderCatalogPresentation | null;
   pricing: CapabilitySummary;
   productionInference: boolean;
   providerId: string;
@@ -878,6 +873,10 @@ export interface ProviderContractGroup {
  * An empty `overrides` array is rejected by handlers.
  */
 export interface ModelProtocolOverridesUpdate {
+  /**
+   * Explicit consent to add this batch's enabled builtin endpoint grants.
+   */
+  authorizeCredentialIds?: string[];
   expectedRevision: number;
   overrides: ModelProtocolOverride[];
   processGeneration: number;
@@ -887,6 +886,11 @@ export interface ModelProtocolOverridesUpdate {
  */
 export interface ModelProtocolOverride {
   modelId: string;
+  /**
+   * Remember this conversion-default protocol, even while disabled.
+   * Omitted or false preserves the saved choice; static reset clears it.
+   */
+  preferred?: boolean;
   protocol: AccountUpstreamProtocol;
   state: ProtocolOverrideState;
 }
@@ -930,148 +934,6 @@ export interface ProtocolProbeResponse {
   revision: number;
 }
 /**
- * Dashboard V3 pricing snapshot. Distinct from `kernel::pricing::PricingSnapshot`
- * and from the stored provider pricing blob.
- *
- * `revision` is the settings CAS token. The official snapshot id is
- * `pricingRevision` and must never be named `revision` on this wire type.
- */
-export interface PricingSnapshot {
-  activatedAt: string;
-  adjustmentPolicyVersion: string;
-  contentHash: string;
-  documentUpdatedAt: string;
-  limits: PricingLimits;
-  models: PricingModel[];
-  pricingRevision: string;
-  processGeneration: number;
-  revision: number;
-  sourceUrl: string;
-}
-/**
- * OpenCode Go 5h / week / month usage windows.
- */
-export interface PricingLimits {
-  window5h: number;
-  windowMonth: number;
-  windowWeek: number;
-}
-/**
- * One official model row, including optional cache-write and token-tier bounds.
- */
-export interface PricingModel {
-  adjustments: PricingAdjustment[];
-  cacheRead: number;
-  cacheWrite: number | null;
-  displayName: string;
-  input: number;
-  maxInputTokens: number | null;
-  minInputTokens: number | null;
-  modelId: string;
-  output: number;
-  quotaMultiplier: number;
-  timeWindow: PricingTimeWindow;
-  usage: number;
-}
-/**
- * One documented local adjustment on a model row.
- */
-export interface PricingAdjustment {
-  appliesTo: string;
-  label: string;
-  multiplier: number;
-}
-/**
- * Pricing refresh result. Nested `snapshot` is required; nullable fields emit `T | null`.
- */
-export interface PricingRefresh {
-  error: string | null;
-  multiplierChanges: PricingMultiplierChange[];
-  officialContentHash: string | null;
-  refreshStatus: PricingRefreshStatus;
-  snapshot: PricingSnapshot;
-}
-/**
- * One model whose official multiplier differs from the active snapshot.
- */
-export interface PricingMultiplierChange {
-  currentMultiplier: number;
-  modelId: string;
-  officialMultiplier: number;
-}
-/**
- * POST pricing-refresh body. CAS tokens and `expectedPricingRevision` are
- * required; `policy` and `expectedOfficialContentHash` may be omitted.
- */
-export interface PricingRefreshUpdate {
-  expectedOfficialContentHash?: string | null;
-  expectedPricingRevision: string;
-  expectedRevision: number;
-  policy?: PricingRefreshPolicy | null;
-  processGeneration: number;
-}
-/**
- * PUT provider pricing-multipliers body. CAS tokens,
- * `expectedPricingRevision` (the selected provider's active revision), and
- * `multipliers` are required.
- */
-export interface PricingMultipliersUpdate {
-  expectedPricingRevision: string;
-  expectedRevision: number;
-  multipliers: PricingMultiplierWrite[];
-  processGeneration: number;
-}
-/**
- * One multiplier write. Handlers validate model id, range, and uniqueness.
- */
-export interface PricingMultiplierWrite {
-  modelId: string;
-  multiplier: number;
-}
-/**
- * Provider-scoped pricing. `snapshot` is required `T | null` and never
- * carries a raw stored pricing blob.
- */
-export interface ProviderPricing {
-  availability: PricingAvailability;
-  pricingRevision: string;
-  processGeneration: number;
-  providerId: string;
-  providerPricingRevision: string;
-  providerSnapshot: ProviderPricingSnapshot | null;
-  revision: number;
-  snapshot: PricingSnapshot | null;
-}
-/**
- * Provider-neutral immutable pricing snapshot. GOAT uses this shape both for
- * dashboard display and provider-scoped per-request cost attribution.
- */
-export interface ProviderPricingSnapshot {
-  activatedAt: string;
-  contentHash: string;
-  documentUpdatedAt: string | null;
-  evidence: string;
-  revision: string;
-  sourceUrl: string;
-  values: ProviderPricingValue[];
-}
-export interface ProviderPricingValue {
-  cacheReadPerMillion: number | null;
-  cacheWritePerMillion: number | null;
-  currency: string | null;
-  displayName: string;
-  inputPerMillion: number | null;
-  maxInputTokens: number | null;
-  minInputTokens: number | null;
-  modelAllowance: number | null;
-  modelId: string;
-  outputPerMillion: number | null;
-  paidPlanPrice: number | null;
-  planLimit: number | null;
-  quotaMultiplier: number | null;
-  timeWindow: PricingTimeWindow;
-}
-/**
  * Secret-free gateway listener view. The plaintext Key lives only on
  * [`ConnectionInfo`].
  */
@@ -1085,7 +947,7 @@ export interface GatewayStatus {
   upstreamBaseUrl: string;
 }
 /**
- * Local Applications picker: Go routable Alias 鈭?current pricing snapshot.
+ * Local Go-routable Alias ∩ current Go pricing snapshot (no request-time upstream).
  */
 export interface ApplicationModels {
   models: string[];
@@ -1100,13 +962,13 @@ export interface ApplicationModels {
 export interface DashboardSummary {
   availableAccounts: number;
   gatewayRunning: boolean;
-  monthCost: number;
+  monthCost: number | null;
   pricingRevision: string;
   processGeneration: number;
   revision: number;
-  todayCost: number;
+  todayCost: number | null;
   totalAccounts: number;
-  weekCost: number;
+  weekCost: number | null;
 }
 /**
  * One UTC day / model token bucket. `date` is `YYYY-MM-DD`.
@@ -1201,7 +1063,7 @@ export interface ForwardLog {
 export interface ForwardLogSummary {
   cachedTokens: number;
   completionTokens: number;
-  cost: number;
+  cost: number | null;
   promptTokens: number;
   totalRequests: number;
 }
@@ -1245,6 +1107,8 @@ export interface ForwardLogModels {
  * GET `/logs/gateway` query. All fields may be omitted.
  */
 export interface GatewayLogQuery {
+  category?: string | null;
+  level?: string | null;
   limit?: number | null;
   requestId?: string | null;
 }
@@ -1277,8 +1141,10 @@ export interface DailyTokensQuery {
 /**
  * GET `/accounts/{id}/usage` body. Distinct from `models::UsageWindow`.
  *
- * `revision` is the settings CAS token and is not advanced by calibration.
- * `pricingRevision` is present when the projection uses the live Go snapshot.
+ * Window fields are observed percent used against a limit of 100.
+ * `None` means no official or manual percent evidence. `revision` is the
+ * settings CAS token and is not advanced by calibration. `pricingRevision`
+ * is always absent: usage is no longer a pricing CAS token.
  */
 export interface UsageWindow {
   accountId: string;
@@ -1288,14 +1154,15 @@ export interface UsageWindow {
   resetsInMonth: string | null;
   resetsInWeek: string | null;
   revision: number;
-  window5h: number;
-  windowMonth: number;
-  windowWeek: number;
+  window5h: number | null;
+  windowMonth: number | null;
+  windowWeek: number | null;
 }
 /**
  * PATCH `/accounts/{id}/usage` envelope. Calibration does not bump revision.
  */
 export interface UsageMutation {
+  observedAt: string;
   processGeneration: number;
   revision: number;
   usage: UsageWindow;
@@ -1316,8 +1183,7 @@ export interface AccountUsageUpdate {
 /**
  * GET `/accounts/{id}/provider-usage` body. Distinct from stored quota rows.
  *
- * `pricingRevision` is present when live Go quota windows use one captured
- * pricing snapshot.
+ * `pricingRevision` is always absent. Usage is no longer a pricing CAS token.
  */
 export interface ProviderUsage {
   accountId: string;
@@ -1462,30 +1328,6 @@ export interface CustomModelDiscoveryResponse {
   truncated: boolean;
 }
 /**
- * GET/PUT `/claude-desktop/models` resource. Distinct from `AppConfig` and
- * from `models::ClaudeDesktopModels`. Role values are the resolved mapping
- * (empty roles inherit the first configured model). CAS tokens follow the
- * Settings convention: `revision` and `processGeneration` only.
- */
-export interface ClaudeDesktopModels {
-  haiku: string;
-  opus: string;
-  processGeneration: number;
-  revision: number;
-  sonnet: string;
-}
-/**
- * PUT `/claude-desktop/models` body. CAS tokens and all three roles are
- * required. Unknown fields, including any Key material, are rejected.
- */
-export interface ClaudeDesktopModelsUpdate {
-  expectedRevision: number;
-  haiku: string;
-  opus: string;
-  processGeneration: number;
-  sonnet: string;
-}
-/**
  * POST `/accounts/{id}/verify` body. CAS tokens are required. Unknown
  * fields, including any Key material, are rejected.
  */
@@ -1572,8 +1414,8 @@ export interface AccountManagedKeyVerify {
 }
 /**
  * POST `/accounts/{id}/usage/refresh` result. Nested `usage` is the V3
- * window projection; `revision` is captured after the provider-specific
- * refresh returns and is not advanced by official calibration.
+ * window projection; `revision` is captured after the shared coordinator
+ * returns and is not advanced by official calibration.
  */
 export interface UsageRefresh {
   lastSuccessAt: string;
@@ -1623,38 +1465,6 @@ export interface ProviderModels {
   refreshedAt: string;
   revision: number;
   sourceUrl: string;
-}
-/**
- * Result of refreshing the priced snapshot owned by one Provider. Provider
- * failures are isolated: this response never represents a cross-Provider
- * transaction.
- */
-export interface ProviderPricingRefresh {
-  error: string | null;
-  multiplierChanges: PricingMultiplierChange[];
-  officialContentHash: string | null;
-  pricingRevision: string;
-  processGeneration: number;
-  providerId: string;
-  providerPricingRevision: string;
-  refreshStatus: PricingRefreshStatus;
-  revision: number;
-  /**
-   * The refreshed Go snapshot. Provider-neutral plans expose their active
-   * snapshot through the provider pricing read endpoint instead.
-   */
-  snapshot: PricingSnapshot | null;
-}
-/**
- * POST Provider pricing-refresh body. The Provider-local pricing revision is
- * distinct from the global Go `pricingRevision` control token.
- */
-export interface ProviderPricingRefreshUpdate {
-  expectedOfficialContentHash?: string | null;
-  expectedProviderPricingRevision: string;
-  expectedRevision: number;
-  policy?: PricingRefreshPolicy | null;
-  processGeneration: number;
 }
 /**
  * POST `/accounts/transfer/export` body. The password is write-only and used
@@ -1725,84 +1535,6 @@ export interface AccountImportResult {
   duplicateAccounts: number;
   importedAccounts: number;
   items: AccountImportPreviewItem[];
-  processGeneration: number;
-  revision: number;
-}
-/**
- * One redacted field-level change. Sensitive values are represented by a
- * fixed mask; this DTO never carries a plaintext Key or whole config file.
- */
-export interface ApplicationConnectorChange {
-  after: string | null;
-  before: string | null;
-  field: string;
-  sensitive: boolean;
-}
-/**
- * One of the eight statically supported local client surfaces.
- */
-export interface ApplicationConnectorItem {
-  automatic: boolean;
-  detail: string | null;
-  detected: boolean;
-  id: string;
-  status: ApplicationConnectorStatus;
-  targetPaths: string[];
-}
-/**
- * GET `/applications/connectors` response.
- */
-export interface ApplicationConnectors {
-  items: ApplicationConnectorItem[];
-  processGeneration: number;
-  revision: number;
-}
-/**
- * POST `/applications/connectors/{id}/preview` request. Paths, Gateway URLs,
- * config text and Key material are intentionally not accepted from callers.
- */
-export interface ApplicationConnectorPreviewRequest {
-  action: ApplicationConnectorAction;
-  keyId?: string | null;
-  modelValues?: {
-    [k: string]: string;
-  };
-}
-/**
- * Redacted preview tied to the current target-file state by `fingerprint`.
- */
-export interface ApplicationConnectorPreview {
-  action: ApplicationConnectorAction;
-  changes: ApplicationConnectorChange[];
-  detail: string | null;
-  fingerprint: string;
-  id: string;
-  processGeneration: number;
-  revision: number;
-  status: ApplicationConnectorStatus;
-  targetPaths: string[];
-}
-/**
- * POST `/applications/connectors/{id}/commit` request. CAS protects the OCG
- * selection while `previewFingerprint` protects the external config files.
- */
-export interface ApplicationConnectorCommitRequest {
-  action: ApplicationConnectorAction;
-  expectedRevision: number;
-  keyId?: string | null;
-  modelValues?: {
-    [k: string]: string;
-  };
-  previewFingerprint: string;
-  processGeneration: number;
-}
-/**
- * Successful commit result. The settings revision advances exactly once for
- * a real external write and stays unchanged for a verified no-op.
- */
-export interface ApplicationConnectorCommitResult {
-  changed: boolean;
-  connector: ApplicationConnectorItem;
   processGeneration: number;
   revision: number;
 }
@@ -2017,10 +1749,18 @@ export interface CpaCliImportResult {
  * installed desktop Host on Windows x64, macOS, or Linux x64.
  */
 export interface CpaRuntime {
+  actions: CpaRuntimeActions;
   assetSha256: string | null;
   baseUrl: string | null;
+  clientKeysAvailable: boolean;
+  codexDeviceLoginAvailable: boolean;
   currentOperation: string | null;
   currentVersion: string | null;
+  /**
+   * Last explicit Start/Stop intent for the OCG-owned child. True means the
+   * next Open Console Gateway process should restore that child once.
+   */
+  desiredRunning: boolean;
   error: string | null;
   installed: boolean;
   latestVersion: string | null;
@@ -2031,9 +1771,31 @@ export interface CpaRuntime {
   processGeneration: number;
   revision: number;
   running: boolean;
+  startupRestorePending: boolean;
   supported: boolean;
   unavailableReason: string | null;
   updateAvailable: boolean;
+}
+/**
+ * Authoritative eligibility; clients may additionally gate local requests.
+ */
+export interface CpaRuntimeActions {
+  checkUpdate: boolean;
+  install: boolean;
+  remove: boolean;
+  rollback: boolean;
+  start: boolean;
+  stop: boolean;
+  update: boolean;
+}
+export interface CpaRuntimeActions1 {
+  checkUpdate: boolean;
+  install: boolean;
+  remove: boolean;
+  rollback: boolean;
+  start: boolean;
+  stop: boolean;
+  update: boolean;
 }
 export interface CpaRuntimeCheck {
   currentVersion: string | null;
@@ -2041,6 +1803,7 @@ export interface CpaRuntimeCheck {
   processGeneration: number;
   releaseUrl: string;
   revision: number;
+  runtime: CpaRuntime;
   updateAvailable: boolean;
 }
 /**
@@ -2082,69 +1845,107 @@ export interface CpaRuntimeKeyCreated {
   revision: number;
   secret: string;
 }
-/**
- * One public-to-upstream mapping owned by a dynamic Provider.
- */
-export interface DynamicProviderModel {
+export interface ProviderDefinitionModel {
   publicModel: string;
   upstreamModel: string;
+  upstreamOverride?: ProviderModelUpstreamOverride | null;
 }
 /**
- * Secret-free dynamic Provider definition.
+ * Secret-free Provider definition. Surfaces both builtin and dynamic rows
+ * through the same wire shape. `endpointUrl` / `upstreamProtocol` /
+ * `authKind` are nullable because builtin rows leave them empty (the sealed
+ * adapter drives those at call time).
  */
-export interface DynamicProvider {
-  authKind: DynamicProviderAuthKind;
+export interface ProviderDefinition {
+  /**
+   * Nullable: builtin rows leave the field empty.
+   */
+  authKind?: ProviderDefinitionAuthKind | null;
   createdAt: string;
-  endpointUrl: string;
+  /**
+   * Whether the dashboard may DELETE this row. Always `false` for builtin.
+   */
+  deletable: boolean;
+  /**
+   * Whether the dashboard may PATCH this row. Always `false` for builtin.
+   */
+  editable: boolean;
+  /**
+   * Nullable: builtin rows leave the field empty.
+   */
+  endpointUrl?: string | null;
   id: string;
-  models: DynamicProviderModel[];
+  /**
+   * Empty for builtin rows; builtin catalogs feed the contract projection.
+   */
+  models: ProviderDefinitionModel[];
   name: string;
+  /**
+   * Plan/api offering label persisted alongside the row.
+   */
+  offering: string;
+  /**
+   * Row provenance: `builtin` | `preset` | `custom`.
+   */
+  origin: "builtin" | "preset" | "custom";
+  presetId?: string | null;
   processGeneration: number;
   revision: number;
   updatedAt: string;
-  upstreamProtocol: AccountUpstreamProtocol;
+  /**
+   * Nullable: builtin rows leave the field empty.
+   */
+  upstreamProtocol?: AccountUpstreamProtocol | null;
 }
 /**
- * POST `/providers` body. Creates the definition, mappings, and first account.
+ * POST `/providers` body. Creates the definition and mappings.
+ * A Key on keyed auth creates the first account in the same write (Accounts add).
+ * Keyed auth may omit `key` to save the definition only; add Keys on Accounts.
+ * No-auth always creates the singleton account.
  */
-export interface DynamicProviderCreate {
+export interface ProviderDefinitionCreate {
   accountName?: string | null;
-  authKind: DynamicProviderAuthKind;
+  authKind: ProviderDefinitionAuthKind;
   endpointUrl: string;
   expectedRevision: number;
   key?: string | null;
-  models: DynamicProviderModel[];
+  models: ProviderDefinitionModel[];
   name: string;
   notes?: string | null;
+  presetId?: string | null;
   processGeneration: number;
   upstreamProtocol: AccountUpstreamProtocol;
 }
 /**
  * PATCH `/providers/{providerId}` body. Full replacement of mutable config.
  */
-export interface DynamicProviderUpdate {
-  authKind: DynamicProviderAuthKind;
+export interface ProviderDefinitionUpdate {
+  authKind: ProviderDefinitionAuthKind;
   endpointUrl: string;
   expectedRevision: number;
   key?: string | null;
-  models: DynamicProviderModel[];
+  models: ProviderDefinitionModel[];
   name: string;
+  /**
+   * Omitted/null preserves provenance; an empty string clears it.
+   */
+  presetId?: string | null;
   processGeneration: number;
   upstreamProtocol: AccountUpstreamProtocol;
 }
 /**
- * Mutation result for a dynamic Provider write.
+ * Mutation result for a Provider definition write.
  */
-export interface DynamicProviderMutation {
+export interface ProviderDefinitionMutation {
   processGeneration: number;
-  provider: DynamicProvider;
+  provider: ProviderDefinition;
   revision: number;
 }
 /**
  * POST `/providers/models/discover` body. Operational probe; no CAS bump.
  */
-export interface DynamicProviderDiscoverRequest {
-  authKind: DynamicProviderAuthKind;
+export interface ProviderDefinitionDiscoverRequest {
+  authKind: ProviderDefinitionAuthKind;
   endpointUrl: string;
   key?: string | null;
   upstreamProtocol: AccountUpstreamProtocol;
@@ -2152,7 +1953,7 @@ export interface DynamicProviderDiscoverRequest {
 /**
  * Discovery result. Never includes the submitted Key.
  */
-export interface DynamicProviderDiscoverResponse {
+export interface ProviderDefinitionDiscoverResponse {
   models: string[];
   processGeneration: number;
   revision: number;
@@ -2161,8 +1962,8 @@ export interface DynamicProviderDiscoverResponse {
 /**
  * POST `/providers/test` body. Operational probe; no CAS bump.
  */
-export interface DynamicProviderTestRequest {
-  authKind: DynamicProviderAuthKind;
+export interface ProviderDefinitionTestRequest {
+  authKind: ProviderDefinitionAuthKind;
   endpointUrl: string;
   key?: string | null;
   publicModel: string;
@@ -2172,17 +1973,145 @@ export interface DynamicProviderTestRequest {
 /**
  * Model-test result. Never includes the submitted Key.
  */
-export interface DynamicProviderTestResponse {
+export interface ProviderDefinitionTestResponse {
   error: string | null;
   ok: boolean;
   processGeneration: number;
   revision: number;
 }
+export interface PlatformAccounts {
+  accounts: PlatformAccount[];
+  links: PlatformLink[];
+  processGeneration: number;
+  revision: number;
+}
+export interface PlatformAccount {
+  baseUrl: string;
+  hasUserCredential: boolean;
+  id: string;
+  kind: PlatformKind;
+  name: string;
+  snapshot: PlatformSnapshot | null;
+  version: number;
+}
+export interface PlatformSnapshot {
+  billingPreference: string | null;
+  /**
+   * Fixed component/error codes only, never upstream bodies or credentials.
+   */
+  errors: string[];
+  groups: PlatformGroup[];
+  models: PlatformModel[];
+  observedAt: number;
+  prices: PlatformPrice[];
+  quotas: PlatformQuota[];
+  stale: boolean;
+  walletOverflow: boolean | null;
+}
+export interface PlatformGroup {
+  autoGroups: string[];
+  id: string | null;
+  platform: string | null;
+  subscriptionType: string | null;
+  verified: boolean;
+}
+export interface PlatformModel {
+  groupId: string | null;
+  id: string;
+  platform: string | null;
+  /**
+   * A storefront row is never proof of inference permission.
+   */
+  source: string;
+}
+export interface PlatformPrice {
+  cacheRead: number | null;
+  cacheWrite: number | null;
+  currency: string;
+  groupId: string | null;
+  /**
+   * All numeric rates are currency per token, never per million tokens.
+   */
+  input: number | null;
+  model: string;
+  officialReference: boolean;
+  output: number | null;
+  source: string;
+  unavailableReason: string | null;
+  validUntil: number;
+}
+export interface PlatformQuota {
+  expiresAt: number | null;
+  kind: PlatformQuotaKind;
+  limit: number | null;
+  period: string | null;
+  remaining: number | null;
+  resetsAt: number | null;
+  scopeId: string;
+  source: string;
+  unit: string;
+  unlimited: boolean;
+  used: number | null;
+}
+export interface PlatformLink {
+  accountId: string;
+  group: PlatformGroup;
+  platformAccountId: string;
+  snapshot: PlatformSnapshot | null;
+}
 /**
- * Atomic replacement of every user-defined model Alias binding.
+ * Required process-scoped mutation precondition.
+ *
+ * Both fields travel at the top level of every mutation request. The random
+ * process generation prevents a revision captured before restart from being
+ * accepted by a fresh process whose in-memory counter reused the same value.
  */
-export interface ModelAliasBindingsUpdate {
-  bindings: ModelAliasBinding[];
+export interface PlatformCreate {
+  baseUrl: string;
+  expectedRevision: number;
+  kind: PlatformKind;
+  name: string;
+  processGeneration: number;
+  userCredential?: string | null;
+}
+/**
+ * Required process-scoped mutation precondition.
+ *
+ * Both fields travel at the top level of every mutation request. The random
+ * process generation prevents a revision captured before restart from being
+ * accepted by a fresh process whose in-memory counter reused the same value.
+ */
+export interface PlatformUpdate {
+  expectedRevision: number;
+  name: string;
+  processGeneration: number;
+  /**
+   * Omitted/null preserves, empty clears.
+   */
+  userCredential?: string | null;
+}
+/**
+ * Required process-scoped mutation precondition.
+ *
+ * Both fields travel at the top level of every mutation request. The random
+ * process generation prevents a revision captured before restart from being
+ * accepted by a fresh process whose in-memory counter reused the same value.
+ */
+export interface PlatformLinkWrite {
+  expectedRevision: number;
+  group: PlatformGroup;
+  platformAccountId: string;
+  processGeneration: number;
+}
+/**
+ * Required process-scoped mutation precondition.
+ *
+ * Both fields travel at the top level of every mutation request. The random
+ * process generation prevents a revision captured before restart from being
+ * accepted by a fresh process whose in-memory counter reused the same value.
+ */
+export interface PlatformRefresh {
+  accountId?: string | null;
   expectedRevision: number;
   processGeneration: number;
 }

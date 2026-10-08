@@ -1,0 +1,115 @@
+//! A single CAS write owns the visible layout and its flattened routing order.
+
+use axum::Json;
+use axum::body::Bytes;
+use axum::extract::State;
+
+use super::destinations::{DestinationsError, projection_refused};
+use crate::dashboard_v3::{ControlRevision, V3ApiError, check_expectation, parse_mutation_json};
+use crate::db::routing_cards;
+use crate::destination_projection::read_v4_projection;
+use crate::state::CoreState;
+
+use super::types::{DestinationDto, RoutingCardList, RoutingCardUpdate};
+
+pub(super) async fn list(
+    State(state): State<CoreState>,
+) -> Result<Json<RoutingCardList>, DestinationsError> {
+    let _settings_update = state.settings_update.lock();
+    snapshot(&state).map(Json)
+}
+
+pub(super) async fn replace(
+    State(state): State<CoreState>,
+    body: Bytes,
+) -> Result<Json<RoutingCardList>, DestinationsError> {
+    let receipt =
+        super::applications::DashboardReceipt::open(&state, "routing.replace", "routing", None);
+    let mut durable = None;
+    let mut card_count = 0_u32;
+    let result = (|| {
+        let input = parse_mutation_json::<RoutingCardUpdate>(&body)?;
+        let _settings_update = state.settings_update.lock();
+        check_expectation(&state, &input.expectation)?;
+        // Preserve the destination read gate before changing any saved ranks.
+        snapshot(&state)?;
+        card_count = super::applications::count_u32(input.cards.len());
+        {
+            let db = state.db.lock();
+            let tx = db
+                .conn
+                .unchecked_transaction()
+                .map_err(V3ApiError::internal)?;
+            routing_cards::save_on(&tx, &input.cards)
+                .and_then(|()| routing_cards::reconcile_on(&tx))
+                .map_err(|error| V3ApiError::invalid_request_at(&state, error.to_string()))?;
+            tx.commit().map_err(V3ApiError::internal)?;
+            // Membership/rank changes do not replace credentials or transport.
+            // Preserve conversation bindings and selector progress, as the legacy
+            // account-order writer does; each new request loads the saved ranks.
+            state.bump_settings_revision();
+        }
+        durable = Some(super::applications::DurableEffect {
+            revision: state.settings_revision(),
+            completed: card_count,
+            failed: 1,
+            related_ids: Vec::new(),
+        });
+        snapshot(&state)
+    })();
+    if result.is_ok() {
+        durable = None;
+    }
+    let card_count = card_count;
+    receipt
+        .observe(result, durable, |value| {
+            crate::log_types::OperationMetadata {
+                revision: Some(value.revision.revision),
+                requested_count: Some(card_count),
+                completed_count: Some(card_count),
+                failed_count: Some(0),
+                ..crate::log_types::OperationMetadata::default()
+            }
+        })
+        .map(Json)
+}
+
+/// Caller holds settings_update so revision, layout and rows describe one state.
+pub(super) fn snapshot(state: &CoreState) -> Result<RoutingCardList, DestinationsError> {
+    // Capture the plan map with the projection. The overlay is pure and must
+    // not take the database lock again; this mutex is not reentrant.
+    let (projection, cards, recoveries, probes, goat_plans, revision) = {
+        let db = state.db.lock();
+        let projection = read_v4_projection(&db)
+            .map_err(V3ApiError::internal)?
+            .map_err(|refusals| DestinationsError::Refused(projection_refused(state, &refusals)))?;
+        let cards = routing_cards::load_on(&db.conn).map_err(V3ApiError::internal)?;
+        let recoveries = crate::db::quota_recovery::load_all_identified_on(&db.conn)
+            .map_err(V3ApiError::internal)?;
+        let goat_plans =
+            crate::goat_plan_cooldowns::load_all_on(&db.conn).map_err(V3ApiError::internal)?;
+        let probes = state.quota_probes.lock().clone();
+        let revision = ControlRevision::from_state(state);
+        (projection, cards, recoveries, probes, goat_plans, revision)
+    };
+    let now = state.sample_gateway_clock().0;
+    Ok(RoutingCardList {
+        revision,
+        cards,
+        destinations: projection
+            .destinations
+            .iter()
+            .map(DestinationDto::from)
+            .collect(),
+        credentials: super::destinations::overlay_credential_dtos(
+            now,
+            &projection.credentials,
+            &recoveries,
+            &probes,
+            &goat_plans,
+        ),
+    })
+}
+
+#[cfg(test)]
+mod tests;

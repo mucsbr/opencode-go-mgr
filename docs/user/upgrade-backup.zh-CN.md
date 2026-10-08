@@ -4,27 +4,25 @@
 
 从 [GitHub 最新 Release](https://github.com/klarkxy/open-console-gateway/releases/latest) 下载升级包，并用同一 Release 的 `SHA256SUMS` 校验：PowerShell 用 `Get-FileHash <文件> -Algorithm SHA256`，macOS 用 `shasum -a 256 <文件>`，Linux 用 `sha256sum <文件>`。下面把备份、恢复和卸载一起讲完——都是平时很枯燥、关键时刻恨自己没看的操作。
 
-Windows 应用内更新会在 OCG Manager 升级为 Open Console Gateway 时保留原安装目录。手动运行安装器时，请选择原目录以替换旧安装。升级保留数据目录与开机启动设置，迁移已有桌面和开始菜单快捷方式，并将已安装应用记录更新为新名称。
+Windows 上，安装、应用内更新和再次运行安装包都会沿用已有安装目录。安装器不会先卸载再安装。升级保留数据目录与开机启动设置，并迁移已有桌面和开始菜单快捷方式。只从 Windows **已安装的应用** 卸载。
 
-## 数据库迁移与接入 Key（schema v38）
+## 数据库迁移与接入 Key（schema v66）
 
-数据库 schema 是 **v38**，历史库启动时原地迁移。从单 Key 版本升级会保留既有凭证为 **主 Key**（id 固定为 `00000000-0000-0000-0000-000000000001`），客户端无需改动即可继续鉴权。主 Key 与额外子 Key 共用 `access_keys` 表：未删除子 Key 最多 64 把，删除为软删除，保留名称用于日志归因并清除明文。
+数据库 schema 是 **v66**，历史库启动时原地迁移。**主 Key** 的 id 固定为 `00000000-0000-0000-0000-000000000001`，升级前后保持不变，客户端无需改动即可继续鉴权。主 Key 与额外子 Key 共用 `access_keys` 表：未删除子 Key 最多 64 把，删除为软删除，保留名称用于日志归因并清除明文。
 
-已有（非空）库会先规范迁移到 v26，再由 v27 重写把主 Key 与全部 `sub_gateway_keys` 行复制进 `access_keys` 表，删除 `sub_gateway_keys`，并删除 `accounts` 上遗留的五列 `usage_sync_*`。任何 v27 写入前，库会得到同级快照 `data.sqlite.pre-v3.<timestamp>.bak` 及 SHA-256 sidecar。v35 会在 fail-closed 预检后去掉 offering 维度，非空 v34 库另写 `data.sqlite.pre-v35.<timestamp>.bak`。全新空数据目录直接创建 schema v38，不写这些副本。快照只是回滚点，不能替代完整备份：恢复前先校验 sidecar。旧版程序无法打开已迁移的数据库——单 Key 时代不识额外 Key，已撤销的值也不会因降级复活。
+在执行受备份保护的 schema 迁移（v27、v35、v42、v48、v58、v59、v65）之前，迁移器会先写一个唯一且不覆盖的同级快照——可能是 `data.sqlite.pre-v3.<timestamp>.bak`、`data.sqlite.pre-v35.<timestamp>.bak`、`data.sqlite.pre-v42.<timestamp>.bak`、`data.sqlite.pre-v48.<timestamp>.bak`、`data.sqlite.pre-v58.<timestamp>.bak`、`data.sqlite.pre-v59.<timestamp>.bak` 或 `data.sqlite.pre-v65.<timestamp>.bak`——并附带 SHA-256 sidecar。极老的数据库（schema 1–22 / 1–23）还会另外写 `data.sqlite.pre-v22.` / `pre-v23.` 快照。全新空数据目录直接创建 schema v66，不写这些副本。
 
-Schema v38 还会保存管理员确认的跨 Provider 模型 Alias 绑定。节点导出/导入携带完整绑定集；目录刷新绝不会自动创建或改指向这些映射。
+快照只是回滚点，不能替代完整备份：恢复前先校验 sidecar，并且只能恢复到可打开该 schema 版本的程序上，或用于重试一次从未提交成功的升级。旧版程序无法打开已迁移的数据库。
 
-v29 从目录中移除 SCNet Token Plans，并在迁移期间删除所有现有 SCNet 账号行。每次启动时，历史 Command Code GOAT 验证状态都会统一为 `not_required`，因为公开目录不是 Key 验证；Custom API 的 enabled 状态保留。OpenCode Go、Zen Free 与未知 provider 身份不受影响。v35 同时保存 `dynamic_providers` / `dynamic_provider_models`；节点备份导出只含 `providerId` 的 payload V4，并包含已保存的用户定义供应商定义。更旧的 payload V1–V3 备份会被明确的不支持版本错误拒绝；那不是密码错误，也不是文件损坏。
+迁移是 fail-closed 的：无法安全迁移的数据会拒绝升级而不是被删除。
 
-v30 将 Custom API 的 `account_custom_configs` 从单一 `upstream_protocol` 列扩展为 JSON `upstream_protocols` 集合，按旧值回填每个现有 Custom 账号。Custom 配置/能力编辑保持账号启用，但将 `verification_status` 重置为 `pending`。
+### 节点备份载荷
 
-v31 新增 `provider_contract_model_protocol_overrides` 表以支持按模型/按协议启用，并停止读取已弃用的 `provider_contract_scopes` 开关列。
+节点备份当前导出 payload V12，以目的地与凭据为权威（密钥与 identity extras 只存在加密信封内），并携带模型解析策略与按模型路由覆盖。V11 还携带显式 HTTP 协议路由；早于 V11 但携带非空显式路由的备份会被拒绝，避免丢失这些路由。V12 另外携带每把 GOAT Key 的计划窗口映射。V4–V12 备份可导入。早于 V12 但携带计划窗口字段的备份会被拒绝。V4–V11 导入只有普通冷却：同一把 Key 保留本机已有映射，Key 已更换则丢掉旧映射。V12 导入同一把 Key 时按窗口取较晚截止；Key 已更换时先丢掉旧的本机映射，再应用有效的传入映射。同一把 Key 的保留或合并只在传入凭据仍是 GOAT 时成立；把同一 id、同一明文改到非 GOAT 供应商（包括 Custom HTTP）仍是受支持的重映射，只丢掉 GOAT 映射，普通冷却保留。V7 会补确定性解析默认值。payload V1–V3 与新于 V12 的版本会返回明确的不支持版本错误——那不是密码错误，也不是文件损坏。schema 66 是增量变更，没有单独的升级前快照。旧版程序拒绝打开 v66 数据库。回退需用更早的程序完整恢复升级前的数据目录。Schema 66 与 payload V12 是内部存储版本，不是产品发布版本。V12 备份给当前或更新的读取方；更早的程序请保留更早的备份。维护者向的 payload 策略见[运行时不变量](../maintainer/runtime-invariants.zh-CN.md)。
 
-v32 将 Custom API 的 base URL、协议集合与可配置鉴权收敛为一个完整推理 Endpoint 和一个上游协议。历史 Custom 行按 Chat Completions → Responses → Messages 选择协议，追加对应标准推理后缀，并置为 disabled/pending 供管理员复核；非所选协议状态在同一事务中移除。
+V9 备份同时保存供应商卡片的身份、分组与顺序。多张卡可引用同一供应商，不会复制配置或 Key。合并导入时，目标已有账号保留顺序和卡片归属，新增账号采用来源分组。旧备份导入时保留已存的凭据优先级，并生成对应卡片。
 
-v33 新增 `account_model_capabilities.upstream_model`。历史映射行会以此前的公开 `model_id` 回填，因此升级后既有路由保持不变；新建 Custom 行可使用不同的公开名称与上游名称。
-
-v36 曾加入尚未发布的 Ollama Cookie 用量状态；v37 删除该表，并新增账号级 Ollama Cloud 计费档位（Free/Pro/Max/Team）。
+V10 还携带每个账号已保存的积分配置、剩余额度批次和月度发放游标。合并导入保留目标已有余额，旧备份也不会重置它。导出和导入不会重算已保存余额，也不会结算一条历史待处理记录。导入把旧费率留在这段历史里。月度到期、已过期分桶、配置、计数器和月度游标保持原值。绑定 id 与计量 id 是新的。你编辑的配置是名称、币种、月度数量和来源 URL。新请求不会扣减这份余额。
 
 ## 备份
 
@@ -72,11 +70,13 @@ docker compose ps
 
 应用内升级不可用时，按下面方式直接覆盖安装。
 
-- **Windows GUI**：退出托盘程序，运行新版安装包，在“升级方式”页选择 **直接安装（无需先卸载）**。在 Windows **已安装的应用** 中卸载；卸载程序会询问是否删除 `%USERPROFILE%\.ocg-mgr`。
+升级后首次成功启动桌面程序，会同步随该构建内置的 Codex skill。原生正式版 CLI 下次执行 `serve` 时同步，也可用 `skill sync` 立即同步；有意回退二进制时，会同步回与该二进制匹配的 skill。内容变化时，旧的 OCG 管理版本备份在 `~/.agents/skill-backups/`。卸载应用或 CLI 后，用户级 skill 会保留以便辅助重装；只有确认没有其他 OCG 安装在使用它时才单独移除。
+
+- **Windows GUI**：退出托盘程序并运行新版安装包，安装器会原地替换已有副本。从 Windows **已安装的应用** 卸载。只有在确认页勾选 **删除应用数据目录** 时才会删除 `%USERPROFILE%\.ocg-mgr`。卸载时未删除数据目录的，重装后会沿用原配置。
 - **macOS GUI**：用新版 DMG 中的应用替换 **Applications** 里的旧应用。删除应用即可卸载；只有确定也要删除数据时才另行删除 `~/.ocg-mgr`。
 - **Linux GUI**：用新版 `.deb` 覆盖安装，或替换 AppImage。卸载软件包或删除 AppImage 后，数据仍保留在 `~/.ocg-mgr`，除非手动删除。
 - **CLI**：整体替换解压目录，保持可执行文件、`dist/` 与 `LICENSE` 同级。删除该目录即可卸载；数据仍保留在 `~/.ocg-mgr-cli` 或自定义 `--data-dir`。
-- **Docker**：备份后依次执行 `docker compose pull` 和 `docker compose up -d --no-build`。如果启用了 browser profile，应改用 `docker compose --profile browser pull` 和 `docker compose --profile browser up -d --no-build`，确保两个镜像同步升级。生产部署建议把 `OCG_IMAGE` 与 `OCG_BROWSER_IMAGE` 固定到完整版本标签。`docker compose down` 只删容器、保留 `ocg-data` 与 `ocg-browser-profiles`；`docker compose down -v` 会永久删除这些卷，只能在确认双卷备份有效且确实要重置时使用。切换到旧镜像不等于回滚数据库；需要数据库回滚时，应同时恢复该旧版本升级前制作的完整备份。
+- **Docker**：备份后依次执行 `docker compose pull` 和 `docker compose up -d --no-build`。如果启用了 browser profile，应改用 `docker compose --profile browser pull` 和 `docker compose --profile browser up -d --no-build`，确保两个镜像同步升级。生产部署建议把 `OCG_IMAGE` 与 `OCG_BROWSER_IMAGE` 固定到完整版本标签。`docker compose down` 只删容器、保留 `ocg-data` 与 `ocg-browser-profiles`；`docker compose down -v` 会永久删除这些卷，只能在确认双卷备份有效且确实要重置时使用。切换到旧镜像不等于回滚数据库；需要数据库回滚时，应同时恢复该旧版本升级前制作的完整备份。当前 payload V12 的节点备份给当前或更新的读取方，不能代替那份更早的目录备份。
 
 ---
 

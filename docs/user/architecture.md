@@ -6,7 +6,7 @@ Open Console Gateway is one local node. Desktop, CLI, and Docker are alternative
 for the same `ocg-core` process. The default listener is `127.0.0.1:9042`.
 Each node stores its own data locally.
 
-## One local node
+## One Local Node
 
 [![Open Console Gateway local-node architecture](../diagrams/local-node.visual-check.1440x900.light.png)](https://klarkxy.github.io/open-console-gateway/diagrams/local-node/)
 
@@ -16,9 +16,10 @@ trace relationships, or export another format.
 The Dashboard and inference endpoints share port `9042`, but they use different
 credentials. A client **Key** authenticates an AI tool to Open Console Gateway. After
 selection, the account credential is sent only to that account's configured
-upstream; Zen Free has no credential. The Vue SPA talks HTTP Dashboard V3.
+upstream; Zen Free has no credential. The Vue SPA talks HTTP Dashboard V4 only. The only V2 compatibility
+families kept are auth and the browser WebSocket.
 
-## Request lifecycle
+## Request Lifecycle
 
 One inference request follows a fixed order:
 
@@ -37,47 +38,49 @@ Unknown model names return `400`. Ambiguous exact raw IDs return
 eligible pre-send or provider-specific failures; ambiguous or unsafe requests
 fail before selection.
 
-## Product ownership
+## Product Ownership
 
 | Surface | Owns | Related surface |
 | --- | --- | --- |
 | **Access Keys** | Client-facing primary and sub Keys | Account credentials live on **Accounts** |
 | **Accounts** | Account Key, enablement, order, notes, cooldown, usage state | Catalogs and protocol contracts live on **Providers** |
-| **Providers** | Built-in catalogs, model/protocol contracts, pricing scopes, typed user-defined Provider Endpoint/auth/mappings | Custom API mappings stay on the account card |
+| **Providers** | Built-in catalogs, model/protocol contracts, typed user-defined Provider Endpoint/auth/mappings | Custom API mappings stay on the account card |
 | **Custom API account** | One API URL, one account-wide upstream protocol, public-model → upstream-ID mappings | Shared Provider definitions live on **Providers** |
 | **Extensions / CPA** | A static local external-integration boundary | Built-in routing families stay under **Accounts** / **Providers** |
-| **Legacy Applications** | Retired; remaining guide and connector code awaits cleanup | Clients use the ordinary Gateway API |
+| **Applications / DSH** | The OCG-owned plugin installed into DSH's `web` profile | Clients use the ordinary Gateway API |
 
 The Adapter Registry is static and sealed. User-defined Providers persist as
 typed data and always bind Configurable HTTP.
 
-## Local model lists
+## Local Model Lists
 
 These reads use saved local state. Catalog refreshes are explicit actions on
 **Providers**.
 
 | Endpoint | Published models |
 | --- | --- |
-| Authenticated `GET /v1/models` | Currently routeable code-owned Aliases, saved Zen/Command/CN mappings, saved user-defined Provider public models, and eligible Custom declared IDs |
-| `GET /dashboard/api/v3/application-models` | Go-routeable Aliases intersected with the current Go pricing snapshot; excludes Custom API, user-defined Providers, and CN Plans |
-| `GET /claude-desktop/v1/models` | The three Claude Desktop role aliases only |
+| Authenticated `GET /v1/models` | Currently qualified public names (code-owned Aliases, saved Zen/Command/CN mappings, saved user-defined Provider public models, and eligible Custom declared IDs) that carry a validated derived protocol profile from the same snapshot used to enrich the row |
+| `GET /dashboard/api/v4/application-models` | Go names that resolve in the saved catalog and have an enabled protocol; it does not consult a price snapshot. Excludes Custom API, user-defined Providers, and CN Plans |
 
-Saved catalog rows keep exact raw pins until code assigns an Alias. A Custom ID
+Command ids that contain `/` publish a unique last-segment lowercase kebab Alias;
+other unmatched catalog rows keep exact raw pins until code assigns an Alias. A Custom ID
 that collides with a published built-in Alias is excluded from publication.
 
-## Protocol conversion
+## Protocol Conversion
 
 Clients may use OpenAI Chat Completions, OpenAI Responses, Anthropic Messages,
-Gemini `generateContent` / `streamGenerateContent`, or Claude Desktop entry
-points. A supported and enabled client/upstream pair passes through; otherwise
-the whole request and response are converted to and from the model's effective
-upstream protocol. Gemini is a client format: the gateway converts it to the
-selected Plan's Chat Completions or Messages upstream.
+or Gemini `generateContent` / `streamGenerateContent` entry points. Each
+attempt chooses one upstream protocol locally before the send: the saved
+preferred protocol, then the enabled client protocol, then the remaining
+granted protocols. The request and response are converted when that choice
+differs from the client protocol. Gemini is a client format and is never an
+upstream protocol. Credential and provider retries keep their existing
+policy. An HTTP 400 does not switch protocol.
 
-The complete preferred/supported matrix and conversion limits live in
+Selection, native opaque history, and conversion limits live in
 [Protocol conversion](protocol-conversion.md).
 
-## Where to read next
+## Where To Read Next
 
 | Task | Guide |
 | --- | --- |
@@ -85,6 +88,7 @@ The complete preferred/supported matrix and conversion limits live in
 | Add and order accounts | [Accounts](accounts.md), [Routing](routing.md) |
 | Manage catalogs and contracts | [Providers](providers.md) |
 | Understand aliases and errors | [Gateway](gateway.md) |
+| Connect the DSH plugin | [Applications](applications.md) |
 | Inspect the crate and Host boundaries | [Maintainer architecture](../maintainer/architecture.md) |
 
 ---

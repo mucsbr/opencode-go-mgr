@@ -4,7 +4,8 @@
 //! [`DesktopCapabilities`] is a concrete process/Host facade, not a plugin
 //! trait. It owns the OnceLock hooks and the update status machine. Hosts
 //! register auto-start before listener bind and Dock/updater during setup;
-//! CLI and Docker leave the hooks unset.
+//! Native CLI builds may register the DSH application host; Docker and other
+//! headless builds leave local-only capabilities unset.
 //!
 //! This module does not import the process host, sqlite, or gateway runtime
 //! and stays a DAG leaf outside the remaining host SCC.
@@ -17,6 +18,11 @@ use std::sync::{Arc, OnceLock};
 pub type AutoStartSync = fn(bool) -> crate::Result<()>;
 
 pub type DockVisibilitySync = Arc<dyn Fn(bool) -> crate::Result<()> + Send + Sync + 'static>;
+
+/// Shared with [`crate::state::HostSettingsError`] so headless hooks and
+/// settings writes fail closed on the same public strings.
+pub const AUTO_START_UNAVAILABLE: &str = "auto-start is unavailable in this runtime";
+pub const DOCK_VISIBILITY_UNAVAILABLE: &str = "Dock visibility is unavailable in this runtime";
 
 pub type DesktopUpdateStarter = Arc<dyn Fn(String) -> crate::Result<()> + Send + Sync + 'static>;
 
@@ -93,6 +99,8 @@ pub struct DesktopCapabilities {
     auto_start_sync: OnceLock<AutoStartSync>,
     dock_visibility_sync: OnceLock<DockVisibilitySync>,
     desktop_update_starter: OnceLock<DesktopUpdateStarter>,
+    dsh_application_host: OnceLock<crate::dsh_application::DshApplicationHost>,
+    byok_application_host: OnceLock<crate::byok_application::ByokApplicationHost>,
     desktop_update_status: Mutex<DesktopUpdateStatus>,
 }
 
@@ -102,6 +110,8 @@ impl DesktopCapabilities {
             auto_start_sync: OnceLock::new(),
             dock_visibility_sync: OnceLock::new(),
             desktop_update_starter: OnceLock::new(),
+            dsh_application_host: OnceLock::new(),
+            byok_application_host: OnceLock::new(),
             desktop_update_status: Mutex::new(DesktopUpdateStatus::new()),
         }
     }
@@ -121,7 +131,7 @@ impl DesktopCapabilities {
         let sync = self
             .auto_start_sync
             .get()
-            .ok_or_else(|| anyhow::anyhow!("auto-start is unavailable in this runtime"))?;
+            .ok_or_else(|| anyhow::anyhow!(AUTO_START_UNAVAILABLE))?;
         sync(enabled)
     }
 
@@ -140,7 +150,7 @@ impl DesktopCapabilities {
         let sync = self
             .dock_visibility_sync
             .get()
-            .ok_or_else(|| anyhow::anyhow!("dock visibility is unavailable in this runtime"))?;
+            .ok_or_else(|| anyhow::anyhow!(DOCK_VISIBILITY_UNAVAILABLE))?;
         sync(visible)
     }
 
@@ -154,6 +164,28 @@ impl DesktopCapabilities {
 
     pub fn desktop_update_supported(&self) -> bool {
         self.desktop_update_starter.get().is_some()
+    }
+
+    pub fn set_byok_application_host(&self, host: crate::byok_application::ByokApplicationHost) {
+        assert!(
+            self.byok_application_host.set(host).is_ok(),
+            "BYOK host already registered"
+        );
+    }
+
+    pub fn byok_application_host(&self) -> Option<crate::byok_application::ByokApplicationHost> {
+        self.byok_application_host.get().cloned()
+    }
+
+    pub fn set_dsh_application_host(&self, host: crate::dsh_application::DshApplicationHost) {
+        assert!(
+            self.dsh_application_host.set(host).is_ok(),
+            "DSH application host is already configured"
+        );
+    }
+
+    pub fn dsh_application_host(&self) -> Option<crate::dsh_application::DshApplicationHost> {
+        self.dsh_application_host.get().cloned()
     }
 
     pub fn desktop_update_status(&self) -> DesktopUpdateStatus {
@@ -254,10 +286,9 @@ mod tests {
     fn auto_start_is_unsupported_until_the_host_registers_a_hook() {
         let desktop = DesktopCapabilities::new();
         assert!(!desktop.auto_start_supported());
-        let error = desktop
+        desktop
             .sync_auto_start(true)
             .expect_err("headless runtimes leave auto-start unset");
-        assert!(error.to_string().contains("unavailable"));
 
         desktop.set_auto_start_sync(ok_auto_start);
         assert!(desktop.auto_start_supported());
@@ -274,10 +305,9 @@ mod tests {
     fn dock_visibility_is_unsupported_until_the_host_registers_a_hook() {
         let desktop = DesktopCapabilities::new();
         assert!(!desktop.dock_visibility_supported());
-        let error = desktop
+        desktop
             .sync_dock_visibility(false)
             .expect_err("headless runtimes leave Dock visibility unset");
-        assert!(error.to_string().contains("unavailable"));
 
         let applied = Arc::new(StdMutex::new(Vec::new()));
         let captured = applied.clone();

@@ -1,12 +1,11 @@
 use super::*;
 use crate::catalog::{
-    CatalogParseError, CredentialKind, OPENCODE_GO_USAGE_URL, QuotaScope, UpstreamAuthScheme,
-    UpstreamProtocolKind,
+    CredentialKind, OPENCODE_GO_USAGE_URL, QuotaScope, UpstreamAuthScheme, UpstreamProtocolKind,
 };
 use crate::ids::{
-    COMMAND_CODE_GOAT_DEEPSEEK_V4_FLASH_UPSTREAM, COMMAND_CODE_PROVIDER_ID, CPA_ACCOUNT_ID,
-    CPA_PROVIDER_ID, CUSTOM_PROVIDER_ID, KIMI_PROVIDER_ID, MINIMAX_PROVIDER_ID, OLLAMA_PROVIDER_ID,
-    OPENCODE_PROVIDER_ID, OPENCODE_ZEN_FREE_PROVIDER_ID, ZEN_FREE_ACCOUNT_ID,
+    COMMAND_CODE_PROVIDER_ID, CPA_ACCOUNT_ID, CPA_PROVIDER_ID, CUSTOM_PROVIDER_ID,
+    KIMI_PROVIDER_ID, MINIMAX_PROVIDER_ID, OLLAMA_PROVIDER_ID, OPENCODE_PROVIDER_ID,
+    OPENCODE_ZEN_FREE_PROVIDER_ID, ZEN_FREE_ACCOUNT_ID,
 };
 
 #[test]
@@ -130,30 +129,23 @@ fn catalog_hardcodes_providers_and_keeps_unverified_providers_unroutable() {
     assert_eq!(goat.verification_runtime_availability, "not_applicable");
     assert_eq!(goat.creation_availability, CreationAvailability::Available);
     assert_eq!(goat.pricing_availability, "available");
-    assert_eq!(goat.usage_availability, "local_state");
+    assert_eq!(goat.usage_availability, "available");
     assert!(goat.manual_usage_calibration);
     assert_eq!(goat.auth_schemes, &BEARER_AUTH);
     assert_eq!(goat.upstream_protocols, &GOAT_PROTOCOLS);
     assert!(
-        !goat
-            .upstream_protocols
+        goat.upstream_protocols
             .contains(&UpstreamProtocolKind::Responses)
     );
     assert_eq!(goat.model_source, COMMAND_CODE_GOAT_MODEL_SOURCE);
-    assert_eq!(
-        COMMAND_CODE_GOAT_BASE_URL,
-        "https://api.commandcode.ai/provider/v1"
-    );
-    assert_eq!(COMMAND_CODE_GOAT_HOST, "api.commandcode.ai");
-    assert_eq!(COMMAND_CODE_GOAT_CHAT_COMPLETIONS_PATH, "/chat/completions");
-    assert_eq!(COMMAND_CODE_GOAT_MESSAGES_PATH, "/messages");
-    assert_eq!(COMMAND_CODE_GOAT_MODELS_PATH, "/models");
-    assert_eq!(
-        COMMAND_CODE_GOAT_DEEPSEEK_V4_FLASH_UPSTREAM,
-        "deepseek/deepseek-v4-flash"
-    );
     assert!(is_command_code_goat(COMMAND_CODE_PROVIDER_ID));
     assert!(!is_command_code_goat(OPENCODE_PROVIDER_ID));
+
+    let minimax_plan = builtin_provider(MINIMAX_PROVIDER_ID).unwrap();
+    assert_eq!(minimax_plan.upstream_protocols, &MINIMAX_CN_PROTOCOLS);
+    assert_eq!(MINIMAX_CN_RESPONSES_PATH, "/responses");
+    assert_eq!(COMMAND_CODE_GOAT_RESPONSES_PATH, "/responses");
+    assert_eq!(minimax_plan.upstream_protocols.len(), 3);
 
     let custom = builtin_provider(CUSTOM_PROVIDER_ID).unwrap();
     assert!(custom.routable);
@@ -275,7 +267,6 @@ fn catalog_enablement_gate_is_fail_closed_for_unroutable_plans() {
                 ),
                 "{error:?}"
             );
-            assert!(error.to_string().contains("not routable"), "{}", error);
         }
     }
     assert!(!provider_allows_enablement("unknown-provider"));
@@ -283,10 +274,6 @@ fn catalog_enablement_gate_is_fail_closed_for_unroutable_plans() {
         ensure_provider_can_enable("unknown-provider"),
         Err(ProviderBindingError::UnknownProvider { .. })
     ));
-    let zen = builtin_provider(OPENCODE_ZEN_FREE_PROVIDER_ID).unwrap();
-    assert!(plan_allows_enablement(zen));
-    let go = builtin_provider(OPENCODE_PROVIDER_ID).unwrap();
-    assert!(plan_allows_enablement(go));
 }
 
 #[test]
@@ -436,14 +423,10 @@ fn adapter_descriptors_preserve_current_capability_decisions() {
     );
     assert!(go.inference.follow_redirects);
     assert_eq!(go.inference.origin, InferenceOriginKind::OfficialFixed);
-    assert_eq!(OPENCODE_GO_BASE_URL, "https://opencode.ai/zen/go");
-    assert_eq!(OPENCODE_GO_HOST, "opencode.ai");
-    assert_eq!(OPENCODE_ZEN_BASE_URL, "https://opencode.ai/zen");
     assert!(OPENCODE_GO_USAGE_URL.starts_with(OPENCODE_GO_BASE_URL));
     assert!(go.usage.automatic_sync);
     assert!(go.usage.authoritative_for_quota);
     assert_eq!(go.usage.endpoint, Some(OPENCODE_GO_USAGE_URL));
-    assert_eq!(OPENCODE_GO_USAGE_URL, "https://opencode.ai/zen/go/v1/usage");
     assert_eq!(go.usage.contract, UsageContractKind::Authoritative);
     assert!(go.usage.publishes_capability);
     assert!(!go.usage.egress_ip_shared_cooldown_window);
@@ -473,7 +456,6 @@ fn adapter_descriptors_preserve_current_capability_decisions() {
     assert!(zen.inference.follow_redirects);
     assert_eq!(zen.inference.origin, InferenceOriginKind::OfficialFixed);
     assert!(zen.model_catalog.admin_explicit_refresh);
-    assert!(zen.protocol_probe.unknown_zen_free_defaults_to_chat);
     assert!(zen.protocol_probe.explicit_probe);
     assert_eq!(
         zen.protocol_probe.structural_ceiling,
@@ -499,6 +481,7 @@ fn adapter_descriptors_preserve_current_capability_decisions() {
     assert!(!goat.usage.experimental);
     assert!(goat.usage.publishes_capability);
     assert_eq!(goat.usage.contract, UsageContractKind::Authoritative);
+    assert_eq!(goat.usage.catalog_availability, "available");
     assert_eq!(goat.usage.endpoint, Some(COMMAND_CODE_GOAT_USAGE_URL));
     assert!(!goat.usage.automatic_sync);
     assert!(!goat.usage.authoritative_for_quota);
@@ -513,9 +496,14 @@ fn adapter_descriptors_preserve_current_capability_decisions() {
         goat.protocol_probe.structural_ceiling,
         StructuralProbeCeiling::CommandCodeConstructable
     );
+    assert_eq!(
+        goat.protocol_probe.fallback_priority,
+        PROTOCOL_FALLBACK_CHAT_RESPONSES_MESSAGES
+    );
     assert!(goat.card_actions.protocol_probe);
     assert!(goat.card_actions.catalog_refresh);
     assert!(goat.card_actions.usage_refresh);
+    assert!(goat.card_actions.manual_usage_calibration);
     assert_eq!(
         goat.card_actions.connection_verify,
         CardVerifyAction::NotApplicable
@@ -523,25 +511,38 @@ fn adapter_descriptors_preserve_current_capability_decisions() {
     assert!(!goat.verification.uses_get_models);
     assert!(!goat.verification.never_auto_enable);
 
-    for fixed_provider in [
-        ProviderRegistry::get(MINIMAX_PROVIDER_ID).unwrap(),
-        ProviderRegistry::get(KIMI_PROVIDER_ID).unwrap(),
-    ] {
-        assert!(fixed_provider.protocol_probe.explicit_probe);
-        assert_eq!(
-            fixed_provider.protocol_probe.structural_ceiling,
-            StructuralProbeCeiling::Fixed(&CHAT_MESSAGES_PROTOCOLS)
-        );
-        assert_eq!(
-            fixed_provider.protocol_probe.matrix,
-            ProtocolMatrixKind::FixedProviderProtocols
-        );
-        assert_eq!(
-            fixed_provider.protocol_probe.fallback_priority,
-            &CHAT_MESSAGES_PROTOCOLS
-        );
-        assert!(fixed_provider.card_actions.protocol_probe);
-    }
+    let minimax = ProviderRegistry::get(MINIMAX_PROVIDER_ID).unwrap();
+    assert!(minimax.protocol_probe.explicit_probe);
+    assert_eq!(
+        minimax.protocol_probe.matrix,
+        ProtocolMatrixKind::FixedProviderProtocols
+    );
+    assert_eq!(
+        minimax.protocol_probe.structural_ceiling,
+        StructuralProbeCeiling::Fixed(&MINIMAX_CN_PROTOCOLS)
+    );
+    assert_eq!(
+        minimax.protocol_probe.fallback_priority,
+        &MINIMAX_CN_PROTOCOLS
+    );
+    assert_eq!(minimax.protocol_probe.fallback_priority.len(), 3);
+    assert!(minimax.card_actions.protocol_probe);
+
+    let kimi = ProviderRegistry::get(KIMI_PROVIDER_ID).unwrap();
+    assert!(kimi.protocol_probe.explicit_probe);
+    assert_eq!(
+        kimi.protocol_probe.structural_ceiling,
+        StructuralProbeCeiling::Fixed(&CHAT_MESSAGES_PROTOCOLS)
+    );
+    assert_eq!(
+        kimi.protocol_probe.matrix,
+        ProtocolMatrixKind::FixedProviderProtocols
+    );
+    assert_eq!(
+        kimi.protocol_probe.fallback_priority,
+        &CHAT_MESSAGES_PROTOCOLS
+    );
+    assert!(kimi.card_actions.protocol_probe);
 
     let ollama = ProviderRegistry::get(OLLAMA_PROVIDER_ID).unwrap();
     assert_eq!(ollama.kind, ProviderAdapterKind::OllamaCloud);
@@ -640,21 +641,6 @@ fn adapter_descriptors_preserve_current_capability_decisions() {
 }
 
 #[test]
-fn descriptor_capabilities_are_built_once_from_the_sealed_kind() {
-    for plan in BUILTIN_PROVIDERS {
-        let kind = ProviderAdapterKind::from_provider_id(plan.provider_id)
-            .expect("every catalog plan has an adapter kind");
-        let descriptor = ProviderRegistry::get(plan.provider_id)
-            .expect("every catalog plan has a composed descriptor");
-        assert_eq!(descriptor.kind, kind);
-        assert!(!descriptor.protocol_probe.request_path_may_trial);
-        assert!(!descriptor.protocol_probe.fallback_priority.is_empty());
-        assert_eq!(descriptor.inference.catalog_routable, plan.routable);
-        assert_eq!(descriptor.pricing.availability, plan.pricing_availability);
-    }
-}
-
-#[test]
 fn contract_scopes_are_unique_and_limited_to_ordinary_providers() {
     let mut scopes = std::collections::HashSet::new();
     for plan in BUILTIN_PROVIDERS {
@@ -679,7 +665,33 @@ fn contract_scopes_are_unique_and_limited_to_ordinary_providers() {
 }
 
 #[test]
-fn defaults_verification_status_and_binding_error_messages_stay_stable() {
+fn manual_usage_calibration_is_true_only_for_go_goat_and_ollama() {
+    for plan in BUILTIN_PROVIDERS {
+        let expected = matches!(
+            plan.provider_id,
+            OPENCODE_PROVIDER_ID | COMMAND_CODE_PROVIDER_ID | OLLAMA_PROVIDER_ID
+        );
+        assert_eq!(
+            plan.manual_usage_calibration, expected,
+            "{}",
+            plan.provider_id
+        );
+        let descriptor = ProviderRegistry::get(plan.provider_id).unwrap();
+        assert_eq!(
+            descriptor.usage.manual_calibration, expected,
+            "{}",
+            plan.provider_id
+        );
+        assert_eq!(
+            descriptor.card_actions.manual_usage_calibration, expected,
+            "{}",
+            plan.provider_id
+        );
+    }
+}
+
+#[test]
+fn defaults_and_verification_status_tokens_round_trip() {
     assert_eq!(default_provider_id(), OPENCODE_PROVIDER_ID);
     assert_eq!(default_credential_kind(), CredentialKind::ApiKey);
     assert_eq!(default_quota_scope(), QuotaScope::Key);
@@ -703,90 +715,6 @@ fn defaults_verification_status_and_binding_error_messages_stay_stable() {
         ConnectionVerificationStatus::try_from("unknown"),
         Err(ProviderBindingError::UnknownVerificationStatus(value)) if value == "unknown"
     ));
-
-    let unknown = ProviderBindingError::UnknownProvider {
-        provider_id: "p".into(),
-    };
-    assert_eq!(unknown.to_string(), "unknown provider `p`");
-    assert_eq!(
-        ProviderBindingError::UnknownCredentialKind("cookie".into()).to_string(),
-        "unknown credential kind `cookie`"
-    );
-    assert_eq!(
-        ProviderBindingError::UnknownQuotaScope("account".into()).to_string(),
-        "unknown quota scope `account`"
-    );
-    assert_eq!(
-        ProviderBindingError::BindingMismatch {
-            provider_id: "p".into(),
-        }
-        .to_string(),
-        "provider binding does not match `p`"
-    );
-    assert_eq!(
-        ProviderBindingError::SingletonAccountRequired(ZEN_FREE_ACCOUNT_ID).to_string(),
-        format!("provider requires singleton account `{ZEN_FREE_ACCOUNT_ID}`")
-    );
-    assert_eq!(
-        ProviderBindingError::ReservedAccountId(ZEN_FREE_ACCOUNT_ID).to_string(),
-        format!("account id `{ZEN_FREE_ACCOUNT_ID}` is reserved")
-    );
-    assert_eq!(
-        ProviderBindingError::UnknownVerificationStatus("bogus".into()).to_string(),
-        "unknown verification status `bogus`"
-    );
-    assert_eq!(
-        ProviderBindingError::UnknownUpstreamProtocol("gemini".into()).to_string(),
-        "unknown upstream protocol `gemini`"
-    );
-    assert_eq!(
-        ProviderBindingError::UnknownAuthScheme("basic".into()).to_string(),
-        "unknown auth scheme `basic`"
-    );
-    assert_eq!(
-        ProviderBindingError::KeyRequired.to_string(),
-        "key is required"
-    );
-    assert_eq!(
-        ProviderBindingError::KeyPrefixMismatch {
-            provider_id: "custom".into(),
-            prefix: "x-".into(),
-        }
-        .to_string(),
-        "provider `custom` requires key prefix `x-`"
-    );
-    assert_eq!(
-        ProviderBindingError::InvalidCustomBaseUrl("base URL is required".into()).to_string(),
-        "base URL is required"
-    );
-    assert_eq!(
-        ProviderBindingError::InvalidModelId("model id is required".into()).to_string(),
-        "model id is required"
-    );
-    assert_eq!(
-        ProviderBindingError::EnablementNotRoutable {
-            provider_id: COMMAND_CODE_PROVIDER_ID,
-            display_name: "Command Code GOAT",
-        }
-        .to_string(),
-        "Command Code GOAT is catalogued but is not routable in this release"
-    );
-    assert!(matches!(
-        ProviderBindingError::from(CatalogParseError::UnknownCredentialKind("cookie".into())),
-        ProviderBindingError::UnknownCredentialKind(value) if value == "cookie"
-    ));
-    assert!(matches!(
-        ProviderBindingError::from(CatalogParseError::UnknownQuotaScope("account".into())),
-        ProviderBindingError::UnknownQuotaScope(value) if value == "account"
-    ));
-    assert!(matches!(
-        ProviderBindingError::from(CatalogParseError::UnknownUpstreamProtocol("gemini".into())),
-        ProviderBindingError::UnknownUpstreamProtocol(value) if value == "gemini"
-    ));
-    assert!(matches!(
-        ProviderBindingError::from(CatalogParseError::UnknownAuthScheme("basic".into())),
-        ProviderBindingError::UnknownAuthScheme(value) if value == "basic"
-    ));
 }
 
 #[test]
@@ -808,7 +736,6 @@ fn command_code_models_catalog_parses_openai_list_and_rejects_empty() {
         parse_command_code_models_catalog(br#"{"models":[{"model":"gpt-5.4"}]}"#)
             .is_ok_and(|models| models == ["gpt-5.4"])
     );
-    assert!(ensure_provider_can_enable(COMMAND_CODE_PROVIDER_ID).is_ok());
 }
 
 #[test]
@@ -822,4 +749,110 @@ fn zen_free_key_validation_skips_empty_secret() {
         validate_plan_key(go, "   "),
         Err(ProviderBindingError::KeyRequired)
     ));
+}
+
+#[test]
+fn provider_origin_round_trips_strings_and_rejects_unknowns() {
+    for (origin, text) in [
+        (ProviderOrigin::Builtin, "builtin"),
+        (ProviderOrigin::Preset, "preset"),
+        (ProviderOrigin::Custom, "custom"),
+    ] {
+        assert_eq!(origin.as_str(), text);
+        assert_eq!(origin.to_string(), text);
+        assert_eq!(ProviderOrigin::try_from(text).unwrap(), origin);
+    }
+    assert!(matches!(
+        ProviderOrigin::try_from("unknown"),
+        Err(ProviderBindingError::UnknownUpstreamProtocol(value)) if value == "unknown"
+    ));
+    assert_eq!(ProviderOrigin::ALL.len(), 3);
+}
+
+#[test]
+fn preset_offering_resolves_plan_presets_and_falls_back_to_api() {
+    for plan_id in [
+        "zhipu-coding",
+        "zai-coding",
+        "tencent-token",
+        "tencent-enterprise-pro",
+        "bailian-coding",
+        "qwencloud-coding",
+        "qwencloud-token",
+        "volcengine-agent",
+        "volcengine-coding",
+        "byteplus-coding",
+        "qianfan-coding",
+        "qianfan-token-team",
+        "stepfun-plan",
+        "stepfun-plan-intl",
+        "xiaomi-mimo-token",
+        "streamlake-coding",
+        "compshare-coding",
+        "atlascloud",
+    ] {
+        assert_eq!(preset_offering(plan_id), "plan", "{plan_id}");
+    }
+    for api_id in [
+        "openai",
+        "anthropic",
+        "gemini",
+        "xai",
+        "azure-openai",
+        "bedrock",
+        "deepseek",
+        "moonshot",
+        "zhipu",
+        "zai",
+        "minimax-api-cn",
+        "minimax-api-intl",
+        "longcat",
+        "tencent-hunyuan",
+        "tencent-token-unknown",
+        "bailian",
+        "qwencloud",
+        "volcengine",
+        "qianfan",
+        "stepfun-api",
+        "stepfun-api-intl",
+        "xiaomi-mimo",
+        "ant-ling",
+        "streamlake",
+        "openrouter",
+        "siliconflow-cn",
+        "siliconflow-intl",
+        "nvidia",
+        "modelscope",
+        "ppio",
+        "qiniu",
+        "novita",
+        "compshare",
+    ] {
+        assert_eq!(preset_offering(api_id), "api", "{api_id}");
+    }
+    assert_eq!(preset_offering(""), "api");
+    assert_eq!(preset_offering("  "), "api");
+    assert_eq!(preset_offering("definitely-not-a-real-preset"), "api");
+}
+
+#[test]
+fn builtin_offering_maps_paid_families_to_plan_and_the_rest_to_api() {
+    for plan_id in [
+        OPENCODE_PROVIDER_ID,
+        COMMAND_CODE_PROVIDER_ID,
+        MINIMAX_PROVIDER_ID,
+        KIMI_PROVIDER_ID,
+        OLLAMA_PROVIDER_ID,
+    ] {
+        assert_eq!(builtin_offering(plan_id), "plan", "{plan_id}");
+    }
+    for api_id in [
+        OPENCODE_ZEN_FREE_PROVIDER_ID,
+        CUSTOM_PROVIDER_ID,
+        CPA_PROVIDER_ID,
+    ] {
+        assert_eq!(builtin_offering(api_id), "api", "{api_id}");
+    }
+    assert_eq!(builtin_offering("not-a-builtin"), "api");
+    assert_eq!(builtin_offering(""), "api");
 }

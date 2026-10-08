@@ -15,20 +15,23 @@ use chrono::Utc;
 
 use crate::account_control::{self, AccountControlError};
 use crate::db::ReorderAccountsError;
+use crate::log_types::{OperationMetadata, OperationOutcome};
 use crate::models::{
     Account as ModelAccount, AccountCustomConfigInput, AccountModelCapabilityInput,
     AccountSetupStep as ModelSetupStep, AccountType as ModelAccountType,
-    AccountUpdate as ModelAccountUpdate, normalize_account_notes, normalize_purchase_date,
+    AccountUpdate as ModelAccountUpdate, NEW_READY_KEY_ACCOUNT_ENABLED, normalize_account_notes,
+    normalize_purchase_date,
 };
-use crate::provider::{CreationAvailability, ProviderRegistry, default_provider_id};
+use crate::provider::{CreationAvailability, default_provider_id};
 use crate::redaction::redact_known_secret;
 use crate::state::CoreState;
+use crate::user_operation::UserOperation;
 
 use super::types::{
     Account, AccountCreate, AccountCustomConfig, AccountCustomConfigUpdate,
     AccountCustomConfigWrite, AccountList, AccountManagedCreate, AccountModelCapabilitiesUpdate,
     AccountModelCapability, AccountModelCapabilityWrite, AccountMutation, AccountOrder,
-    AccountSetupUpdate, AccountUpdate, MutationExpectation, OllamaBillingTier,
+    AccountSetupUpdate, AccountUpdate, MutationAck, MutationExpectation, OllamaBillingTier,
 };
 use super::{V3ApiError, check_expectation, parse_mutation_json};
 
@@ -36,10 +39,7 @@ pub(super) async fn list_accounts(
     State(state): State<CoreState>,
 ) -> Result<Json<AccountList>, V3ApiError> {
     let _settings_update = state.settings_update.lock();
-    let accounts = state
-        .db
-        .lock()
-        .list_accounts()
+    let accounts = crate::destination_projection::list_accounts_for_v3(&state.db.lock())
         .map_err(V3ApiError::internal)?;
     Ok(Json(account_list_from_state(&state, accounts)?))
 }
@@ -57,16 +57,22 @@ pub(super) async fn create_account(
     State(state): State<CoreState>,
     body: Bytes,
 ) -> Result<Json<AccountMutation>, V3ApiError> {
-    let input = parse_mutation_json::<AccountCreate>(&body)?;
-    create_account_locked(&state, input).map(Json)
+    let mut attempt = DashboardAttempt::open(&state, "account.create", "account", None);
+    let result = parse_mutation_json::<AccountCreate>(&body)
+        .and_then(|input| create_account_locked(&state, input, &mut attempt));
+    attempt.finish(result).map(Json)
 }
 
 pub(super) async fn create_managed_account(
     State(state): State<CoreState>,
     body: Bytes,
 ) -> Result<(StatusCode, Json<AccountMutation>), V3ApiError> {
-    let input = parse_mutation_json::<AccountManagedCreate>(&body)?;
-    create_managed_locked(&state, input).map(|mutation| (StatusCode::CREATED, Json(mutation)))
+    let mut attempt = DashboardAttempt::open(&state, "account.create_managed", "account", None);
+    let result = parse_mutation_json::<AccountManagedCreate>(&body)
+        .and_then(|input| create_managed_locked(&state, input, &mut attempt));
+    attempt
+        .finish(result)
+        .map(|mutation| (StatusCode::CREATED, Json(mutation)))
 }
 
 pub(super) async fn update_account(
@@ -74,8 +80,10 @@ pub(super) async fn update_account(
     Path(id): Path<String>,
     body: Bytes,
 ) -> Result<Json<AccountMutation>, V3ApiError> {
-    let input = parse_mutation_json::<AccountUpdate>(&body)?;
-    update_account_locked(&state, &id, input).map(Json)
+    let mut attempt = DashboardAttempt::open(&state, "account.update", "account", Some(id.clone()));
+    let result = parse_mutation_json::<AccountUpdate>(&body)
+        .and_then(|input| update_account_locked(&state, &id, input, &mut attempt));
+    attempt.finish(result).map(Json)
 }
 
 pub(super) async fn delete_account(
@@ -83,18 +91,22 @@ pub(super) async fn delete_account(
     Path(id): Path<String>,
     body: Bytes,
 ) -> Result<Json<AccountMutation>, V3ApiError> {
-    let expectation = parse_mutation_json::<MutationExpectation>(&body)?;
-    delete_account_locked(&state, &id, &expectation)
-        .await
-        .map(Json)
+    let mut attempt = DashboardAttempt::open(&state, "account.delete", "account", Some(id.clone()));
+    let result = match parse_mutation_json::<MutationExpectation>(&body) {
+        Ok(expectation) => delete_account_locked(&state, &id, &expectation, &mut attempt).await,
+        Err(error) => Err(error),
+    };
+    attempt.finish(result).map(Json)
 }
 
 pub(super) async fn reorder_accounts(
     State(state): State<CoreState>,
     body: Bytes,
 ) -> Result<Json<AccountList>, V3ApiError> {
-    let input = parse_mutation_json::<AccountOrder>(&body)?;
-    reorder_accounts_locked(&state, input).map(Json)
+    let mut attempt = DashboardAttempt::open(&state, "account.reorder", "account", None);
+    let result = parse_mutation_json::<AccountOrder>(&body)
+        .and_then(|input| reorder_accounts_locked(&state, input, &mut attempt));
+    attempt.finish(result).map(Json)
 }
 
 pub(super) async fn toggle_account(
@@ -102,8 +114,10 @@ pub(super) async fn toggle_account(
     Path(id): Path<String>,
     body: Bytes,
 ) -> Result<Json<AccountMutation>, V3ApiError> {
-    let expectation = parse_mutation_json::<MutationExpectation>(&body)?;
-    toggle_account_locked(&state, &id, &expectation).map(Json)
+    let mut attempt = DashboardAttempt::open(&state, "account.toggle", "account", Some(id.clone()));
+    let result = parse_mutation_json::<MutationExpectation>(&body)
+        .and_then(|expectation| toggle_account_locked(&state, &id, &expectation, &mut attempt));
+    attempt.finish(result).map(Json)
 }
 
 pub(super) async fn advance_account_setup(
@@ -111,8 +125,10 @@ pub(super) async fn advance_account_setup(
     Path(id): Path<String>,
     body: Bytes,
 ) -> Result<Json<AccountMutation>, V3ApiError> {
-    let input = parse_mutation_json::<AccountSetupUpdate>(&body)?;
-    advance_setup_locked(&state, &id, input).map(Json)
+    let mut attempt = DashboardAttempt::open(&state, "account.setup", "account", Some(id.clone()));
+    let result = parse_mutation_json::<AccountSetupUpdate>(&body)
+        .and_then(|input| advance_setup_locked(&state, &id, input, &mut attempt));
+    attempt.finish(result).map(Json)
 }
 
 pub(super) async fn reset_account_cooldown(
@@ -120,8 +136,15 @@ pub(super) async fn reset_account_cooldown(
     Path(id): Path<String>,
     body: Bytes,
 ) -> Result<Json<AccountMutation>, V3ApiError> {
-    let expectation = parse_mutation_json::<MutationExpectation>(&body)?;
-    reset_cooldown_locked(&state, &id, &expectation).map(Json)
+    let mut attempt = DashboardAttempt::open(
+        &state,
+        "account.reset_cooldown",
+        "account",
+        Some(id.clone()),
+    );
+    let result = parse_mutation_json::<MutationExpectation>(&body)
+        .and_then(|expectation| reset_cooldown_locked(&state, &id, &expectation, &mut attempt));
+    attempt.finish(result).map(Json)
 }
 
 pub(super) async fn put_account_custom_config(
@@ -129,8 +152,11 @@ pub(super) async fn put_account_custom_config(
     Path(id): Path<String>,
     body: Bytes,
 ) -> Result<Json<AccountMutation>, V3ApiError> {
-    let input = parse_mutation_json::<AccountCustomConfigUpdate>(&body)?;
-    put_custom_config_locked(&state, &id, input).map(Json)
+    let mut attempt =
+        DashboardAttempt::open(&state, "account.custom_config", "account", Some(id.clone()));
+    let result = parse_mutation_json::<AccountCustomConfigUpdate>(&body)
+        .and_then(|input| put_custom_config_locked(&state, &id, input, &mut attempt));
+    attempt.finish(result).map(Json)
 }
 
 pub(super) async fn put_account_model_capabilities(
@@ -138,14 +164,22 @@ pub(super) async fn put_account_model_capabilities(
     Path(id): Path<String>,
     body: Bytes,
 ) -> Result<Json<AccountMutation>, V3ApiError> {
-    let input = parse_mutation_json::<AccountModelCapabilitiesUpdate>(&body)?;
-    put_capabilities_locked(&state, &id, input).map(Json)
+    let mut attempt = DashboardAttempt::open(
+        &state,
+        "account.model_capabilities",
+        "account",
+        Some(id.clone()),
+    );
+    let result = parse_mutation_json::<AccountModelCapabilitiesUpdate>(&body)
+        .and_then(|input| put_capabilities_locked(&state, &id, input, &mut attempt));
+    attempt.finish(result).map(Json)
 }
 
 fn create_dynamic_account_locked(
     state: &CoreState,
     input: AccountCreate,
     runtime: crate::dynamic::DynamicProviderRuntime,
+    attempt: &mut DashboardAttempt,
 ) -> Result<AccountMutation, V3ApiError> {
     if input.custom_config.is_some() || !input.model_capabilities.is_empty() {
         return Err(V3ApiError::invalid_request_at(
@@ -180,7 +214,7 @@ fn create_dynamic_account_locked(
         key_cipher: state
             .encrypt_key(input.key.trim())
             .map_err(V3ApiError::internal)?,
-        enabled: true,
+        enabled: NEW_READY_KEY_ACCOUNT_ENABLED,
         account_type: ModelAccountType::Key,
         setup_step: ModelSetupStep::Ready,
         referral_code: None,
@@ -203,12 +237,13 @@ fn create_dynamic_account_locked(
         db.create_account(&account)
             .map_err(|error| map_account_write_error(state, error))?;
     }
-    mutation_after_commit(state, &id, false)
+    mutation_after_commit(state, &id, false, attempt)
 }
 
 fn create_account_locked(
     state: &CoreState,
     input: AccountCreate,
+    attempt: &mut DashboardAttempt,
 ) -> Result<AccountMutation, V3ApiError> {
     let _settings_update = state.settings_update.lock();
     check_expectation(state, &input.expectation)?;
@@ -228,7 +263,7 @@ fn create_account_locked(
         .find(|runtime| crate::dynamic::provider_ids_equal(&runtime.id, provider_id))
         .cloned()
     {
-        return create_dynamic_account_locked(state, input, runtime);
+        return create_dynamic_account_locked(state, input, runtime, attempt);
     }
     let plan = crate::provider::builtin_provider(provider_id).ok_or_else(|| {
         V3ApiError::invalid_request_at(state, format!("unknown provider `{provider_id}`"))
@@ -305,10 +340,7 @@ fn create_account_locked(
             ));
         }
     }
-    let enable_requires_verification = ProviderRegistry::get(plan.provider_id)
-        .is_some_and(|descriptor| descriptor.card_actions.enable_requires_verification);
-    let enabled = crate::provider::provider_allows_enablement(plan.provider_id)
-        && !enable_requires_verification;
+    let enabled = NEW_READY_KEY_ACCOUNT_ENABLED;
     let purchase_date = match input.purchase_date {
         Some(value) if !value.trim().is_empty() => normalize_purchase_date(&value)
             .map_err(|error| V3ApiError::invalid_request_at(state, error.to_string()))?,
@@ -366,18 +398,14 @@ fn create_account_locked(
             ollama_billing,
         )
         .map_err(|error| map_account_write_error(state, error))?;
-        let _ = db.log_gateway(
-            "info",
-            "account",
-            &format!("created account {}", account.name),
-        );
     }
-    mutation_after_commit(state, &id, true)
+    mutation_after_commit(state, &id, true, attempt)
 }
 
 fn create_managed_locked(
     state: &CoreState,
     input: AccountManagedCreate,
+    attempt: &mut DashboardAttempt,
 ) -> Result<AccountMutation, V3ApiError> {
     let _settings_update = state.settings_update.lock();
     check_expectation(state, &input.expectation)?;
@@ -435,19 +463,15 @@ fn create_managed_locked(
     {
         let db = state.db.lock();
         db.create_account(&account).map_err(V3ApiError::internal)?;
-        let _ = db.log_gateway(
-            "info",
-            "account",
-            &format!("created managed account draft {}", account.name),
-        );
     }
-    mutation_after_commit(state, &id, false)
+    mutation_after_commit(state, &id, false, attempt)
 }
 
 fn update_account_locked(
     state: &CoreState,
     id: &str,
     input: AccountUpdate,
+    attempt: &mut DashboardAttempt,
 ) -> Result<AccountMutation, V3ApiError> {
     let _settings_update = state.settings_update.lock();
     check_expectation(state, &input.expectation)?;
@@ -510,6 +534,9 @@ fn update_account_locked(
     }
     let key_cipher = match update.key.as_deref().map(str::trim) {
         Some("") | None => None,
+        Some(key) if crate::provider::is_command_code_goat(&existing.provider_id) => {
+            Some(goat_key_cipher_for_save(state, &existing.key_cipher, key)?)
+        }
         Some(key) => Some(state.encrypt_key(key).map_err(V3ApiError::internal)?),
     };
     let password_cipher = match update.password.as_deref().map(str::trim) {
@@ -541,26 +568,39 @@ fn update_account_locked(
             ollama_billing,
         )
         .map_err(|error| map_account_write_error(state, error))?;
-        let _ = db.log_gateway("info", "account", &format!("updated account {id}"));
     }
-    mutation_after_commit(state, id, false)
+    mutation_after_commit(state, id, false, attempt)
 }
 
 async fn delete_account_locked(
     state: &CoreState,
     id: &str,
     expectation: &MutationExpectation,
+    attempt: &mut DashboardAttempt,
 ) -> Result<AccountMutation, V3ApiError> {
-    let revision = account_control::delete_account(
+    let revision = match account_control::delete_account_recorded(
         state,
         id,
         Some((
             expectation.expected_revision,
             expectation.process_generation,
         )),
+        |revision| {
+            attempt.note_partial(OperationMetadata {
+                revision: Some(revision),
+                completed_count: Some(1),
+                failed_count: Some(1),
+                ..Default::default()
+            })
+        },
     )
     .await
-    .map_err(|error| map_account_control_error(state, error))?;
+    {
+        Ok(revision) => revision,
+        Err(error) => {
+            return Err(map_account_control_error(state, error));
+        }
+    };
     Ok(AccountMutation {
         account: None,
         revision,
@@ -571,6 +611,7 @@ async fn delete_account_locked(
 fn reorder_accounts_locked(
     state: &CoreState,
     input: AccountOrder,
+    attempt: &mut DashboardAttempt,
 ) -> Result<AccountList, V3ApiError> {
     let _settings_update = state.settings_update.lock();
     check_expectation(state, &input.expectation)?;
@@ -586,15 +627,30 @@ fn reorder_accounts_locked(
                     "account list changed; reload accounts and try again",
                 ),
                 ReorderAccountsError::Database(error) => V3ApiError::internal(error),
+                ReorderAccountsError::Layout(error) => V3ApiError::internal(error),
             })?;
     }
-    let (revision, accounts) = with_committed_revision(state, || {
-        state
-            .db
-            .lock()
-            .list_accounts()
-            .map_err(V3ApiError::internal)
-    })?;
+    let requested = u32::try_from(input.account_ids.len()).ok();
+    let revision = committed_revision(state);
+    let accounts = match crate::destination_projection::list_accounts_for_v3(&state.db.lock()) {
+        Ok(accounts) => accounts,
+        Err(error) => {
+            attempt.note_partial(OperationMetadata {
+                requested_count: requested,
+                completed_count: Some(1),
+                failed_count: Some(1),
+                revision: Some(revision),
+                ..OperationMetadata::default()
+            });
+            return Err(V3ApiError::internal(error));
+        }
+    };
+    attempt.note_success(OperationMetadata {
+        requested_count: requested,
+        completed_count: requested,
+        revision: Some(revision),
+        ..OperationMetadata::default()
+    });
     account_list_at(state, accounts, revision)
 }
 
@@ -602,20 +658,34 @@ fn toggle_account_locked(
     state: &CoreState,
     id: &str,
     expectation: &MutationExpectation,
+    attempt: &mut DashboardAttempt,
 ) -> Result<AccountMutation, V3ApiError> {
     let _settings_update = state.settings_update.lock();
     check_expectation(state, expectation)?;
     let account = load_model_account(state, id)?;
     let next_enabled = !account.enabled;
-    let account = account_control::set_account_enabled_locked(state, id, next_enabled)
-        .map_err(|error| map_account_control_error(state, error))?;
-    mutation_at(state, account, state.settings_revision())
+    let account = match account_control::set_account_enabled_locked_recorded(
+        state,
+        id,
+        next_enabled,
+        |revision| attempt.note_own_commit(revision),
+    ) {
+        Ok(account) => account,
+        Err(error) => return Err(map_account_control_error(state, error)),
+    };
+    let mutation = mutation_at(state, account, state.settings_revision())?;
+    attempt.note_success(OperationMetadata {
+        revision: Some(mutation.revision),
+        ..OperationMetadata::default()
+    });
+    Ok(mutation)
 }
 
 fn advance_setup_locked(
     state: &CoreState,
     id: &str,
     input: AccountSetupUpdate,
+    attempt: &mut DashboardAttempt,
 ) -> Result<AccountMutation, V3ApiError> {
     let _settings_update = state.settings_update.lock();
     check_expectation(state, &input.expectation)?;
@@ -651,13 +721,14 @@ fn advance_setup_locked(
             "setup changed; reload the account and try again",
         ));
     }
-    mutation_after_commit(state, id, false)
+    mutation_after_commit(state, id, false, attempt)
 }
 
 fn reset_cooldown_locked(
     state: &CoreState,
     id: &str,
     expectation: &MutationExpectation,
+    attempt: &mut DashboardAttempt,
 ) -> Result<AccountMutation, V3ApiError> {
     let _settings_update = state.settings_update.lock();
     check_expectation(state, expectation)?;
@@ -672,14 +743,16 @@ fn reset_cooldown_locked(
         let db = state.db.lock();
         db.clear_account_cooldown(id)
             .map_err(V3ApiError::internal)?;
+        state.recovery.reset_account(id);
     }
-    mutation_after_commit(state, id, false)
+    mutation_after_commit(state, id, false, attempt)
 }
 
 fn put_custom_config_locked(
     state: &CoreState,
     id: &str,
     input: AccountCustomConfigUpdate,
+    attempt: &mut DashboardAttempt,
 ) -> Result<AccountMutation, V3ApiError> {
     let _settings_update = state.settings_update.lock();
     check_expectation(state, &input.expectation)?;
@@ -689,10 +762,29 @@ fn put_custom_config_locked(
         &account,
         "custom config is only available for Custom API accounts",
     )?;
-    let config = AccountCustomConfigInput {
+    reject_shared_custom_account_edit(state, id)?;
+    let mut config = AccountCustomConfigInput {
         endpoint_url: input.endpoint_url,
         upstream_protocol: input.upstream_protocol.into(),
     };
+    {
+        let db = state.db.lock();
+        if let Some(endpoint) = db
+            .platform_hosted_endpoint(id)
+            .map_err(V3ApiError::internal)?
+        {
+            let old = db.account_custom_config(id).map_err(V3ApiError::internal)?;
+            if config.endpoint_url != endpoint
+                && old.is_none_or(|c| c.endpoint_url != config.endpoint_url)
+            {
+                return Err(V3ApiError::invalid_request_at(
+                    state,
+                    "endpoint belongs to the platform account; unlink the Key to change it",
+                ));
+            }
+            config.endpoint_url = endpoint;
+        }
+    }
     let capabilities = input
         .model_capabilities
         .iter()
@@ -703,13 +795,14 @@ fn put_custom_config_locked(
         .lock()
         .commit_account_custom_config_and_capabilities(id, &config, &capabilities)
         .map_err(|error| V3ApiError::invalid_request_at(state, error.to_string()))?;
-    mutation_after_commit(state, id, true)
+    mutation_after_commit(state, id, true, attempt)
 }
 
 fn put_capabilities_locked(
     state: &CoreState,
     id: &str,
     input: AccountModelCapabilitiesUpdate,
+    attempt: &mut DashboardAttempt,
 ) -> Result<AccountMutation, V3ApiError> {
     let _settings_update = state.settings_update.lock();
     check_expectation(state, &input.expectation)?;
@@ -719,6 +812,7 @@ fn put_capabilities_locked(
         &account,
         "model capabilities are only available for Custom API accounts",
     )?;
+    reject_shared_custom_account_edit(state, id)?;
     let capabilities = input
         .capabilities
         .iter()
@@ -729,7 +823,25 @@ fn put_capabilities_locked(
         .lock()
         .commit_account_model_capabilities(id, &capabilities)
         .map_err(|error| V3ApiError::invalid_request_at(state, error.to_string()))?;
-    mutation_after_commit(state, id, true)
+    mutation_after_commit(state, id, true, attempt)
+}
+
+fn reject_shared_custom_account_edit(
+    state: &CoreState,
+    account_id: &str,
+) -> Result<(), V3ApiError> {
+    let count = state
+        .db
+        .lock()
+        .custom_connection_credential_count(account_id)
+        .map_err(V3ApiError::internal)?;
+    if count > 1 {
+        return Err(V3ApiError::invalid_request_at(
+            state,
+            "this Custom HTTP connection has multiple Keys; edit the service connection on Providers",
+        ));
+    }
+    Ok(())
 }
 
 fn ensure_account_can_enable(state: &CoreState, account: &ModelAccount) -> Result<(), V3ApiError> {
@@ -780,29 +892,52 @@ fn committed_revision(state: &CoreState) -> u64 {
 
 /// Run fallible post-commit reload/read/purge after the CAS token has already
 /// advanced, so a later error cannot hide the committed change.
-fn with_committed_revision<T>(
-    state: &CoreState,
-    then: impl FnOnce() -> Result<T, V3ApiError>,
-) -> Result<(u64, T), V3ApiError> {
-    let revision = committed_revision(state);
-    let value = then()?;
-    Ok((revision, value))
-}
-
 fn mutation_after_commit(
     state: &CoreState,
     id: &str,
     reload_contracts: bool,
+    attempt: &mut DashboardAttempt,
 ) -> Result<AccountMutation, V3ApiError> {
-    let (revision, account) = with_committed_revision(state, || {
+    let revision = committed_revision(state);
+    attempt.subject(id);
+    let loaded = (|| {
         if reload_contracts {
             state
                 .reload_provider_contracts()
                 .map_err(V3ApiError::internal)?;
         }
         load_model_account(state, id)
-    })?;
-    mutation_at(state, account, revision)
+    })();
+    let account = match loaded {
+        Ok(account) => account,
+        Err(error) => {
+            attempt.note_partial(OperationMetadata {
+                revision: Some(revision),
+                completed_count: Some(1),
+                failed_count: Some(1),
+                ..OperationMetadata::default()
+            });
+            return Err(error);
+        }
+    };
+    match mutation_at(state, account, revision) {
+        Ok(mutation) => {
+            attempt.note_success(OperationMetadata {
+                revision: Some(revision),
+                ..OperationMetadata::default()
+            });
+            Ok(mutation)
+        }
+        Err(error) => {
+            attempt.note_partial(OperationMetadata {
+                revision: Some(revision),
+                completed_count: Some(1),
+                failed_count: Some(1),
+                ..OperationMetadata::default()
+            });
+            Err(error)
+        }
+    }
 }
 
 fn account_list_from_state(
@@ -852,9 +987,25 @@ pub(super) fn mutation_at(
     })
 }
 
-fn account_from_state(state: &CoreState, account: ModelAccount) -> Result<Account, V3ApiError> {
-    let ((usage_sync_last_success_at, usage_sync_next_allowed_at), contract, ollama_billing) = {
-        let db = state.db.lock();
+pub(crate) fn account_from_state(
+    state: &CoreState,
+    account: ModelAccount,
+) -> Result<Account, V3ApiError> {
+    account_from_db(state, &state.db.lock(), account, &state.dynamic_providers())
+}
+
+pub(crate) fn account_from_db(
+    state: &CoreState,
+    db: &crate::db::Database,
+    account: ModelAccount,
+    dynamic: &[crate::dynamic::DynamicProviderRuntime],
+) -> Result<Account, V3ApiError> {
+    let (
+        (usage_sync_last_success_at, usage_sync_next_allowed_at),
+        contract,
+        ollama_billing,
+        goat_plan,
+    ) = {
         let sync = db
             .account_usage_sync_state(&account.id)
             .map_err(V3ApiError::internal)?;
@@ -867,10 +1018,13 @@ fn account_from_state(state: &CoreState, account: ModelAccount) -> Result<Accoun
         } else {
             None
         };
+        let goat_plan = crate::goat_plan_cooldowns::load_for_legacy_on(&db.conn, &account.id)
+            .map_err(V3ApiError::internal)?;
         (
             crate::usage_sync::dashboard_sync_fields(sync.as_ref(), state.usage_sync.now()),
             contract,
             ollama_billing,
+            goat_plan,
         )
     };
     let known_secret = if account.last_error.is_some()
@@ -893,6 +1047,18 @@ fn account_from_state(state: &CoreState, account: ModelAccount) -> Result<Accoun
         })
     };
     let plan = crate::provider::builtin_provider(&account.provider_id);
+    // A stored legacy purchase anchor is not evidence of a dynamic Provider's
+    // billing cadence or credential expiry. Keep storage intact, but do not
+    // publish invented subscription dates for these account-owned Keys.
+    let has_builtin_lifecycle = plan.is_some();
+    let (cooldown_until, cooldown_5h_until, cooldown_week_until, cooldown_month_until) =
+        crate::goat_plan_cooldowns::overlay_account_deadlines(
+            account.cooldown_until,
+            account.cooldown_5h_until,
+            account.cooldown_week_until,
+            account.cooldown_month_until,
+            goat_plan.as_ref(),
+        );
     Ok(Account {
         id: account.id.clone(),
         provider_id: account.provider_id.clone(),
@@ -904,13 +1070,21 @@ fn account_from_state(state: &CoreState, account: ModelAccount) -> Result<Accoun
         enabled: account.enabled,
         account_type: account.account_type.into(),
         setup_step: account.setup_step.into(),
-        purchase_date: account.purchase_date,
-        expires_on: account.expires_on,
-        cooldown_until: account.cooldown_until.map(|t| t.to_rfc3339()),
+        purchase_date: if has_builtin_lifecycle {
+            account.purchase_date
+        } else {
+            String::new()
+        },
+        expires_on: if has_builtin_lifecycle {
+            account.expires_on
+        } else {
+            String::new()
+        },
+        cooldown_until,
         cooldown_generic_until: account.cooldown_generic_until.map(|t| t.to_rfc3339()),
-        cooldown_5h_until: account.cooldown_5h_until.map(|t| t.to_rfc3339()),
-        cooldown_week_until: account.cooldown_week_until.map(|t| t.to_rfc3339()),
-        cooldown_month_until: account.cooldown_month_until.map(|t| t.to_rfc3339()),
+        cooldown_5h_until,
+        cooldown_week_until,
+        cooldown_month_until,
         cooldown_free_until: account.cooldown_free_until.map(|t| t.to_rfc3339()),
         last_error: sanitize_persisted_error(account.last_error),
         auth_error: sanitize_persisted_error(account.auth_error),
@@ -928,8 +1102,7 @@ fn account_from_state(state: &CoreState, account: ModelAccount) -> Result<Accoun
             .map(|value| value.to_rfc3339()),
         verification_error: sanitize_persisted_error(contract.verification.verification_error),
         plan_routable: plan.is_some_and(|plan| plan.routable)
-            || crate::dynamic::find_runtime(&state.dynamic_providers(), &account.provider_id)
-                .is_some(),
+            || crate::dynamic::find_runtime(dynamic, &account.provider_id).is_some(),
         custom_config: contract.custom_config.map(custom_config_from_model),
         model_capabilities: contract
             .model_capabilities
@@ -1041,6 +1214,29 @@ fn clean_optional(value: Option<String>) -> Option<String> {
     })
 }
 
+/// Reuse the stored GOAT ciphertext when the trimmed Key matches.
+///
+/// Encryption draws a fresh nonce, so saving the same Key would otherwise
+/// look like a replacement and drop the plan-window map. A different Key,
+/// or a ciphertext that cannot be read, uses the normal encrypt path.
+/// The plaintext is compared here and is not logged.
+fn goat_key_cipher_for_save(
+    state: &CoreState,
+    current_cipher: &str,
+    incoming: &str,
+) -> Result<String, V3ApiError> {
+    let normalized = incoming.trim();
+    if !current_cipher.is_empty()
+        && state
+            .decrypt_key(current_cipher)
+            .ok()
+            .is_some_and(|stored| stored == normalized)
+    {
+        return Ok(current_cipher.to_string());
+    }
+    state.encrypt_key(normalized).map_err(V3ApiError::internal)
+}
+
 fn encrypted_optional(
     state: &CoreState,
     value: &Option<String>,
@@ -1086,32 +1282,106 @@ fn map_provider_binding_error(
     }
 }
 
-#[cfg(test)]
-mod committed_revision_tests {
-    use super::*;
-    use crate::crypto::{KeyCipher, StaticKeyCipher};
-    use crate::db::Database;
-    use crate::state::CoreStateInner;
-    use std::sync::Arc;
+pub(super) trait RevisionAck {
+    fn acked_revision(&self) -> Option<u64>;
+}
 
-    #[test]
-    fn committed_revision_advances_before_fallible_post_commit_work() {
-        let dir =
-            std::env::temp_dir().join(format!("ocg-v3-accounts-rev-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let db = Database::open(dir.clone()).unwrap();
-        let cipher: Arc<dyn KeyCipher + Send + Sync> =
-            Arc::new(StaticKeyCipher::new("v3-accounts-rev"));
-        let state = Arc::new(CoreStateInner::new(db, dir.clone(), cipher).unwrap());
-        let before = state.settings_revision();
-        let err = with_committed_revision::<()>(&state, || {
-            Err(V3ApiError::internal("injected post-commit failure"))
-        })
-        .expect_err("post-commit failure must surface");
-        assert_eq!(err.status, StatusCode::INTERNAL_SERVER_ERROR);
-        assert_eq!(err.body.code, super::super::ERROR_INTERNAL);
-        assert_eq!(state.settings_revision(), before + 1);
-        drop(state);
-        let _ = std::fs::remove_dir_all(dir);
+impl RevisionAck for AccountMutation {
+    fn acked_revision(&self) -> Option<u64> {
+        Some(self.revision)
     }
 }
+
+impl RevisionAck for AccountList {
+    fn acked_revision(&self) -> Option<u64> {
+        Some(self.revision)
+    }
+}
+
+impl RevisionAck for MutationAck {
+    fn acked_revision(&self) -> Option<u64> {
+        Some(self.revision)
+    }
+}
+
+pub(super) struct DashboardAttempt {
+    op: UserOperation,
+    committed: Option<OperationMetadata>,
+}
+
+impl DashboardAttempt {
+    pub(super) fn open(
+        state: &CoreState,
+        action: &'static str,
+        subject_type: &'static str,
+        subject_id: Option<String>,
+    ) -> Self {
+        Self {
+            op: UserOperation::dashboard(state, action, subject_type, subject_id),
+            committed: None,
+        }
+    }
+
+    pub(super) fn subject(&mut self, id: impl Into<String>) {
+        self.op.subject(id);
+    }
+
+    pub(super) fn note_success(&mut self, metadata: OperationMetadata) {
+        self.committed = Some(metadata);
+    }
+
+    pub(super) fn note_partial(&mut self, metadata: OperationMetadata) {
+        self.committed = Some(metadata);
+    }
+
+    /// This action's own committed write, captured at that commit and before a
+    /// fallible follow-up. `finish` keeps these facts as Partial when the action
+    /// still returns `Err`. `note_success` replaces them when the whole action
+    /// returns `Ok`.
+    pub(super) fn note_own_commit(&mut self, revision: u64) {
+        self.note_partial(OperationMetadata {
+            revision: Some(revision),
+            completed_count: Some(1),
+            failed_count: Some(1),
+            ..OperationMetadata::default()
+        });
+    }
+
+    pub(super) fn complete_failed(self, reason: &'static str, metadata: OperationMetadata) {
+        self.op
+            .complete(OperationOutcome::Failed, Some(reason), metadata);
+    }
+
+    pub(super) fn finish<T: RevisionAck>(
+        mut self,
+        result: Result<T, V3ApiError>,
+    ) -> Result<T, V3ApiError> {
+        match &result {
+            Ok(value) => {
+                let mut metadata = self.committed.take().unwrap_or_default();
+                // Commit notices are provisional until follow-up finishes.
+                // A completed operation must not retain a predicted failure.
+                metadata.failed_count = None;
+                if metadata.revision.is_none() {
+                    metadata.revision = value.acked_revision();
+                }
+                self.op.complete(OperationOutcome::Success, None, metadata);
+            }
+            Err(error) if self.committed.is_some() => {
+                let metadata = self.committed.take().unwrap();
+                let reason = error.operation_reason().to_string();
+                let outcome = if metadata.compensated == Some(true) {
+                    OperationOutcome::Compensated
+                } else {
+                    OperationOutcome::Partial
+                };
+                self.op.complete(outcome, Some(reason.as_str()), metadata);
+            }
+            Err(_) => self.op.result(&result),
+        }
+        result
+    }
+}
+
+#[cfg(test)]
+mod tests;

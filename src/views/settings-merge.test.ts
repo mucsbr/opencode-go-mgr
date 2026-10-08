@@ -1,15 +1,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { AppConfig } from "../api/dashboard.ts";
-import { EDITABLE_SETTING_KEYS, mergeUnsavedSettings } from "./settings-merge.ts";
-
-test("the primary key value is not an editable settings field", () => {
-  assert.ok(!(EDITABLE_SETTING_KEYS as readonly string[]).includes("gateway_key"));
-});
+import { mergeUnsavedSettings } from "./settings-merge.ts";
 
 function config(overrides: Partial<AppConfig> = {}): AppConfig {
   return {
     revision: 1,
+    process_generation: 3,
     gateway_port: 9042,
     gateway_port_from_env: false,
     proxy_mode: "auto",
@@ -42,6 +39,7 @@ test("settings conflict merge preserves local edits and accepts unrelated remote
   });
   const latest = config({
     revision: 2,
+    process_generation: 8,
     gateway_port: 9142,
     non_stream_timeout_secs: 1_200,
   });
@@ -49,11 +47,25 @@ test("settings conflict merge preserves local edits and accepts unrelated remote
   const merged = mergeUnsavedSettings(latest, current, saved);
 
   assert.equal(merged.revision, 2);
+  assert.equal(merged.process_generation, 8);
   assert.equal(merged.proxy_mode, "manual");
   assert.equal(merged.proxy_url, "http://127.0.0.1:7890");
   assert.equal(merged.connect_timeout_secs, 45);
   assert.equal(merged.gateway_port, 9142);
   assert.equal(merged.non_stream_timeout_secs, 1_200);
+});
+
+test("settings drafts adopt routing controls owned by Accounts", () => {
+  const saved = config();
+  const current = config({ routing_mode: "sticky-global", conversation_sticky: false, connect_timeout_secs: 45 });
+  const latest = config({ revision: 2, routing_mode: "round-robin", conversation_sticky: true });
+
+  const merged = mergeUnsavedSettings(latest, current, saved);
+
+  assert.equal(merged.routing_mode, "round-robin");
+  assert.equal(merged.conversation_sticky, true);
+  assert.equal(merged.connect_timeout_secs, 45);
+  assert.equal(merged.revision, 2);
 });
 
 test("settings conflict merge adopts the remote OpenCode Go invite URL", () => {
@@ -71,10 +83,6 @@ test("settings conflict merge adopts the remote OpenCode Go invite URL", () => {
 
   assert.equal(merged.opencode_invite_url, "https://opencode.ai/invite/remote");
   assert.equal(merged.proxy_mode, "manual");
-});
-
-test("the OpenCode Go invite URL is not an editable Settings-page field", () => {
-  assert.ok(!(EDITABLE_SETTING_KEYS as readonly string[]).includes("opencode_invite_url"));
 });
 
 test("settings conflict merge keeps local edits and adopts server capability flags", () => {

@@ -1,0 +1,51 @@
+[简体中文](platform-accounts.zh-CN.md)
+
+# New API And Sub2API Accounts
+
+For a site installed under a path such as `/chat`, enter the site root as either `/chat` or `/chat/v1`. Adding and refreshing a Key requests `/chat/v1/models`; Chat inference uses `/chat/v1/chat/completions`, with matching Responses and Messages paths. When an unlinked Key's original Custom connection is empty and still uses the same route and model mappings, the Key returns to that connection; shared or edited connections are preserved.
+
+Each site is **one account** with multiple Keys. **Add Key** asks for a name and the Key only. Saving fetches that Key's models from the site and then associates the Key. On New API, **Import Keys from site** uses the saved management credential to list remote tokens, read each full Key, create local Custom Keys, and associate them. Tokens that already exist locally, are disabled, or cannot return a full Key or models are skipped. New API and Sub2API already convert Chat Completions, Messages, and Responses, so OCG does not ask for a protocol or open the Providers model matrix for that Key. If association fails after creation, the form shows that the Key already exists and retries only association. Reloading keeps the standalone Key available under Link existing Key. An uncertain creation result must be reconciled against the account list before creating again.
+
+**New API** and **Sub2API** are platform types, not singleton suppliers. Add a separate named instance for each site or user account: multiple New API instances and multiple Sub2API instances can coexist. Each instance has its own identity, site URL, credentials, linked Keys and observations. Refreshing, editing or deleting one instance does not act on every instance of that type.
+
+On **Accounts**, open **Add account**, choose **New API** or **Sub2API** under **Platform accounts**, then enter the site URL and a name. The site appears as one sortable card in the account list. Drag that card to set its place in global routing; Keys inside the card have their own up/down order for fallback among themselves. **Get models** (or **Fetch all models**) asks each Key for `GET /v1/models` and stores that Key's list. The same public name on two Keys is overlay, not a conflict: authenticated `GET /v1/models` lists it once, and a request tries those Keys in order. Give each Key a distinct name (for example `Codex 稳定` and `Codex Pro`); after refresh each Key row labels the site group, the token name when it differs from the local name, and how many models that Key can route. Click the model count to open that Key's model list on Accounts — New API and Sub2API sites do not appear on **Providers**.
+
+Use the site's root URL, including any installation path. The platform and URL are fixed after creation. Link an existing Custom API Key explicitly, add a Key from the site card, or on New API import Keys from the site after the management credential is saved. Imported Key secrets are stored locally like manually added Keys and are never returned by the dashboard. A manual association is not proof of remote ownership or model permission. A linked Key is recorded as a declared (not verified) relation to the platform account. While linked, inference uses the site root. Each attempt selects among the saved Chat, Messages, and Responses routes in the same preferred, client, then remaining granted order used for every other supplier, locally before the send. An HTTP 400 does not switch protocol. Credential and provider retries keep their existing policy. Gemini stays a client format.
+
+An optional user credential enables user-scoped observations. For New API, fill the numeric user ID from Personal settings and the system access token from Personal settings → Security → System access token as two fields, not an inference Key from the token list. The user ID is sent as `New-Api-User` on sites that still require it; newer New API builds ignore that header. For Sub2API, use the logged-in user's access token. It is stored separately from inference Keys and is never returned by the dashboard or included in a transfer bundle. Omitting it keeps Key-scoped reads available. Expired user credentials do not disable inference. Clearing the credential removes cached observations that depended on it.
+
+Model counts in the import confirmation, Key row, and model list use distinct public model names. A model available through Chat, Messages, and Responses counts once.
+
+## Refresh And Read The Results
+
+Refresh is manual. The parent card shows the site's **Balance**, **This month**, and **Lifetime**. These are site wallet and consume-log observations, not a local price and not a request cost. Official API cards show the remaining balance only. Balance and lifetime come from the site wallet; this month is the site's consume-log total for the current UTC month when that optional endpoint responds, otherwise a dash. Parent **Refresh** reads that site wallet. Each linked Key row can show its own remaining next to its enable switch; that row's **Refresh** reads only that Key's remaining quota, not the site wallet. Wallet, subscription, and Key limits are separate scopes and are not added together.
+
+Without the optional user credential, the parent wallet stays unknown; refresh each Key to read that Key's remaining quota. A missing management credential is not a card error: the banner is not kept on the site card. Refresh still reports a one-time toast when the observation cannot run. New API amounts are stored in the site's native quota points and converted to USD when `GET /api/status` returns a positive `quota_per_unit` (the same points-per-dollar rate the site uses). If that rate is missing, the native `quota` unit is kept.
+
+New API supports wallet and subscription billing, fixed and automatic groups, and billing preferences. Sub2API current balance comes from the user profile or from a Key's `/v1/usage` `balance` field when that field is present. Fixed model permissions or Key-authenticated `GET /v1/models` supply the models that Key can route. A refresh reads models, usage, balance, and groups. It does not fetch a price table or estimate a request cost, and it does not change routeable models by itself.
+
+A missing cost stays unknown and is not shown as zero or free. If a new snapshot has no prices, previously stored prices stay with the older snapshot and are not used to price a new request. A later refresh does not recalculate older rows. A site balance observation does not prove what one request debited from the wallet.
+
+## Change Or Transfer An Account
+
+A linked Key's endpoint belongs to its parent. Unlinking keeps the Key, its materialized endpoint, and model configuration. Delete or unlink all children before deleting a parent; parent deletion never deletes Keys.
+
+Node exports use the current payload. Destinations and credentials remain authoritative — parent definitions, associations, management secrets, and platform extras travel inside the encrypted envelope with inference Keys. A merge that omits the CPA or platform observer key keeps the destination's existing management key. Draft connections stay off routing after import until completed. Imports accept V4 through the current export version. Imported groups remain unverified until fresh evidence; a matching parent ID with a different platform or site URL rejects atomically. See [Upgrade and backup](upgrade-backup.md).
+
+Back up the complete data directory before upgrading. Rollback restores that full backup; do not open a migrated database with an older binary. See [storage and migrations](../maintainer/storage-migration.md).
+
+The reader baseline is New API `71c1fd7caad738db4d13aabbf28eeadb293d0cfe` and Sub2API `772a0382f079676983c06f24b0d41e09139a8462`. Older releases and forks may omit or change these interfaces; an unavailable observation is not an inference failure.
+
+## Refresh Isolation And Bounded Imports
+
+The parent **Refresh** and each Key's **Refresh** update observations only. They do not run model discovery a second time or change saved model routing. Use **Fetch models** explicitly for that configuration change. A truncated discovery result leaves the existing model configuration unchanged; empty and failed results likewise do not replace it.
+
+A Key refresh reports that Key's errors, not an old parent error. Sub2API Key refresh does not fetch the management user's wallet, subscriptions, or available groups, and it does not look up model-plaza prices. A Key-authenticated balance remains scoped to the Key.
+
+When an endpoint fails, successful components are saved and only rows from failed sources retain their last-known values. Retained rows do not gain a new expiry from the failed attempt. The snapshot time describes the latest attempt, not proof every retained row was observed then. A parent observation no longer invalidates an in-flight child refresh; origin, management credential, link, and inference Key changes still invalidate it.
+
+New API import copies at most 50 remote rows per action and returns an explicit `nextPage`. Even a page of entirely disabled or already imported Keys can have a continuation. Invoke **Import Keys from site** again to continue in the current session. Completing all pages resets the next import to page one. Reloading or signing out also resets the cursor. This is bounded copying, not remote synchronization; rescan after concurrent remote inventory changes. Duplicate secrets are checked within the selected platform instance, and already imported Keys skip model discovery.
+
+---
+
+[User guide index](../USER.md) · [简体中文](platform-accounts.zh-CN.md) · [Docs index](../README.md)

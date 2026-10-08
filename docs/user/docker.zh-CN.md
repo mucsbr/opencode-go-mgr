@@ -4,11 +4,12 @@
 
 Docker 版在同一个端口 `9042` 上无头提供 Dashboard 和 Gateway。镜像在 GHCR 上匿名可拉，`linux/amd64`
 与 `linux/arm64` 自动匹配。把 Release 的 `compose.example.yaml` 存为
-`compose.yaml`，按需加 `.env`，然后执行下面命令；或者检出对应 tag
+`compose.yaml`，按需加 `.env`，然后执行下面命令；命令用 `VERSION` shell 变量钉住同一个版本，取值与该 Release 附带的 `compose.example.yaml` 一致，运行时可替换为最新发布版。也可以检出对应 tag
 的仓库：
 
 ```bash
-git clone --branch v2.2.1 --depth 1 https://github.com/klarkxy/open-console-gateway.git
+VERSION=2.7.0
+git clone --branch "v$VERSION" --depth 1 https://github.com/klarkxy/open-console-gateway.git
 cd open-console-gateway
 cp .env.example .env
 # PowerShell: Copy-Item .env.example .env
@@ -20,19 +21,18 @@ docker compose ps
 
 镜像标签会动；先决定是跟车还是钉死。
 
-源码仓库现为 `klarkxy/open-console-gateway`。已发布的 GHCR 镜像继续使用
+源码仓库是 `klarkxy/open-console-gateway`。已发布的 GHCR 镜像包名是
 `ghcr.io/klarkxy/opencode-go-mgr` 和 `ghcr.io/klarkxy/opencode-go-mgr-browser`；
-仓库改名不会同步更改镜像包名。Compose 和容器发布工作流保留这些现有名称，
-使已有安装继续沿用同一升级通道。
+Compose 和容器发布工作流使用这些镜像名。
 
 ## 选择镜像
 
 - 仓库源码里的 `compose.yaml` 默认用 `latest`；Release 的
   `compose.example.yaml` 钉死对应完整版本。
 - 生产部署建议在 `.env` 中用 `OCG_IMAGE` 固定完整版本标签，例如
-  `ghcr.io/klarkxy/opencode-go-mgr:2.2.1`。
+  `ghcr.io/klarkxy/opencode-go-mgr:<version>`。
 - 完整版本与 `sha-<commit>` 标签指向单次发布，按策略不应移动；
-  `1.5` 与 `latest` 会继续移动。技术上只有 digest
+  `latest` 会继续移动。技术上只有 digest
   `ghcr.io/klarkxy/opencode-go-mgr@sha256:...` 真正不可变。
 - 想调试当前源码时，设置 `OCG_IMAGE=ocg-manager:local`，再执行
   `docker compose up -d --build`。`NPM_REGISTRY` 与 `CARGO_REGISTRY`
@@ -45,6 +45,7 @@ docker compose ps
 | `OCG_PORT` | Compose | 宿主机回环端口；容器内仍监听 `9042`。 |
 | `OCG_ADMIN_USERNAME` + `OCG_ADMIN_PASSWORD` | 首次启动 | 可选管理员引导；必须同时设置或都不设置。 |
 | `OCG_CLIENT_ROOT_URL` | 运行时 | 只读覆盖外部客户端根地址。 |
+| `OCG_MAX_REQUEST_BODY_BYTES` | 运行时 | Gateway JSON 请求体大小上限（字节）；默认 64 MiB。 |
 | `OCG_CPA_BASE_URL` | Compose CPA profile | 只读 CPA 并列服务地址；保持 `http://cpa:8317`。 |
 | `CPA_MANAGEMENT_PASSWORD` | Compose CPA profile | CPA Management API 密码；只保存在部署用 `.env`。 |
 | `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` / `NO_PROXY` | 运行时 | “自动（系统 / 环境）”出站代理模式使用的标准代理变量。 |
@@ -135,6 +136,9 @@ Google 可能把数据中心出口 IP 视为高风险，要求额外验证，甚
 `https://ocg.example.com`，不需要填写 `/dashboard/` 或具体 API 端点；
 末尾 `/v1` 可省略或保留。
 
+以上说的是部署加密密钥，不是客户端用来鉴权的 Gateway **Key**。Key 泄露时
+请重新生成。
+
 ## 运行时行为
 
 在 `.env` 中设置 `OCG_PORT` 可修改宿主机端口，容器内仍固定使用 `9042`。
@@ -155,8 +159,7 @@ Google 可能把数据中心出口 IP 视为高风险，要求额外验证，甚
   `seccomp=unconfined`，以便普通 Chromium 建立自身的 namespace 和 renderer
   seccomp 沙箱。Sidecar 不使用 `--no-sandbox`，另有 1 GiB 共享内存；命名卷
   `ocg-data` 与 `ocg-browser-profiles` 是两类持久化应用状态。
-- 启动日志会打印 Key，因此日志输出和 Docker daemon 权限都属于敏感信息。
-  如果 Docker 主机默认没有限制日志大小，请由部署方配置日志轮转。
+- 支持 `status --show-key` 的 CLI 构建会在启动日志中隐藏 Gateway Key；旧版镜像可能打印过它，因此既有日志和 Docker daemon 权限仍属于敏感信息。如果 Docker 主机默认没有限制日志大小，请由部署方配置日志轮转。
 
 常用检查命令：
 
@@ -177,13 +180,14 @@ curl --fail http://127.0.0.1:9042/dashboard/
 的 provenance attestation。可这样检查发布版本：
 
 ```bash
-docker buildx imagetools inspect ghcr.io/klarkxy/opencode-go-mgr:2.2.1
-docker buildx imagetools inspect ghcr.io/klarkxy/opencode-go-mgr-browser:2.2.1
+VERSION=2.7.0
+docker buildx imagetools inspect ghcr.io/klarkxy/opencode-go-mgr:$VERSION
+docker buildx imagetools inspect ghcr.io/klarkxy/opencode-go-mgr-browser:$VERSION
 gh attestation verify \
-  oci://ghcr.io/klarkxy/opencode-go-mgr:2.2.1 \
+  oci://ghcr.io/klarkxy/opencode-go-mgr:$VERSION \
   --repo klarkxy/open-console-gateway
 gh attestation verify \
-  oci://ghcr.io/klarkxy/opencode-go-mgr-browser:2.2.1 \
+  oci://ghcr.io/klarkxy/opencode-go-mgr-browser:$VERSION \
   --repo klarkxy/open-console-gateway
 ```
 

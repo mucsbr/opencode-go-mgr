@@ -6,7 +6,7 @@ This page defines stable dependency and ownership boundaries. Runtime edge
 cases, schema history, route inventories, and release procedures live in
 their own chapters.
 
-## Dependency graph
+## Dependency Graph
 
 ```text
 ocg-gateway -> ocg-domain
@@ -15,7 +15,7 @@ ocg-cli     -> ocg-core
 src-tauri   -> ocg-core
 
 ocg-browser-worker   separate process; no internal ocg-* dependency
-Vue SPA              static assets; HTTP Dashboard V3 only
+Vue SPA              static assets; HTTP Dashboard V4 only
 ```
 
 The **Adapter Registry** is static and sealed. Runtime Provider definitions
@@ -26,13 +26,16 @@ are typed data bound to Configurable HTTP.
 | `ocg-domain` | IDs, `BUILTIN_PROVIDERS`, `ProviderAdapterKind`, protocol tables, typed dynamic definitions | DB, `CoreState`, HTTP clients, filesystem, clocks |
 | `ocg-gateway` | Alias resolution, `AttemptSpec`, classification, selector state machines, no-I/O JSON conversion | DB, `CoreState`, plaintext credentials, outbound HTTP |
 | `ocg-infra` | Key obfuscation, proxy-aware HTTP helpers, inference transport, SQLite log statements | Product catalogs, Dashboard DTOs, routing policy |
-| `ocg-core` | SQLite, `CoreState`, Dashboard V3, adapters, gateway execution, usage sync, Host composition | Runtime plugin loading; adapter-owned DB or HTTP clients |
+| `ocg-core` | SQLite, `CoreState`, Dashboard control plane, adapters, gateway execution, usage sync, Host composition | Runtime plugin loading; adapter-owned DB or HTTP clients |
 | `ocg-cli` / `src-tauri` | Process composition for CLI and Desktop | A second control plane or direct WebView mutation path |
 
-Compatibility facades remain in `ocg-core`, but new no-I/O catalog, selector,
+`ocg-domain::credential` holds the identity/credential/binding vocabulary and
+the single legacy mapper.
+
+Compatibility facades live in `ocg-core`; new no-I/O catalog, selector,
 alias, and conversion behavior belongs in the lower crates.
 
-## HTTP composition
+## HTTP Composition
 
 `crates/ocg-core/src/host_router.rs` is the composition root for one listener:
 
@@ -41,26 +44,31 @@ alias, and conversion behavior belongs in the lower crates.
   inference routes
     OpenAI Chat / Responses / Anthropic Messages
     Gemini generateContent / streamGenerateContent
-    Claude Desktop role aliases
     local GET /v1/models
-  /dashboard/api/v3       current Dashboard control plane
-  /dashboard/api          preserved auth + browser WS; retired REST -> 410
+  /dashboard/api/v3       410 tombstone
+  /dashboard/api/v4       live Dashboard control plane
+  /dashboard/api          preserved auth + browser WS; other REST -> 410 tombstone
   /dashboard/             Vue SPA and assets
 ```
 
 The SPA remains an HTTP client. Desktop capabilities are registered into
 `CoreState`.
 
-## Gateway request path
+## Gateway Request Path
 
 Inference is implemented under `crates/ocg-core/src/gateway/`:
 
 1. `handler.rs` assigns the request id, authenticates a client Key, parses the
-   client protocol, rewrites Claude Desktop roles, and resolves model identity.
-2. `GatewayExecutor` captures one request-entry snapshot for pricing, proxy
-   routes, contracts, and Alias resolution. Fallback iterations re-read live
+   client protocol, and resolves model identity.
+2. `GatewayExecutor` captures one request-entry snapshot for proxy
+   routes, contracts, and Alias resolution. It does not capture a price
+   snapshot for a new request. Fallback iterations re-read live
    account state, eligible Custom runtimes, and Zen Free cooldown. Protocol
-   selection uses that saved contract.
+   selection is made again for each attempt from that saved contract: the
+   saved preferred protocol, then the enabled client protocol, then the
+   remaining granted protocols. Local preservation picks one of those
+   candidates before that attempt's send. An HTTP 400 does not switch
+   protocol. Credential and provider retries stay in the outer loop below.
 3. Candidate materialization applies adapter ceilings and effective
    model/protocol state before the no-I/O selector chooses a card.
 4. `provider_adapter.rs` exhaustively maps the sealed `ProviderAdapterKind` to
@@ -77,26 +85,31 @@ stream interruptions, and other outcomes that may have reached the upstream
 are not automatically replayed. Full status-specific behavior lives in
 [Runtime invariants](runtime-invariants.md).
 
-## Adapter and Provider boundary
+## Adapter And Provider Boundary
 
 `ocg-domain::ProviderRegistry` contains the code-owned built-in Provider rows
 and exhaustive adapter kinds. Unknown `provider_id` values fail closed unless
 they match a persisted typed Provider definition, which always selects the
 existing Configurable HTTP adapter.
 
-Custom API remains an account-owned product path even though it uses the same
-sealed adapter kind. CPA is a separate static external integration.
+Legacy Custom API rows are distinct configurable `http` destinations using
+the same sealed adapter kind. A connection may hold multiple credentials while
+preserving public-name-only resolution. CPA is a separate static external
+integration.
 
 Provider-owned catalogs and contracts are resolved before account credentials
 are used. Saved discovery rows may activate code-owned Alias mappings or remain
 exact raw pins.
 
-## Control plane
+## Control Plane
 
-The Vue SPA calls `/dashboard/api/v3` through `src/api/dashboard-v3.ts` and its
-presenters. CAS-protected mutations carry `expectedRevision` and
-`processGeneration`; pricing writes also carry `expectedPricingRevision`.
-Operational reads and diagnostics that do not mutate state skip CAS.
+The Vue SPA calls remounted operational handlers through
+`src/api/dashboard-v3.ts` (HTTP base `/dashboard/api/v4`) and native V4 routes
+through `src/api/dashboard-v4.ts` (presenters in `src/api/connections.ts`).
+`/dashboard/api/v3` is a 410 tombstone. Live dashboard JSON is V4 only.
+CAS-protected mutations carry `expectedRevision` and `processGeneration`.
+There is no pricing write and no `expectedPricingRevision`. Operational reads and
+diagnostics that do not mutate state skip CAS.
 
 The CLI calls the same HTTP-neutral services without an argv CAS token. Shared
 services own persistence and revision bumps for both the CLI and the frontend.
@@ -106,12 +119,12 @@ The settings-specific persist/rebind/compensation sequence is shown in
 states are shown in
 [State and lifecycle](state-and-lifecycle.md#managed-account-setup-lifecycle).
 
-## Detail ownership
+## Detail Ownership
 
 | Detail | Authoritative chapter |
 | --- | --- |
 | Alias, selector, protocol, retry, cooldown, model-list behavior | [Runtime invariants](runtime-invariants.md) |
-| Dashboard V3 DTOs, CAS, V2 tombstones | [Dashboard API](dashboard-api.md) |
+| Dashboard V4 DTOs, remounted handlers, CAS, V2/V3 tombstones | [Dashboard API](dashboard-api.md) |
 | Locks, account setup, browser workers, process lifecycles | [State and lifecycle](state-and-lifecycle.md) |
 | Tables, migrations, backups, rollback | [Storage and migrations](storage-migration.md) |
 | Complete HTTP route inventory | [HTTP routes](http-routes.md) |

@@ -19,10 +19,8 @@ supported protocol matrix lives in
   schemas/behavior, `VALIDATED` function calling, candidate counts other than
   one, and response modalities other than `TEXT` return `400`. Use base64
   `inlineData` for PNG, JPEG, GIF, or WebP images.
-- Gemini `topK` and `thinkingConfig` are accepted only as cross-protocol
-  compatibility hints. A native Chat Completions or Messages upstream may
-  ignore them or implement different semantics; exact Gemini-equivalent
-  sampling and thinking behavior is not guaranteed.
+- A non-null Gemini `generationConfig.topK` or `generationConfig.thinkingConfig`
+  is rejected before HTTP. Conversion has no exact form for either value.
 - Other non-null generation options that cannot be preserved, including
   `seed`, presence/frequency penalties, log-probability controls, and media
   resolution, return `400` instead of being silently discarded.
@@ -38,16 +36,18 @@ supported protocol matrix lives in
   automatic tool mode; explicitly forcing one returns a `400` error.
   Function, custom, and namespace tools are converted normally.
 - Streaming token counts are accurate only when upstream emits usage chunks;
-  Chat streams request `stream_options.include_usage`. Cost uses the active
-  OpenCode Go pricing snapshot. Without usage, logs end as `success_no_usage`.
+  Chat streams request `stream_options.include_usage`. The gateway does not
+  estimate a price for a new request. A cost that was not recorded stays
+  unknown and is not shown as zero or free. Without usage, logs end as
+  `success_no_usage`.
 - Browser onboarding provides only manual page interaction; it does not
   register Google accounts, solve verification challenges, pay, scrape
   pages, or extract keys automatically.
 - The installed Windows x64, macOS, and Linux x64 desktop dashboards can start
-  Open Console Gateway in the tray when the user logs in. Development builds, CLI, and
-  Docker do not expose that dashboard `auto_start` switch. Docker Compose
-  separately uses `restart: unless-stopped`, so its service can restart with
-  the Docker daemon.
+  Open Console Gateway in the tray when the user logs in. Development builds,
+  CLI, and Docker do not expose that dashboard `auto_start` switch. Docker
+  Compose separately uses `restart: unless-stopped`, so its service can restart
+  with the Docker daemon.
 - The macOS desktop dashboard can hide the Dock icon while retaining the
   menu-bar icon. Windows, Linux, CLI, and Docker do not expose the
   `show_dock_icon` switch.
@@ -56,36 +56,70 @@ supported protocol matrix lives in
   are not implemented. That covers desktop installers only; the container
   images (`ghcr.io/klarkxy/opencode-go-mgr` and its `-browser` sidecar)
   publish `linux/amd64` and `linux/arm64`. Updater-enabled installed desktop
-  builds can install signed releases from Settings; 1.4.1, development
+  builds can install signed releases from Settings; development
   builds, the CLI, and Docker use the direct/manual upgrade path.
 - Command Code GOAT is a live fixed-origin route. Its public `/models` catalog
-  is refreshed explicitly on **Providers**; GOAT preset rows default on and
-  additional rows default off. GOAT catalog refresh updates the model
-  directory; Key auth is observed from inference 401/403. Its verified price
-  snapshot estimates new request costs, with a saved editable multiplier per
-  priced model. The account card can explicitly calibrate local
-  `$14 / $35 / $70` windows from the first-party `/alpha/billing/credits`
-  endpoint used by Command Code's official CLI, then continues accumulating
-  priced OCG logs. The endpoint is not documented in the public Provider API,
-  GOAT is never auto-synced, and manual correction remains available. Custom
-  API is live under the trusted-administrator
-  boundary in [Accounts](accounts.md); it is unpriced, has no official usage
-  path, and its catalog, protocol, and pricing controls live on **Providers**
-  as isolated `CustomEndpoint` scopes.
-- Ollama Cloud monthly USD-credits usage is a soft estimate from locally priced
-  logs. Used credit may exceed the Pro `$60` / Max `$300` / Team `$1000`
-  limit; the dashboard clamps the bar at 100% and shows overage. Meter fullness
-  never writes cooldown, disables the account, or changes routing. New Ollama
-  accounts require an explicit Pro/Max/Team tier and purchase date. Migrated
-  accounts with no billing row stay routeable without a meter. Actual upstream
-  `429` still uses the generic cooldown/fallback path.
-- Zen Free routing uses the card's enable switch and list position. There is
-  no Deny / Explicit / Prefer policy.
+  is refreshed explicitly on **Providers**, and also when **Refresh quota**
+  runs on **Accounts**; GOAT preset and newly discovered rows default on when
+  a supported protocol is known, except that GOAT's first snapshot starts only
+  plan-included models on and keeps the rest of that snapshot off until enabled
+  manually.
+
+  GOAT catalog refresh updates the model directory; Key auth is observed from
+  inference 401/403. The account card can explicitly **Refresh quota** to read
+  official percentage windows from the first-party `/alpha/billing/credits`
+  endpoint used by Command Code's official CLI. When that reading includes a
+  percentage, the window uses it against a full window of 100 and keeps its
+  reset. A dollar amount is not relabeled as a percentage. Later requests do
+  not add a price onto the percentage. The endpoint is not documented in the
+  public Provider API. GOAT is never auto-synced. You can save a manual
+  percentage afterwards. With no official reading and no manual percentage,
+  the window stays unavailable and is not shown as 0.
+
+  Custom API is live under the trusted-administrator boundary in
+  [Accounts](accounts.md). A missing cost stays unknown and is not shown as
+  zero or free. A manual credit balance is not reduced by a completed
+  request. There is no generic official usage path. Its catalog and protocol
+  controls live on **Providers**.
+- Account cards show three kinds of evidence when the Provider has it: timed
+  quota windows, an official balance, and a manual credit balance. A missing
+  observation stays unavailable and is not shown as 0. Official Go and GOAT
+  windows use the observed percentage against 100. OpenCode Go, GOAT, and
+  Ollama can save a manual percentage. Go uses the 5-hour, weekly, and monthly
+  windows. Ollama uses the month window. Zen, MiniMax, Kimi, Custom, and CPA
+  do not show that editor. A plan whose metadata explicitly turns manual
+  calibration off does not show it either. The first saved percentage is only
+  that quota window. Opening the page again, or reading it again while it
+  stays open, shows that percentage and does not fill in a full billing
+  status.
+  A manual credit balance, a cash balance, and a platform site's
+  observed consumption history stay separate. A manual credit balance
+  keeps separate buckets, grants, monthly renewal, and expiry; **Calibrate
+  usage** corrects the saved balance by hand. A completed request does not
+  reduce that balance, and the product does not apply per-token rates or a
+  currency conversion. Unknown stays unknown and is not recorded as zero or
+  free. An empty or unknown balance does not disable a Key or change routing.
+  Official remaining balance is the observed wallet. It is not a price-based
+  monthly or lifetime spend.
+- Ollama Cloud has no official usage API in this product and does not estimate
+  a monthly credit meter from request prices. The account form still presents
+  Pro, Max, or Team and a purchase date. A manual percentage does not require a
+  price.
+  A month percentage can be saved before a tier is chosen. A week percentage is
+  not accepted.
+  Without an official or manual usage observation, usage stays unavailable and
+  is not shown as 0. Existing accounts stay routeable. Previously stored
+  billing rows stay on disk and are not recalculated. A full window, where one
+  exists, never writes cooldown, disables the account, or changes routing. An
+  actual upstream `429` uses the generic cooldown/fallback path.
+- Zen Free routing uses the card's enable switch and list position.
 - Unknown model names return `400` on every supported client format. Clients
   should send published aliases or eligible Custom IDs from authenticated
-  `GET /v1/models` that currently have an effective enabled protocol.
-  Protected `GET /dashboard/api/v3/application-models` is Go aliases ∩ active
-  pricing, not that full client list.
+  `GET /v1/models` that currently carry a validated derived protocol profile
+  from the same qualified snapshot.
+  Protected `GET /dashboard/api/v4/application-models` lists Go names that
+  resolve in the saved catalog and have an enabled protocol. It does not
+  consult a price snapshot, and it is not that full client list.
 
 ---
 

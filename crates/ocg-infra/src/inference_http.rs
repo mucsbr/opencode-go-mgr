@@ -6,12 +6,16 @@
 //! config, Custom URL trust, and provider auth enums stay in the owning adapter.
 
 use std::fmt;
+use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::StreamExt;
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderName, HeaderValue};
 
-use crate::http::{OutboundProxySpec, ProxyMode, configured_builder, no_redirect_policy};
+use crate::http::{
+    OutboundProxySpec, ProxyMode, RouteLabel, attach_dns_resolver, configured_builder,
+    configured_builder_for_label, no_redirect_policy,
+};
 
 /// Redirect policy for an inference HTTP client. Follow versus none is chosen
 /// by the owning adapter; this crate does not attach a product-specific policy.
@@ -61,6 +65,7 @@ impl std::error::Error for InferenceHttpError {}
 pub enum InferenceAuthScheme {
     Bearer,
     XApiKey,
+    ApiKey,
 }
 
 /// Join `path` onto an already-canonical http(s) base while keeping the origin
@@ -132,6 +137,11 @@ pub fn isolated_inference_headers(
                 .map_err(|error| InferenceHttpError::InvalidUrl(error.to_string()))?;
             headers.insert(HeaderName::from_static("x-api-key"), value);
         }
+        InferenceAuthScheme::ApiKey => {
+            let value = HeaderValue::from_str(api_key)
+                .map_err(|error| InferenceHttpError::InvalidUrl(error.to_string()))?;
+            headers.insert(HeaderName::from_static("api-key"), value);
+        }
     }
     Ok(headers)
 }
@@ -173,7 +183,7 @@ impl HttpInferenceTransportSpec {
 }
 
 /// One outbound inference attempt. Auth is optional so keyless adapters can
-/// reuse the same send path; callers that need isolated Bearer / `x-api-key`
+/// reuse the same send path; callers that need isolated Bearer / `x-api-key` / `api-key`
 /// supply the scheme and key here.
 #[derive(Debug)]
 pub struct InferenceHttpRequest<'a> {
@@ -231,10 +241,51 @@ impl HttpInferenceTransport {
         proxy: &OutboundProxySpec,
         spec: HttpInferenceTransportSpec,
     ) -> Result<Self, InferenceHttpError> {
-        let client = configured_builder(proxy)
+        Self::build_with_dns_resolver(proxy, spec, None)
+    }
+
+    /// Same client as [`Self::build`], with an optional connector DNS resolver.
+    /// IsolatedTrustedAdmin Custom/dynamic callers pass a destination guard.
+    /// Sealed-adapter callers keep `None`. Proxy routing is unchanged: a
+    /// configured or system proxy still owns destination DNS.
+    pub fn build_with_dns_resolver(
+        proxy: &OutboundProxySpec,
+        spec: HttpInferenceTransportSpec,
+        dns_resolver: Option<Arc<dyn reqwest::dns::Resolve>>,
+    ) -> Result<Self, InferenceHttpError> {
+        let mut builder = configured_builder(proxy)
             .map_err(|error| InferenceHttpError::Build(error.to_string()))?
             .redirect(spec.redirect().reqwest_policy())
-            .connect_timeout(proxy.connect_timeout)
+            .connect_timeout(proxy.connect_timeout);
+        if let Some(resolver) = dns_resolver {
+            builder = attach_dns_resolver(builder, resolver);
+        }
+        let client = builder
+            .build()
+            .map_err(|error| InferenceHttpError::Build(error.to_string()))?;
+        Ok(Self {
+            client,
+            proxy_mode: proxy.mode,
+            spec,
+        })
+    }
+
+    /// Build on an already-selected request-entry proxy/direct leg while
+    /// retaining this transport's redirect and destination-DNS policy.
+    pub fn build_for_route_with_dns_resolver(
+        proxy: &OutboundProxySpec,
+        route: RouteLabel,
+        spec: HttpInferenceTransportSpec,
+        dns_resolver: Option<Arc<dyn reqwest::dns::Resolve>>,
+    ) -> Result<Self, InferenceHttpError> {
+        let mut builder = configured_builder_for_label(proxy, route)
+            .map_err(|error| InferenceHttpError::Build(error.to_string()))?
+            .redirect(spec.redirect().reqwest_policy())
+            .connect_timeout(proxy.connect_timeout);
+        if let Some(resolver) = dns_resolver {
+            builder = attach_dns_resolver(builder, resolver);
+        }
+        let client = builder
             .build()
             .map_err(|error| InferenceHttpError::Build(error.to_string()))?;
         Ok(Self {
@@ -275,6 +326,11 @@ impl HttpInferenceTransport {
         &self,
         request: InferenceHttpRequest<'_>,
     ) -> Result<reqwest::Response, InferenceHttpError> {
+        if request.auth.is_some() && self.spec.redirect() == InferenceRedirectPolicy::Follow {
+            return Err(InferenceHttpError::InvalidUrl(
+                "secret-bearing inference requests must not follow redirects".to_string(),
+            ));
+        }
         let mut builder = self.client.request(request.method, request.url);
         if let Some((scheme, api_key)) = request.auth {
             let headers = isolated_inference_headers(scheme, api_key)?;
@@ -554,6 +610,13 @@ mod tests {
         assert_eq!(x_api.get("x-api-key").unwrap(), "sk-test");
         assert!(x_api.get(AUTHORIZATION).is_none());
         assert_eq!(x_api.len(), 1);
+
+        let api_key = isolated_inference_headers(InferenceAuthScheme::ApiKey, "sk-test").unwrap();
+        assert_eq!(api_key.get("api-key").unwrap(), "sk-test");
+        assert!(api_key.get(AUTHORIZATION).is_none());
+        assert!(api_key.get("x-api-key").is_none());
+        assert_eq!(api_key.len(), 1);
+        assert!(isolated_inference_headers(InferenceAuthScheme::ApiKey, "bad\nkey").is_err());
     }
 
     #[test]

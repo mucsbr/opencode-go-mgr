@@ -1,0 +1,26 @@
+{
+  "currency": "CNY",
+  "sourceUrl": "https://platform.stepfun.com/docs/zh/guides/pricing/details",
+  "tiers": [
+    {
+      "id": "mini",
+      "name": "Mini",
+      "amount": 400000000.0
+    },
+    {
+      "id": "plus",
+      "name": "Plus",
+      "amount": 1600000000.0
+    },
+    {
+      "id": "pro",
+      "name": "Pro",
+      "amount": 8000000000.0
+    },
+    {
+      "id": "max",
+      "name": "Max",
+      "amount": 40000000000.0
+    }
+  ]
+}

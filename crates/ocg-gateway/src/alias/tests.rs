@@ -20,7 +20,7 @@ fn catalogs<'a>(
         cpa: NO_IDS,
         ollama: NO_IDS,
         ollama_pinned: NO_IDS,
-        user_aliases: &[],
+        builtin_aliases: &[],
         extra: &[],
     }
 }
@@ -195,8 +195,25 @@ fn is_published_alias(name: &str) -> bool {
     matches!(resolve(name), Ok(ResolvedModel::Alias { .. }))
 }
 
-fn seeded_free_models() -> Vec<String> {
-    ZenFreeModelCatalog::default().models
+/// A refreshed Zen Free catalog used only as a test fixture. The builtin
+/// registry stays empty until an official `/models` snapshot is supplied.
+fn example_zen_free_catalog() -> Vec<String> {
+    [
+        "deepseek-v4-flash-free",
+        "ling-3.0-flash-fin-free",
+        "mimo-v2.5-free",
+        "muse-spark-1.2-contributor-free",
+        "muse-spark-1.3-contributor-free",
+        "nemotron-3-ultra-free",
+        "nemotron-3.5-lightning-free",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
+}
+
+fn resolve_with_example_zen(requested: &str) -> Result<ResolvedModel, ResolveError> {
+    resolve_with_provider_models(requested, &example_zen_free_catalog(), &[])
 }
 
 #[test]
@@ -246,7 +263,7 @@ fn raw_looking_names_do_not_collapse_onto_kebab_aliases() {
 
 #[test]
 fn free_ids_are_exact_pins_and_only_stripped_aliases_are_published() {
-    let resolved = resolve("deepseek-v4-flash-free").expect("Zen model id");
+    let resolved = resolve_with_example_zen("deepseek-v4-flash-free").expect("Zen model id");
     match resolved {
         ResolvedModel::PinnedRaw { mapping, .. } => {
             assert!(mapping.is_zen_free());
@@ -255,19 +272,30 @@ fn free_ids_are_exact_pins_and_only_stripped_aliases_are_published() {
         other => panic!("expected raw pin, got {other:?}"),
     }
     assert!(matches!(
-        resolve("deepseek-v4-flash"),
+        resolve_with_example_zen("deepseek-v4-flash"),
         Ok(ResolvedModel::Alias { mappings, .. }) if mappings.iter().any(ProviderMapping::is_zen_free)
     ));
     assert!(
-        !published_aliases()
+        !published_routeable_aliases_with_zen(&example_zen_free_catalog())
             .iter()
-            .any(|alias| alias == "deepseek-v4-flash-free")
+            .any(|entry| entry.alias == "deepseek-v4-flash-free")
+    );
+    assert!(
+        resolve("deepseek-v4-flash-free").is_err(),
+        "unfetched Zen must not leave a leftover seed pin in the builtin registry"
     );
 }
 
 #[test]
 fn shared_aliases_record_go_and_zen_mappings_in_the_registry() {
     match resolve("mimo-v2.5").unwrap() {
+        ResolvedModel::Alias { mappings, .. } => {
+            assert_eq!(mappings.len(), 1);
+            assert!(mappings[0].is_opencode_go());
+        }
+        other => panic!("expected Go-only builtin alias, got {other:?}"),
+    }
+    match resolve_with_example_zen("mimo-v2.5").unwrap() {
         ResolvedModel::Alias { mappings, .. } => {
             assert_eq!(mappings.len(), 2);
             assert!(mappings[0].is_opencode_go());
@@ -336,11 +364,15 @@ fn command_catalog_uses_go_canonical_aliases_and_keeps_raw_ids_pinned() {
     ));
 
     match resolve_with_all_catalogs("model-name", &go, &zen, &[], &command).unwrap() {
-        ResolvedModel::PinnedRaw { mapping, .. } => {
-            assert!(mapping.is_command_code_goat());
-            assert_eq!(mapping.upstream_model, "acme/Model_Name");
+        ResolvedModel::Alias {
+            alias, mappings, ..
+        } => {
+            assert_eq!(alias, "model-name");
+            assert!(mappings.iter().any(|mapping| {
+                mapping.is_command_code_goat() && mapping.upstream_model == "acme/Model_Name"
+            }));
         }
-        other => panic!("expected raw-only Command pin, got {other:?}"),
+        other => panic!("unique slash Command ids publish the last-segment Alias, got {other:?}"),
     }
     assert!(matches!(
         resolve_with_all_catalogs("acme/Model_Name", &go, &zen, &[], &command),
@@ -358,7 +390,7 @@ fn command_catalog_uses_go_canonical_aliases_and_keeps_raw_ids_pinned() {
         published.iter().filter(|item| item.alias == "hy3").count(),
         1
     );
-    assert!(!published.iter().any(|item| item.alias == "model-name"));
+    assert!(published.iter().any(|item| item.alias == "model-name"));
     assert!(
         !published
             .iter()
@@ -367,7 +399,7 @@ fn command_catalog_uses_go_canonical_aliases_and_keeps_raw_ids_pinned() {
 }
 
 #[test]
-fn command_catalog_shortens_only_code_owned_long_names() {
+fn command_catalog_shortens_code_owned_and_unique_slash_leaves() {
     let nemotron_upstream = COMMAND_CODE_GOAT_ALIASES[0].0.to_string();
     let command = vec![nemotron_upstream.clone()];
 
@@ -415,21 +447,47 @@ fn command_catalog_shortens_only_code_owned_long_names() {
     );
 
     let future = vec!["vendor/future-model-with-a-very-long-name".to_string()];
-    assert!(matches!(
-        resolve_with_all_catalogs(
-            "future-model-with-a-very-long-name",
-            &[],
-            &[],
-            &[],
-            &future,
-        ),
-        Ok(ResolvedModel::PinnedRaw { mapping, .. })
-            if mapping.is_command_code_goat()
-    ));
+    match resolve_with_all_catalogs("future-model-with-a-very-long-name", &[], &[], &[], &future)
+        .unwrap()
+    {
+        ResolvedModel::Alias {
+            alias, mappings, ..
+        } => {
+            assert_eq!(alias, "future-model-with-a-very-long-name");
+            assert!(mappings.iter().any(|mapping| {
+                mapping.is_command_code_goat()
+                    && mapping.upstream_model == "vendor/future-model-with-a-very-long-name"
+            }));
+        }
+        other => panic!("unique slash Command ids publish the last-segment Alias, got {other:?}"),
+    }
     assert!(
-        !published_routeable_aliases_with_all_catalogs(&[], &[], &future)
+        published_routeable_aliases_with_all_catalogs(&[], &[], &future)
             .iter()
             .any(|item| item.alias == "future-model-with-a-very-long-name")
+    );
+    assert_eq!(
+        canonical_alias_for_provider_model(
+            COMMAND_CODE_PROVIDER_ID,
+            "google/gemini-3.5-flash",
+            &[],
+            &[],
+        ),
+        "gemini-3.5-flash"
+    );
+    assert_eq!(
+        canonical_alias_for_provider_model(COMMAND_CODE_PROVIDER_ID, "claude-sonnet-4-6", &[], &[],),
+        ""
+    );
+    let colliding = vec![
+        "deepseek/deepseek-v4-flash-fast".to_string(),
+        "other/deepseek-v4-flash-fast".to_string(),
+    ];
+    assert!(
+        !published_routeable_aliases_with_all_catalogs(&[], &[], &colliding)
+            .iter()
+            .any(|item| item.alias == "deepseek-v4-flash-fast"),
+        "ambiguous last-segment names stay raw pins"
     );
 }
 
@@ -495,28 +553,24 @@ fn refreshed_zen_models_derive_stripped_aliases_from_the_free_suffix() {
 #[test]
 fn registry_covers_every_opencode_protocol_id() {
     let aliases = published_aliases();
-    let free_models = seeded_free_models();
+    let free_models = example_zen_free_catalog();
     for id in supported_model_ids() {
-        if id == "big-pickle" || (is_free_model(id) && !free_models.iter().any(|free| free == id)) {
+        if id == "big-pickle" || is_free_model(id) {
             continue;
         }
-        let expected_alias = if is_free_model(id) {
-            stripped_free_alias(id).expect("free protocol id has a stripped alias")
-        } else {
-            id
-        };
         assert!(
-            aliases.iter().any(|alias| alias == expected_alias),
+            aliases.iter().any(|alias| alias == id),
             "MODEL_PROTOCOLS id `{id}` must have an alias"
         );
     }
+    let published_zen = published_routeable_aliases_with_zen(&free_models);
     for id in &free_models {
-        let alias = stripped_free_alias(id).expect("seeded Zen ids end in -free");
+        let alias = stripped_free_alias(id).expect("refreshed Zen ids end in -free");
         assert!(
-            aliases.iter().any(|item| item == alias),
+            published_zen.iter().any(|item| item.alias == alias),
             "Zen `-free` catalog rows must publish the stripped alias `{alias}`"
         );
-        assert!(resolve(id).unwrap().routeable_mappings()[0].is_zen_free());
+        assert!(resolve_with_example_zen(id).unwrap().routeable_mappings()[0].is_zen_free());
     }
     assert!(!aliases.iter().any(|alias| alias.contains("goat")));
     assert!(
@@ -615,9 +669,8 @@ fn slash_prefixed_goat_raw_pins_to_command_code_and_does_not_steal_go() {
                 .iter()
                 .filter(|mapping| mapping.routeable)
                 .collect::<Vec<_>>();
-            assert_eq!(routeable.len(), 2);
+            assert_eq!(routeable.len(), 1);
             assert!(routeable.iter().any(|mapping| mapping.is_opencode_go()));
-            assert!(routeable.iter().any(|mapping| mapping.is_zen_free()));
             assert_eq!(
                 routeable
                     .iter()
@@ -628,6 +681,18 @@ fn slash_prefixed_goat_raw_pins_to_command_code_and_does_not_steal_go() {
             );
         }
         other => panic!("expected published Go alias, got {other:?}"),
+    }
+    match resolve_with_example_zen(COMMAND_CODE_GOAT_DEEPSEEK_V4_FLASH_ALIAS).unwrap() {
+        ResolvedModel::Alias { mappings, .. } => {
+            let routeable = mappings
+                .iter()
+                .filter(|mapping| mapping.routeable)
+                .collect::<Vec<_>>();
+            assert_eq!(routeable.len(), 2);
+            assert!(routeable.iter().any(|mapping| mapping.is_opencode_go()));
+            assert!(routeable.iter().any(|mapping| mapping.is_zen_free()));
+        }
+        other => panic!("refreshed Zen must join the Go kebab alias, got {other:?}"),
     }
     assert!(is_published_alias(
         COMMAND_CODE_GOAT_DEEPSEEK_V4_FLASH_ALIAS
@@ -683,7 +748,8 @@ fn eligible_goat_catalog_joins_static_aliases_and_keeps_other_ids_raw() {
     assert!(
         !published
             .iter()
-            .any(|item| item.alias == "claude-sonnet-4-6")
+            .any(|item| item.alias == "claude-sonnet-4-6"),
+        "slash-free unmatched Command ids stay unpublished raw pins"
     );
     assert!(
         published
@@ -864,8 +930,18 @@ fn fail_closed_raw_mapping_is_not_routeable() {
 #[test]
 fn catalog_aliases_are_routeable_mappings_in_registry_order() {
     let go = routeable_aliases_for(OPENCODE_PROVIDER_ID);
-    let zen = routeable_aliases_for(OPENCODE_ZEN_FREE_PROVIDER_ID);
-    let free_models = seeded_free_models();
+    let free_models = example_zen_free_catalog();
+    assert!(
+        routeable_aliases_for(OPENCODE_ZEN_FREE_PROVIDER_ID).is_empty(),
+        "unfetched Zen must not publish leftover seed aliases"
+    );
+    let zen = routeable_aliases_for_with_extended_catalogs(
+        OPENCODE_ZEN_FREE_PROVIDER_ID,
+        &free_models,
+        &[],
+        &[],
+        &[],
+    );
     assert!(!go.is_empty());
     assert!(!zen.is_empty());
     let mut sorted_go = go.clone();
@@ -1033,46 +1109,6 @@ fn refreshed_go_catalog_adds_raw_pins_without_expanding_alias_authority() {
 }
 
 #[test]
-fn confirmed_user_aliases_publish_and_rewrite_each_provider_upstream_id() {
-    let go = vec!["deepseek-flash".to_string()];
-    let command = vec!["deepseek/deepseek-v4.1-flash".to_string()];
-    let bindings = vec![
-        UserAliasBinding {
-            alias: "deepseek-flash".to_string(),
-            provider_id: OPENCODE_PROVIDER_ID.to_string(),
-            upstream_model: "deepseek-flash".to_string(),
-        },
-        UserAliasBinding {
-            alias: "deepseek-flash".to_string(),
-            provider_id: COMMAND_CODE_PROVIDER_ID.to_string(),
-            upstream_model: "deepseek/deepseek-v4.1-flash".to_string(),
-        },
-    ];
-    let catalogs = RuntimeCatalogs {
-        go: &go,
-        command_code: &command,
-        user_aliases: &bindings,
-        ..RuntimeCatalogs::default()
-    };
-
-    let published = published_routeable_aliases_with_runtime_catalogs(catalogs);
-    assert!(published.iter().any(|row| row.alias == "deepseek-flash"));
-    match resolve_with_runtime_catalogs("deepseek-flash", catalogs).unwrap() {
-        ResolvedModel::Alias { mappings, .. } => {
-            assert!(mappings.iter().any(|mapping| {
-                mapping.provider_id == OPENCODE_PROVIDER_ID
-                    && mapping.upstream_model == "deepseek-flash"
-            }));
-            assert!(mappings.iter().any(|mapping| {
-                mapping.provider_id == COMMAND_CODE_PROVIDER_ID
-                    && mapping.upstream_model == "deepseek/deepseek-v4.1-flash"
-            }));
-        }
-        other => panic!("expected a cross-Provider Alias, got {other:?}"),
-    }
-}
-
-#[test]
 fn sealed_cn_catalogs_join_static_aliases_and_preserve_raw_ambiguity() {
     let minimax = MINIMAX_CN_ALIASES
         .iter()
@@ -1114,17 +1150,45 @@ fn sealed_cn_catalogs_join_static_aliases_and_preserve_raw_ambiguity() {
                 .iter()
                 .any(|mapping| { mapping.is_kimi_cn() && mapping.upstream_model == *upstream })
         );
-        assert!(matches!(
-            resolve_with_extended_catalogs(
-                upstream, &[], &[], &[], &[], &minimax, &kimi,
-            ),
-            Ok(ResolvedModel::PinnedRaw { mapping, .. })
-                if mapping.is_kimi_cn() && mapping.upstream_model == *upstream
-        ));
+        let exact =
+            resolve_with_extended_catalogs(upstream, &[], &[], &[], &[], &minimax, &kimi).unwrap();
+        if upstream == alias {
+            assert!(matches!(
+                exact,
+                ResolvedModel::Alias {
+                    alias: resolved_alias,
+                    mappings,
+                    ..
+                } if resolved_alias == *alias
+                    && mappings.iter().any(|mapping| {
+                        mapping.is_kimi_cn() && mapping.upstream_model == *upstream
+                    })
+            ));
+        } else {
+            assert!(matches!(
+                exact,
+                ResolvedModel::PinnedRaw { mapping, .. }
+                    if mapping.is_kimi_cn() && mapping.upstream_model == *upstream
+            ));
+        }
         assert_eq!(
             canonical_alias_for_provider_model(KIMI_PROVIDER_ID, upstream, &[], &[]),
             *alias
         );
+    }
+
+    for fixed_version in ["kimi-k2.7-code", "kimi-k2.7-code-highspeed"] {
+        match resolve_with_extended_catalogs(fixed_version, &[], &[], &[], &[], &minimax, &kimi) {
+            Ok(resolved) => assert!(
+                resolved
+                    .routeable_mappings()
+                    .iter()
+                    .all(|mapping| !mapping.is_kimi_cn()),
+                "fixed K2.7 aliases must not route through Kimi's rolling model IDs"
+            ),
+            Err(ResolveError::Unknown { .. }) => {}
+            Err(other) => panic!("unexpected fixed-version resolution error: {other:?}"),
+        }
     }
 
     let published =
@@ -1277,6 +1341,78 @@ fn cpa_catalog_joins_code_owned_aliases_and_keeps_raw_ids_exact_and_fail_closed(
     )
     .unwrap_err();
     assert_eq!(conflict.code(), Some(AMBIGUOUS_MODEL_ID));
+}
+
+#[test]
+fn cpa_and_other_catalogs_share_an_exact_public_name_without_merging_other_raw_pins() {
+    let id = "gpt-6-sol".to_string();
+    let go = vec![id.clone()];
+    let cpa = vec![id.clone()];
+    let http = ExtraProviderCatalog {
+        provider_id: "11111111-1111-4111-8111-111111111111".into(),
+        mappings: vec![(id.clone(), id.clone())],
+    };
+    let extras = [http.clone()];
+    let catalogs = RuntimeCatalogs {
+        go: &go,
+        cpa: &cpa,
+        extra: &extras,
+        ..RuntimeCatalogs::default()
+    };
+    match resolve_with_runtime_catalogs(&id, catalogs).unwrap() {
+        ResolvedModel::Alias {
+            alias, mappings, ..
+        } => {
+            assert_eq!(alias, id);
+            assert!(mappings.iter().any(ProviderMapping::is_cpa));
+            assert!(mappings.iter().any(ProviderMapping::is_opencode_go));
+            assert!(
+                mappings
+                    .iter()
+                    .any(|mapping| mapping.provider_id == http.provider_id)
+            );
+        }
+        other => panic!("expected a shared public Alias, got {other:?}"),
+    }
+    assert_eq!(
+        published_routeable_models_with_runtime_catalogs(catalogs)
+            .iter()
+            .filter(|item| item.alias == id)
+            .count(),
+        1
+    );
+
+    let http_and_cpa = RuntimeCatalogs {
+        cpa: &cpa,
+        extra: &extras,
+        ..RuntimeCatalogs::default()
+    };
+    assert!(matches!(
+        resolve_with_runtime_catalogs(&id, http_and_cpa),
+        Ok(ResolvedModel::Alias { mappings, .. })
+            if mappings.iter().any(ProviderMapping::is_cpa)
+                && mappings.iter().any(|mapping| mapping.provider_id == http.provider_id)
+    ));
+    assert!(
+        published_routeable_models_with_runtime_catalogs(http_and_cpa)
+            .iter()
+            .any(|item| item.alias == id)
+    );
+
+    let differently_named = [ExtraProviderCatalog {
+        mappings: vec![("other-public-name".into(), id.clone())],
+        ..http
+    }];
+    let error = resolve_with_runtime_catalogs(
+        &id,
+        RuntimeCatalogs {
+            cpa: &cpa,
+            extra: &differently_named,
+            ..RuntimeCatalogs::default()
+        },
+    )
+    .unwrap_err();
+    assert_eq!(error.code(), Some(AMBIGUOUS_MODEL_ID));
 }
 
 #[test]
@@ -1733,4 +1869,515 @@ fn ollama_overlay_coexisting_tags_fail_closed_until_pinned() {
         }
         other => panic!("expected pinned shared alias, got {other:?}"),
     }
+}
+
+#[test]
+fn public_go_catalog_names_include_new_pins_without_creating_shared_aliases() {
+    let go = vec!["future-go-model".to_string(), "vendor/model-x".to_string()];
+    let catalogs = RuntimeCatalogs {
+        go: &go,
+        ..RuntimeCatalogs::default()
+    };
+    let published = published_routeable_models_with_runtime_catalogs(catalogs);
+    for id in &go {
+        assert!(
+            published
+                .iter()
+                .any(|item| item.alias == *id && item.owned_by == OPENCODE_PROVIDER_ID)
+        );
+        assert!(
+            matches!(resolve_with_runtime_catalogs(id, catalogs), Ok(ResolvedModel::PinnedRaw { mapping, .. }) if mapping.is_opencode_go())
+        );
+        assert!(
+            !published_routeable_aliases_with_runtime_catalogs(catalogs)
+                .iter()
+                .any(|item| item.alias == *id)
+        );
+    }
+    let custom = vec!["future-go-model".to_string()];
+    let conflicting = RuntimeCatalogs {
+        custom: &custom,
+        ..catalogs
+    };
+    assert!(
+        !published_routeable_models_with_runtime_catalogs(conflicting)
+            .iter()
+            .any(|item| item.alias == "future-go-model")
+    );
+    assert!(resolve_with_runtime_catalogs("not-in-catalog", catalogs).is_err());
+}
+
+#[test]
+fn builtin_alias_overrides_preserve_exact_upstreams_for_every_adapter() {
+    for (provider, upstream, old_alias) in [
+        (OPENCODE_PROVIDER_ID, "glm-5.2", "glm-5.2"),
+        (OPENCODE_ZEN_FREE_PROVIDER_ID, "glm-5.2-free", "glm-5.2"),
+        (COMMAND_CODE_PROVIDER_ID, "vendor/glm-5.2", "glm-5.2"),
+        (MINIMAX_PROVIDER_ID, "MiniMax-M3", "minimax-m3"),
+        (KIMI_PROVIDER_ID, "k3", "kimi-k3"),
+        (OLLAMA_PROVIDER_ID, "glm-5.2:cloud", "glm-5.2"),
+    ] {
+        let models = [upstream.to_string()];
+        let overrides = [ExtraProviderCatalog {
+            provider_id: provider.into(),
+            mappings: vec![("My-Alias".into(), upstream.into())],
+        }];
+        let mut catalogs = RuntimeCatalogs {
+            builtin_aliases: &overrides,
+            ..RuntimeCatalogs::default()
+        };
+        match provider {
+            OPENCODE_PROVIDER_ID => catalogs.go = &models,
+            OPENCODE_ZEN_FREE_PROVIDER_ID => catalogs.zen_free = &models,
+            COMMAND_CODE_PROVIDER_ID => catalogs.command_code = &models,
+            MINIMAX_PROVIDER_ID => catalogs.minimax = &models,
+            KIMI_PROVIDER_ID => catalogs.kimi = &models,
+            OLLAMA_PROVIDER_ID => catalogs.ollama = &models,
+            _ => unreachable!(),
+        }
+        for requested in ["My-Alias", "my-alias"] {
+            let resolved = resolve_with_runtime_catalogs(requested, catalogs).unwrap();
+            assert!(matches!(&resolved, ResolvedModel::Alias { alias, .. } if alias == "My-Alias"));
+            assert_eq!(
+                resolved.routeable_mappings(),
+                vec![&mapping(provider, upstream, true)]
+            );
+        }
+        let raw = resolve_with_runtime_catalogs(upstream, catalogs).unwrap();
+        assert!(
+            matches!(raw, ResolvedModel::PinnedRaw { mapping, .. } if mapping.provider_id == provider && mapping.upstream_model == upstream && mapping.routeable)
+        );
+        let published = published_routeable_models_with_runtime_catalogs(catalogs);
+        assert!(
+            published
+                .iter()
+                .any(|item| item.alias == "My-Alias" && item.owned_by == provider)
+        );
+        let registry = build_runtime_registry(catalogs);
+        assert!(!registry.aliases.get(old_alias).is_some_and(|entry| {
+            entry.mappings.iter().any(|mapping| {
+                mapping.provider_id == provider && mapping.upstream_model == upstream
+            })
+        }));
+        if provider != OPENCODE_PROVIDER_ID
+            && let Ok(old) = resolve_with_runtime_catalogs(old_alias, catalogs)
+        {
+            assert!(
+                !old.routeable_mappings()
+                    .iter()
+                    .any(|mapping| mapping.provider_id == provider)
+            );
+        }
+    }
+}
+
+#[test]
+fn builtin_override_removes_only_its_mapping_and_joins_existing_public_names() {
+    let go = ["glm-5.2".into()];
+    let zen = ["glm-5.2-free".into()];
+    let goat = ["vendor/glm-5.2".to_string()];
+    let overrides = [ExtraProviderCatalog {
+        provider_id: COMMAND_CODE_PROVIDER_ID.into(),
+        mappings: vec![("new-shared".into(), goat[0].clone())],
+    }];
+    let extras = [ExtraProviderCatalog {
+        provider_id: "http-provider".into(),
+        mappings: vec![("new-shared".into(), "vendor/http".into())],
+    }];
+    let cpa = ["new-shared".into()];
+    let catalogs = RuntimeCatalogs {
+        go: &go,
+        zen_free: &zen,
+        command_code: &goat,
+        cpa: &cpa,
+        builtin_aliases: &overrides,
+        extra: &extras,
+        ..RuntimeCatalogs::default()
+    };
+    let old = resolve_with_runtime_catalogs("glm-5.2", catalogs).unwrap();
+    assert!(
+        old.routeable_mappings()
+            .iter()
+            .any(|mapping| mapping.is_opencode_go())
+    );
+    assert!(
+        old.routeable_mappings()
+            .iter()
+            .any(|mapping| mapping.is_zen_free())
+    );
+    assert!(
+        !old.routeable_mappings()
+            .iter()
+            .any(|mapping| mapping.is_command_code_goat())
+    );
+    let shared = resolve_with_runtime_catalogs("new-shared", catalogs).unwrap();
+    assert_eq!(shared.routeable_mappings().len(), 3);
+    assert!(
+        shared
+            .routeable_mappings()
+            .iter()
+            .any(|mapping| mapping.is_cpa())
+    );
+    assert!(
+        shared
+            .routeable_mappings()
+            .iter()
+            .any(|mapping| mapping.is_command_code_goat() && mapping.upstream_model == goat[0])
+    );
+    assert!(
+        shared
+            .routeable_mappings()
+            .iter()
+            .any(|mapping| mapping.provider_id == "http-provider")
+    );
+}
+
+#[test]
+fn builtin_explicit_raw_shaped_names_have_publication_and_resolution_parity() {
+    for public in ["org/Public", "my_model", "my model"] {
+        let minimax = ["MiniMax-M3".to_string()];
+        let overrides = [ExtraProviderCatalog {
+            provider_id: MINIMAX_PROVIDER_ID.into(),
+            mappings: vec![(public.into(), minimax[0].clone())],
+        }];
+        let catalogs = RuntimeCatalogs {
+            minimax: &minimax,
+            builtin_aliases: &overrides,
+            ..RuntimeCatalogs::default()
+        };
+        let resolved = resolve_with_runtime_catalogs(public, catalogs).unwrap();
+        assert_eq!(
+            resolved.routeable_mappings(),
+            vec![&minimax_mapping("MiniMax-M3")]
+        );
+        assert!(
+            published_routeable_models_with_runtime_catalogs(catalogs)
+                .iter()
+                .any(|item| item.alias == public && item.owned_by == MINIMAX_PROVIDER_ID)
+        );
+        assert!(
+            !published_routeable_aliases_with_runtime_catalogs(catalogs)
+                .iter()
+                .any(|item| item.alias == public)
+        );
+        assert!(
+            routeable_models_for_with_runtime_catalogs(MINIMAX_PROVIDER_ID, catalogs)
+                .contains(&public.to_string())
+        );
+    }
+}
+
+#[test]
+fn builtin_overrides_keep_raw_collisions_ambiguous_and_unpublished() {
+    let models = ["vendor/shared".to_string(), "collision".to_string()];
+    let overrides = [
+        ExtraProviderCatalog {
+            provider_id: MINIMAX_PROVIDER_ID.into(),
+            mappings: vec![
+                ("first".into(), models[0].clone()),
+                ("other".into(), models[1].clone()),
+            ],
+        },
+        ExtraProviderCatalog {
+            provider_id: KIMI_PROVIDER_ID.into(),
+            mappings: vec![
+                ("second".into(), models[0].clone()),
+                ("collision".into(), "kimi-for-coding".into()),
+            ],
+        },
+    ];
+    let kimi = [models[0].clone(), "kimi-for-coding".into()];
+    let catalogs = RuntimeCatalogs {
+        minimax: &models,
+        kimi: &kimi,
+        builtin_aliases: &overrides,
+        ..RuntimeCatalogs::default()
+    };
+    for requested in ["vendor/shared", "collision"] {
+        assert_eq!(
+            resolve_with_runtime_catalogs(requested, catalogs)
+                .unwrap_err()
+                .code(),
+            Some(AMBIGUOUS_MODEL_ID)
+        );
+        assert!(
+            !published_routeable_models_with_runtime_catalogs(catalogs)
+                .iter()
+                .any(|item| item.alias == requested)
+        );
+    }
+    assert_eq!(
+        resolve_with_runtime_catalogs("first", catalogs)
+            .unwrap()
+            .routeable_mappings(),
+        vec![&minimax_mapping("vendor/shared")]
+    );
+    assert_eq!(
+        resolve_with_runtime_catalogs("second", catalogs)
+            .unwrap()
+            .routeable_mappings(),
+        vec![&kimi_mapping("vendor/shared")]
+    );
+}
+
+#[test]
+fn builtin_override_cannot_replace_an_unrelated_same_provider_raw_target() {
+    for provider in [OPENCODE_PROVIDER_ID, COMMAND_CODE_PROVIDER_ID] {
+        let models = ["vendor/one".to_string(), "custom-public".to_string()];
+        let overrides = [ExtraProviderCatalog {
+            provider_id: provider.into(),
+            mappings: vec![("custom-public".into(), models[0].clone())],
+        }];
+        let mut catalogs = RuntimeCatalogs {
+            builtin_aliases: &overrides,
+            ..RuntimeCatalogs::default()
+        };
+        if provider == OPENCODE_PROVIDER_ID {
+            catalogs.go = &models;
+        } else {
+            catalogs.command_code = &models;
+        }
+        assert_eq!(
+            resolve_with_runtime_catalogs("custom-public", catalogs)
+                .unwrap_err()
+                .code(),
+            Some(AMBIGUOUS_MODEL_ID)
+        );
+        assert!(
+            !published_routeable_models_with_runtime_catalogs(catalogs)
+                .iter()
+                .any(|item| item.alias == "custom-public")
+        );
+    }
+}
+
+#[test]
+fn builtin_overrides_require_a_saved_exact_upstream_and_static_provider() {
+    let models = ["MiniMax-M3".into()];
+    let overrides = [
+        ExtraProviderCatalog {
+            provider_id: MINIMAX_PROVIDER_ID.into(),
+            mappings: vec![
+                ("bad-case".into(), "minimax-m3".into()),
+                ("stale".into(), "removed".into()),
+            ],
+        },
+        ExtraProviderCatalog {
+            provider_id: "http-provider".into(),
+            mappings: vec![("wrong-provider".into(), "MiniMax-M3".into())],
+        },
+    ];
+    let catalogs = RuntimeCatalogs {
+        minimax: &models,
+        builtin_aliases: &overrides,
+        ..RuntimeCatalogs::default()
+    };
+    for requested in ["bad-case", "stale", "wrong-provider"] {
+        assert!(matches!(
+            resolve_with_runtime_catalogs(requested, catalogs),
+            Err(ResolveError::Unknown { .. })
+        ));
+    }
+    assert!(
+        resolve_with_runtime_catalogs("minimax-m3", catalogs)
+            .unwrap()
+            .routeable_mappings()
+            .iter()
+            .any(|mapping| mapping.is_minimax_cn())
+    );
+}
+
+#[test]
+fn builtin_shared_explicit_names_keep_all_provider_mappings_and_one_publication() {
+    for public in ["Shared-Name", "org/Shared"] {
+        let minimax = ["MiniMax-M3".to_string()];
+        let kimi = ["k3".to_string()];
+        let mut overrides = [
+            ExtraProviderCatalog {
+                provider_id: MINIMAX_PROVIDER_ID.into(),
+                mappings: vec![(public.into(), minimax[0].clone())],
+            },
+            ExtraProviderCatalog {
+                provider_id: KIMI_PROVIDER_ID.into(),
+                mappings: vec![(public.into(), kimi[0].clone())],
+            },
+        ];
+        for _ in 0..2 {
+            let catalogs = RuntimeCatalogs {
+                minimax: &minimax,
+                kimi: &kimi,
+                builtin_aliases: &overrides,
+                ..RuntimeCatalogs::default()
+            };
+            let resolved = resolve_with_runtime_catalogs(public, catalogs).unwrap();
+            assert_eq!(resolved.routeable_mappings().len(), 2);
+            assert!(
+                resolved
+                    .routeable_mappings()
+                    .contains(&&minimax_mapping("MiniMax-M3"))
+            );
+            assert!(resolved.routeable_mappings().contains(&&kimi_mapping("k3")));
+            assert_eq!(
+                published_routeable_models_with_runtime_catalogs(catalogs)
+                    .iter()
+                    .filter(|item| item.alias == public)
+                    .count(),
+                1
+            );
+            overrides.reverse();
+        }
+    }
+}
+
+#[test]
+fn builtin_explicit_case_variant_of_existing_alias_is_not_published_twice() {
+    let models = ["MiniMax-M3".to_string()];
+    let overrides = [ExtraProviderCatalog {
+        provider_id: MINIMAX_PROVIDER_ID.into(),
+        mappings: vec![("GLM-5.2".into(), models[0].clone())],
+    }];
+    let catalogs = RuntimeCatalogs {
+        minimax: &models,
+        builtin_aliases: &overrides,
+        ..RuntimeCatalogs::default()
+    };
+    assert_eq!(
+        published_routeable_models_with_runtime_catalogs(catalogs)
+            .iter()
+            .filter(|item| item.alias.eq_ignore_ascii_case("glm-5.2"))
+            .count(),
+        1
+    );
+    assert!(
+        resolve_with_runtime_catalogs("GLM-5.2", catalogs)
+            .unwrap()
+            .routeable_mappings()
+            .contains(&&minimax_mapping("MiniMax-M3"))
+    );
+}
+
+#[test]
+fn renaming_go_keeps_other_providers_on_its_previous_shared_alias() {
+    let go = ["glm-5.2".to_string()];
+    let zen = ["glm-5.2-free".to_string()];
+    let overrides = [ExtraProviderCatalog {
+        provider_id: OPENCODE_PROVIDER_ID.into(),
+        mappings: vec![("private-go".into(), go[0].clone())],
+    }];
+    let catalogs = RuntimeCatalogs {
+        go: &go,
+        zen_free: &zen,
+        builtin_aliases: &overrides,
+        ..RuntimeCatalogs::default()
+    };
+    let old = resolve_with_runtime_catalogs("glm-5.2", catalogs).unwrap();
+    assert_eq!(old.routeable_mappings(), vec![&zen_mapping("glm-5.2-free")]);
+    assert_eq!(
+        resolve_with_runtime_catalogs("private-go", catalogs)
+            .unwrap()
+            .routeable_mappings(),
+        vec![&go_mapping("glm-5.2")]
+    );
+    assert!(
+        published_routeable_models_with_runtime_catalogs(catalogs)
+            .iter()
+            .any(|item| item.alias == "glm-5.2" && item.owned_by == OPENCODE_ZEN_FREE_PROVIDER_ID)
+    );
+}
+
+#[test]
+fn publishing_many_go_catalog_ids_builds_the_runtime_registry_once() {
+    let _ = take_runtime_registry_build_count();
+    let go: Vec<String> = (0..256).map(|i| format!("unique-go-catalog-{i}")).collect();
+    let extras = [
+        ExtraProviderCatalog {
+            provider_id: "11111111-1111-4111-8111-111111111111".into(),
+            mappings: vec![("lab-public".into(), "vendor/lab".into())],
+        },
+        ExtraProviderCatalog {
+            provider_id: "22222222-2222-4222-8222-222222222222".into(),
+            mappings: vec![("lab-public".into(), "other/lab".into())],
+        },
+        ExtraProviderCatalog {
+            provider_id: "33333333-3333-4333-8333-333333333333".into(),
+            mappings: vec![("solo-public".into(), "vendor/solo".into())],
+        },
+        ExtraProviderCatalog {
+            provider_id: "44444444-4444-4444-8444-444444444444".into(),
+            mappings: vec![("shared/raw".into(), "shared/raw".into())],
+        },
+        ExtraProviderCatalog {
+            provider_id: "55555555-5555-4555-8555-555555555555".into(),
+            mappings: vec![("shared/raw".into(), "shared/raw".into())],
+        },
+    ];
+    let catalogs = RuntimeCatalogs {
+        go: &go,
+        extra: &extras,
+        ..RuntimeCatalogs::default()
+    };
+    let index = RuntimeCatalogIndex::from_catalogs(catalogs);
+    assert_eq!(
+        take_runtime_registry_build_count(),
+        1,
+        "one publication pass must not rebuild the alias table per catalog id"
+    );
+    let published = index.published_models();
+    for id in &go {
+        assert!(
+            published.iter().any(|item| item.alias == *id),
+            "{id} must stay a unique Go raw pin"
+        );
+        match index.resolve(id).expect(id) {
+            ResolvedModel::PinnedRaw { mapping, .. } => {
+                assert_eq!(mapping.provider_id, OPENCODE_PROVIDER_ID);
+                assert_eq!(mapping.upstream_model, *id);
+                assert!(mapping.routeable);
+            }
+            other => panic!("expected unique Go raw pin for {id}, got {other:?}"),
+        }
+    }
+    match index.resolve("glm-5.2").expect("glm-5.2") {
+        ResolvedModel::Alias { alias, .. } => assert_eq!(alias, "glm-5.2"),
+        other => panic!("glm-5.2 must stay a code-owned alias, got {other:?}"),
+    }
+    match index.resolve("solo-public").expect("solo-public") {
+        ResolvedModel::Alias { mappings, .. } => {
+            assert_eq!(mappings.len(), 1);
+            assert_eq!(mappings[0].provider_id, extras[2].provider_id);
+            assert_eq!(mappings[0].upstream_model, "vendor/solo");
+        }
+        other => panic!("expected an independent public-name alias, got {other:?}"),
+    }
+    match index.resolve("lab-public").expect("lab-public") {
+        ResolvedModel::Alias { mappings, .. } => {
+            assert_eq!(mappings.len(), 2);
+            assert!(
+                mappings
+                    .iter()
+                    .any(|mapping| mapping.provider_id == extras[0].provider_id)
+            );
+            assert!(
+                mappings
+                    .iter()
+                    .any(|mapping| mapping.provider_id == extras[1].provider_id)
+            );
+        }
+        other => panic!("shared public names must aggregate, got {other:?}"),
+    }
+    let ambiguous = index.resolve("shared/raw").expect_err("shared/raw");
+    assert_eq!(ambiguous.code(), Some(AMBIGUOUS_MODEL_ID));
+    match ambiguous {
+        ResolveError::Ambiguous { mappings, .. } => {
+            assert!(
+                mappings.len() >= 2,
+                "raw public collisions must not pick a single extra, got {mappings:?}"
+            );
+        }
+        other => panic!("expected Ambiguous, got {other:?}"),
+    }
+    assert!(
+        !published.iter().any(|item| item.alias == "shared/raw"),
+        "ambiguous raw public names stay unpublished"
+    );
 }

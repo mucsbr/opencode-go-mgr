@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { dashboardApi } from "../api/dashboard.ts";
+import type { ProviderUsage } from "../api/billing.ts";
+import { usageWindowFromProviderUsage } from "./billing.ts";
 import {
   installFetchMock,
   setupControlPlane,
@@ -9,9 +11,12 @@ import { mapWithConcurrency } from "../utils/async.ts";
 import {
   isCooling,
   isFreeCooling,
+  isMiniMaxVideoQuotaWindow,
   isUsageLimitReached,
+  mergeCalibratedProviderUsage,
   mergeUsageEdit,
   normalizeUsagePercent,
+  providerQuotaWindowLabel,
   resetTimeForWindow,
   resetsFieldsToMinutes,
   resetsFirstFieldMax,
@@ -19,7 +24,8 @@ import {
   resetsInMinutesForSave,
   resetsSecondFieldMax,
   resetsSecondFieldValue,
-  usagePercentFromCost,
+  manualEditorWindowKeys,
+  manualUsageEditorEnabled,
   usageProgressPercentage,
   usageProgressStatus,
 } from "./accounts-usage.ts";
@@ -170,8 +176,85 @@ test("normalizes manually entered percentages to the supported range and precisi
   assert.equal(normalizeUsagePercent(-1), 0);
   assert.equal(normalizeUsagePercent(42.56), 42.6);
   assert.equal(normalizeUsagePercent(101), 100);
-  assert.equal(usagePercentFromCost(6, 12), 50);
-  assert.equal(usagePercentFromCost(180, 100), 100);
+});
+
+test("manual calibration updates the visible provider window and preserves siblings", () => {
+  const current = {
+    account_id: "acc-1",
+    provider_id: "command-code",
+    availability: "local_state",
+    quota_windows: [
+      {
+        account_id: "acc-1",
+        window_kind: "five_hours",
+        used: 10,
+        limit_value: 14,
+        started_at: null,
+        resets_at: "2026-09-14T05:00:00Z",
+        calibration_offset: 1,
+        unit: "usd",
+        source: "command-code-goat-local",
+        observed_at: null,
+        updated_at: "2026-09-14T00:00:00Z",
+      },
+      {
+        account_id: "acc-1",
+        window_kind: "week",
+        used: 20,
+        limit_value: 35,
+        started_at: null,
+        resets_at: null,
+        calibration_offset: 2,
+        unit: "usd",
+        source: "command-code-goat-local",
+        observed_at: null,
+        updated_at: "2026-09-14T00:00:00Z",
+      },
+    ],
+    credit_balances: [],
+    sync_state: null,
+  };
+  const usage = {
+    account_id: "acc-1",
+    window_5h: 7,
+    window_week: 21,
+    window_month: 0,
+    resets_in_5h: "2026-09-14T06:00:00Z",
+    resets_in_week: null,
+    resets_in_month: null,
+    revision: 8,
+    process_generation: 99,
+    pricing_revision: null,
+  };
+
+  const merged = mergeCalibratedProviderUsage(
+    current,
+    "window_5h",
+    usage,
+    "2026-09-14T01:00:00Z",
+  )!;
+  assert.equal(merged.quota_windows[0]?.used, 7);
+  assert.equal(merged.quota_windows[0]?.resets_at, "2026-09-14T06:00:00Z");
+  assert.equal(merged.quota_windows[0]?.updated_at, "2026-09-14T01:00:00Z");
+  assert.deepEqual(merged.quota_windows[1], current.quota_windows[1]);
+
+  const weekUsage = {
+    ...usage,
+    window_week: 17.5,
+    resets_in_week: "2026-09-20T00:00:00Z",
+  };
+  const afterConcurrentWindow = mergeCalibratedProviderUsage(
+    merged,
+    "window_week",
+    weekUsage,
+    "2026-09-14T01:00:01Z",
+  )!;
+  assert.equal(afterConcurrentWindow.quota_windows[0]?.used, 7);
+  assert.equal(afterConcurrentWindow.quota_windows[1]?.used, 17.5);
+  assert.equal(
+    afterConcurrentWindow.quota_windows[1]?.resets_at,
+    "2026-09-20T00:00:00Z",
+  );
 });
 
 test("usage refresh preserves dirty drafts unless a real 429 reset that window", () => {
@@ -307,7 +390,7 @@ test("usage API patches the selected window and percent, and refreshes with POST
   await dashboardApi.updateAccountUsage("acc 1", "window_week", 42, 15);
   await dashboardApi.refreshAccountUsage("acc 1");
 
-  assert.equal(requests[0]?.url, "/dashboard/api/v3/accounts/acc%201/usage");
+  assert.equal(requests[0]?.url, "/dashboard/api/v4/accounts/acc%201/usage");
   assert.equal(requests[0]?.method, "PATCH");
   assert.deepEqual(requests[0]?.body, {
     window: "window_week",
@@ -316,10 +399,222 @@ test("usage API patches the selected window and percent, and refreshes with POST
     expectedRevision: 7,
     processGeneration: 99,
   });
-  assert.equal(requests[1]?.url, "/dashboard/api/v3/accounts/acc%201/usage/refresh");
+  assert.equal(requests[1]?.url, "/dashboard/api/v4/accounts/acc%201/usage/refresh");
   assert.equal(requests[1]?.method, "POST");
   assert.deepEqual(requests[1]?.body, {
     expectedRevision: 7,
     processGeneration: 99,
   });
+});
+
+test("provider quota labels preserve known windows and humanize unknown scopes", () => {
+  const labels = {
+    fiveHours: "5 hours",
+    week: "This week",
+    month: "This month",
+    hours: (count: number) => `${count} hours`,
+  };
+  assert.equal(providerQuotaWindowLabel({
+    window_kind: "kimi_5h",
+    started_at: null,
+    resets_at: null,
+  }, labels), "5 hours");
+  assert.equal(providerQuotaWindowLabel({
+    window_kind: "minimax_current:text_generation",
+    started_at: "2026-09-14T00:00:00Z",
+    resets_at: "2026-09-14T06:00:00Z",
+  }, labels), "6 hours · Text generation");
+  assert.equal(providerQuotaWindowLabel({
+    window_kind: "future_burst_window",
+    started_at: null,
+    resets_at: null,
+  }, labels), "Future burst window");
+});
+
+function providerUsage(windows: ProviderUsage["quotaWindows"]): ProviderUsage {
+  return {
+    accountId: "acc-1",
+    providerId: "command-code",
+    availability: "available",
+    creditBalances: [],
+    experimental: false,
+    freeCooldownUntil: null,
+    pricingRevision: null,
+    processGeneration: 1,
+    quotaWindows: windows,
+    revision: 3,
+    syncState: null,
+  };
+}
+
+function observedWindow(windowKind: string, used: number) {
+  return {
+    accountId: "acc-1",
+    windowKind,
+    used,
+    limitValue: 100,
+    startedAt: null,
+    resetsAt: null,
+    calibrationOffset: 0,
+    unit: "percent",
+    source: "manual",
+    observedAt: "2026-10-01T00:00:00.000Z",
+    updatedAt: "2026-10-01T00:00:00.000Z",
+  };
+}
+
+test("omitted provider windows stay unknown and an explicit zero stays zero", () => {
+  const omitted = usageWindowFromProviderUsage(providerUsage([]), "acc-1");
+  assert.equal(omitted.window_5h, null);
+  assert.equal(omitted.window_week, null);
+  assert.equal(omitted.window_month, null);
+  assert.notEqual(omitted.window_5h, 0);
+
+  const explicitZero = usageWindowFromProviderUsage(
+    providerUsage([observedWindow("five_hours", 0)]),
+    "acc-1",
+  );
+  assert.equal(explicitZero.window_5h, 0);
+  assert.equal(explicitZero.window_week, null);
+  assert.equal(explicitZero.window_month, null);
+  assert.notEqual(explicitZero.window_week, 0);
+
+  const missing = usageWindowFromProviderUsage(null, "acc-1");
+  assert.equal(missing.window_5h, null);
+  assert.equal(missing.window_month, null);
+
+  const notANumber = usageWindowFromProviderUsage(
+    providerUsage([observedWindow("week", Number.NaN)]),
+    "acc-1",
+  );
+  assert.equal(notANumber.window_week, null);
+  assert.notEqual(notANumber.window_week, 0);
+});
+
+test("manual calibration writes an explicit zero and leaves an unknown window unchanged", () => {
+  const current = {
+    account_id: "acc-1",
+    provider_id: "command-code",
+    availability: "available",
+    quota_windows: [
+      {
+        account_id: "acc-1",
+        window_kind: "five_hours",
+        used: 10,
+        limit_value: 100,
+        started_at: null,
+        resets_at: null,
+        calibration_offset: 0,
+        unit: "percent",
+        source: "manual",
+        observed_at: "2026-10-01T00:00:00.000Z",
+        updated_at: "2026-10-01T00:00:00.000Z",
+      },
+    ],
+    credit_balances: [],
+    sync_state: null,
+  };
+  const usage = {
+    account_id: "acc-1",
+    window_5h: null as number | null,
+    window_week: null as number | null,
+    window_month: null as number | null,
+    resets_in_5h: null,
+    resets_in_week: null,
+    resets_in_month: null,
+  };
+  const untouched = mergeCalibratedProviderUsage(current, "window_5h", usage, "2026-10-01T01:00:00.000Z");
+  assert.equal(untouched?.quota_windows[0]?.used, 10);
+  const zeroed = mergeCalibratedProviderUsage(
+    current,
+    "window_5h",
+    { ...usage, window_5h: 0 },
+    "2026-10-01T01:00:00.000Z",
+  );
+  assert.equal(zeroed?.quota_windows[0]?.used, 0);
+  assert.equal(zeroed?.quota_windows.length, 1);
+
+  const empty = { ...current, quota_windows: [] };
+  const stillEmpty = mergeCalibratedProviderUsage(empty, "window_5h", usage, "2026-10-01T01:00:00.000Z");
+  assert.equal(stillEmpty?.quota_windows.length, 0);
+});
+
+test("MiniMax video quota lanes stay hidden while text windows remain visible", () => {
+  const hidden = [
+    "minimax_current:m2:video",
+    "minimax_weekly:m2:video",
+    " MiniMax_Current:M2:Video ",
+  ];
+  for (const window_kind of hidden) {
+    assert.equal(isMiniMaxVideoQuotaWindow({ window_kind }), true, window_kind);
+  }
+  const visible = [
+    "minimax_current:text_generation",
+    "minimax_weekly:text_generation",
+    "minimax_video_usage",
+    "five_hours",
+    "week",
+  ];
+  for (const window_kind of visible) {
+    assert.equal(isMiniMaxVideoQuotaWindow({ window_kind }), false, window_kind);
+  }
+});
+
+const MANUAL_PROVIDERS = ["opencode", "command-code", "ollama", "minimax"] as const;
+
+test("an explicit false calibration plan denies every provider including OpenCode Go", () => {
+  const plan = {
+    manual_calibration: false,
+    windows: [{ kind: "five_hours" }, { kind: "week" }, { kind: "month" }],
+  };
+  for (const providerId of MANUAL_PROVIDERS) {
+    assert.deepEqual(manualEditorWindowKeys(providerId, plan), []);
+    assert.equal(manualUsageEditorEnabled({
+      providerId,
+      plan,
+      reportedManual: true,
+      hasCreditMeter: false,
+    }), false);
+  }
+});
+
+test("no plan and a false manual report keep the percent editor closed", () => {
+  assert.deepEqual(
+    manualEditorWindowKeys("opencode", null),
+    ["window_5h", "window_week", "window_month"],
+  );
+  for (const providerId of MANUAL_PROVIDERS) {
+    assert.equal(manualUsageEditorEnabled({
+      providerId,
+      plan: null,
+      reportedManual: false,
+      hasCreditMeter: false,
+    }), false);
+  }
+});
+
+test("a true plan authorizes only listed sealed windows", () => {
+  const plan = { manual_calibration: true, windows: [{ kind: "week" }, { kind: "free" }] };
+  assert.deepEqual(manualEditorWindowKeys("opencode", plan), ["window_week"]);
+  assert.equal(manualUsageEditorEnabled({
+    providerId: "opencode",
+    plan,
+    reportedManual: false,
+    hasCreditMeter: false,
+  }), true);
+  assert.deepEqual(manualEditorWindowKeys("command-code", plan), ["window_week"]);
+  assert.deepEqual(manualEditorWindowKeys("ollama", plan), []);
+  assert.equal(manualUsageEditorEnabled({
+    providerId: "ollama",
+    plan,
+    reportedManual: true,
+    hasCreditMeter: false,
+  }), false);
+  assert.deepEqual(manualEditorWindowKeys("minimax", plan), []);
+  assert.equal(manualUsageEditorEnabled({
+    providerId: "minimax",
+    plan,
+    reportedManual: true,
+    hasCreditMeter: false,
+  }), false);
 });

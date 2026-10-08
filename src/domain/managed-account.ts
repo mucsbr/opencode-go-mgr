@@ -1,4 +1,4 @@
-import type { AccountSetupStep, BrowserTarget } from "../api/dashboard";
+import type { AccountSetupStep } from "../api/dashboard";
 
 export const DEFAULT_OPENCODE_INVITE_URL =
   "https://opencode.ai/go?ref=68XPB6NP8V";
@@ -13,20 +13,6 @@ export const MANAGED_SETUP_STEPS: readonly AccountSetupStep[] = [
 
 export function setupStepIndex(step: AccountSetupStep): number {
   return MANAGED_SETUP_STEPS.indexOf(step);
-}
-
-export function nextSetupStep(step: AccountSetupStep): AccountSetupStep | null {
-  const index = setupStepIndex(step);
-  return index >= 0 && index < MANAGED_SETUP_STEPS.length - 1
-    ? MANAGED_SETUP_STEPS[index + 1]
-    : null;
-}
-
-export function setupBrowserTarget(step: AccountSetupStep): BrowserTarget | null {
-  if (step === "google_account") return "google_signup";
-  if (step === "opencode_registration") return "invite";
-  if (step === "payment" || step === "key_verification" || step === "ready") return "console";
-  return null;
 }
 
 export function normalizeOpenCodeInviteUrl(value: string): string {
@@ -49,8 +35,10 @@ export function normalizeOpenCodeInviteUrl(value: string): string {
 
 export function browserViewUrl(currentUrl: string, sessionToken: string): string {
   const url = new URL(currentUrl);
-  url.searchParams.set("view", "browser");
-  url.searchParams.delete("session");
-  url.hash = new URLSearchParams({ session: sessionToken }).toString();
+  // The token rides inside the hash route's query, so it is never part of the
+  // request URL; any legacy `?view=` search is dropped so the one-shot
+  // legacy-URL conversion cannot hijack the browser session on load.
+  url.search = "";
+  url.hash = `/browser?${new URLSearchParams({ session: sessionToken }).toString()}`;
   return url.toString();
 }

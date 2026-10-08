@@ -7,7 +7,10 @@ use serde_json::Value;
 use crate::provider::{ConnectionVerificationStatus, OPENCODE_GO_BASE_URL, UpstreamProtocolKind};
 
 pub use crate::kernel::ids::DEFAULT_ACCOUNT_TEST_MODEL;
-pub use ocg_domain::account::{Account, AccountSetupStep, AccountType, UpstreamChannel};
+pub use ocg_domain::account::{
+    Account, AccountSetupStep, AccountType, DEFAULT_INFERENCE_BINDING_ENABLED,
+    NEW_READY_KEY_ACCOUNT_ENABLED, UpstreamChannel,
+};
 
 /// Maximum persisted freeform account note length, counted in Unicode scalars.
 pub const MAX_ACCOUNT_NOTES_CHARS: usize = 4000;
@@ -181,7 +184,7 @@ impl ForwardLogNativeAttribution {
         let usd = raw_cost_usd.or(cost);
         let has_usd = matches!(cost_state, "priced" | "legacy_estimate" | "free") && usd.is_some();
         (
-            usd,
+            has_usd.then_some(usd.unwrap_or(0.0)).filter(|_| has_usd),
             has_usd.then_some("usd".to_string()),
             has_usd.then_some("USD".to_string()),
         )
@@ -305,7 +308,6 @@ pub struct AppConfig {
     pub stream_idle_timeout_secs: u64,
     pub routing_mode: RoutingMode,
     pub conversation_sticky: bool,
-    pub claude_desktop_models: ClaudeDesktopModels,
 }
 
 impl Default for AppConfig {
@@ -327,106 +329,9 @@ impl Default for AppConfig {
             stream_idle_timeout_secs: 300,
             routing_mode: RoutingMode::StrictPriority,
             conversation_sticky: false,
-            claude_desktop_models: ClaudeDesktopModels::default(),
         }
     }
 }
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ClaudeDesktopModels {
-    pub sonnet: String,
-    pub opus: String,
-    pub haiku: String,
-}
-
-impl Default for ClaudeDesktopModels {
-    fn default() -> Self {
-        Self {
-            sonnet: "minimax-m3".to_string(),
-            opus: String::new(),
-            haiku: String::new(),
-        }
-    }
-}
-
-impl ClaudeDesktopModels {
-    pub fn normalize(&mut self) {
-        self.sonnet = self.sonnet.trim().to_string();
-        self.opus = self.opus.trim().to_string();
-        self.haiku = self.haiku.trim().to_string();
-    }
-
-    pub fn validate(&self) -> Result<(), String> {
-        if self.first_configured().is_none() {
-            return Err("at least one Claude Desktop model is required".to_string());
-        }
-        for (role, model) in [
-            ("sonnet", self.sonnet.as_str()),
-            ("opus", self.opus.as_str()),
-            ("haiku", self.haiku.as_str()),
-        ] {
-            if model.is_empty() {
-                continue;
-            }
-            if crate::kernel::ids::is_free_model(model) {
-                return Err(format!(
-                    "Claude Desktop {role} model `{model}` cannot be a Zen free model"
-                ));
-            }
-            if !crate::kernel::protocol::supported_model_ids().any(|supported| supported == model) {
-                return Err(format!("unsupported Claude Desktop {role} model `{model}`"));
-            }
-        }
-        Ok(())
-    }
-
-    pub fn resolved(&self) -> Self {
-        let fallback = self.first_configured().unwrap_or_default();
-        Self {
-            sonnet: if self.sonnet.is_empty() {
-                fallback.to_string()
-            } else {
-                self.sonnet.clone()
-            },
-            opus: if self.opus.is_empty() {
-                fallback.to_string()
-            } else {
-                self.opus.clone()
-            },
-            haiku: if self.haiku.is_empty() {
-                fallback.to_string()
-            } else {
-                self.haiku.clone()
-            },
-        }
-    }
-
-    pub(crate) fn model_for_alias(&self, alias: &str) -> Option<&str> {
-        let configured = match alias {
-            CLAUDE_DESKTOP_SONNET_ALIAS => self.sonnet.as_str(),
-            CLAUDE_DESKTOP_OPUS_ALIAS => self.opus.as_str(),
-            CLAUDE_DESKTOP_HAIKU_ALIAS => self.haiku.as_str(),
-            _ => return None,
-        };
-        (!configured.is_empty())
-            .then_some(configured)
-            .or_else(|| self.first_configured())
-    }
-
-    fn first_configured(&self) -> Option<&str> {
-        [
-            self.sonnet.as_str(),
-            self.opus.as_str(),
-            self.haiku.as_str(),
-        ]
-        .into_iter()
-        .find(|model| !model.is_empty())
-    }
-}
-
-pub const CLAUDE_DESKTOP_SONNET_ALIAS: &str = "claude-sonnet-4-6";
-pub const CLAUDE_DESKTOP_OPUS_ALIAS: &str = "claude-opus-4-6";
-pub const CLAUDE_DESKTOP_HAIKU_ALIAS: &str = "claude-haiku-4-5-20251001";
 
 /// Validates and canonicalizes the optional URL shown to downstream clients.
 pub fn normalize_client_root_url(value: &str) -> Result<String, String> {
@@ -483,7 +388,7 @@ impl AppConfig {
         normalize_proxy_url(self.proxy_mode, &self.proxy_url)?;
         normalize_opencode_invite_url(&self.opencode_invite_url)?;
         // routing_mode is validated by serde enum decoding; unknown values never reach here.
-        self.claude_desktop_models.validate()
+        Ok(())
     }
 
     pub fn validate_timeouts(&self) -> Result<(), String> {
@@ -689,58 +594,14 @@ impl Default for ForwardMetrics {
     }
 }
 
-impl ForwardMetrics {
-    /// Constrain generic token-derived metrics to the selected provider's
-    /// verified pricing contract. Legacy rows without provider attribution are
-    /// intentionally left alone, while an explicitly attributed provider can
-    /// never inherit OpenCode Go pricing by accident.
-    pub(crate) fn scope_to_provider(&mut self, provider_id: Option<&str>, successful: bool) {
-        let Some(provider_id) = provider_id else {
-            return;
-        };
-        if self.pricing_provider_id.as_deref() == Some(provider_id) {
-            return;
-        }
-
-        let has_cost_outcome = matches!(self.cost_state, "priced" | "unpriced" | "free");
-        self.cost = 0.0;
-        self.pricing_revision_id = None;
-        self.quota_multiplier = None;
-        self.local_adjustment_multiplier = None;
-        self.pricing_provider_id = None;
-
-        if provider_id == crate::kernel::ids::OPENCODE_ZEN_FREE_PROVIDER_ID
-            && (successful || has_cost_outcome)
-        {
-            self.raw_cost_usd = Some(0.0);
-            self.quota_debit = Some(0.0);
-            self.effective_paid_cost_usd = Some(0.0);
-            self.cost_state = "free";
-        } else if crate::provider::is_custom_api(provider_id) {
-            self.raw_cost_usd = None;
-            self.quota_debit = None;
-            self.effective_paid_cost_usd = None;
-            if successful || has_cost_outcome {
-                self.cost_state = "unknown";
-            }
-        } else {
-            self.raw_cost_usd = None;
-            self.quota_debit = None;
-            self.effective_paid_cost_usd = None;
-            if has_cost_outcome {
-                self.cost_state = "unpriced";
-            }
-        }
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ForwardLogSummary {
     pub total_requests: i64,
     pub prompt_tokens: i64,
     pub completion_tokens: i64,
     pub cached_tokens: i64,
-    pub cost: f64,
+    /// Sum of historical priced rows. `None` when the filter has no priced or legacy-estimate row.
+    pub cost: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -886,9 +747,10 @@ pub struct DashboardSummary {
     pub total_accounts: usize,
     pub available_accounts: usize,
     pub gateway_running: bool,
-    pub today_cost: f64,
-    pub week_cost: f64,
-    pub month_cost: f64,
+    /// Historical priced spend. `None` when that window has no priced or legacy-estimate row.
+    pub today_cost: Option<f64>,
+    pub week_cost: Option<f64>,
+    pub month_cost: Option<f64>,
 }
 
 /// One row of "daily tokens per model" aggregation for the dashboard chart.

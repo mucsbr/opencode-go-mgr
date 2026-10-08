@@ -2,82 +2,163 @@
 
 # HTTP Routes
 
-Legacy Applications routes and model-list behavior mentioned below describe
-remaining implementation pending cleanup, not a supported application subsystem.
-See the [retirement notice](../user/applications.md).
+All routes share one port: inference, Dashboard V4 (including remounted V3
+handlers), V2 and V3 tombstones, and SPA. See [Architecture](architecture.md).
 
-All routes share one port: inference, Dashboard V3, V2 tombstone, and SPA. See [Architecture](architecture.md).
-
-Retired `/dashboard/api/...` REST returns empty-body **401** when anonymous
+Tombstoned `/dashboard/api/...` REST returns empty-body **401** when anonymous
 (auth runs before the tombstone) and **410**
 `{ "code": "dashboardV2Removed", "message": "Dashboard API V2 has been removed; refresh the page and retry." }`
-when authenticated, including loopback local mode. Unknown `/dashboard/api/...`
-paths that are not V3 and not a preserved family are also 410 once
-authenticated. Preserved `/dashboard/api` families (exact path, no trailing
-slash, no extra segments): `auth/status`, `auth/register`, `auth/login`,
-`auth/logout`, and `browser/sessions/{token}/ws` (non-empty token). Do not
-revive protected V2 REST; new JSON is V3.
+when authenticated, including loopback local mode. The `/dashboard/api/v3`
+prefix is a separate 410 family:
+`{ "code": "dashboardV3Removed", "message": "Dashboard API V3 has been removed; refresh the page and retry." }`.
+Unknown `/dashboard/api/...` paths that are not the V3 tombstone prefix, not
+V4, and not a preserved family are also 410 once authenticated. Unknown V4
+paths are V4 `404`s, not tombstones. Preserved
+`/dashboard/api` families (exact path, no trailing slash, no extra
+segments): `auth/status`, `auth/register`, `auth/login`, `auth/logout`,
+and `browser/sessions/{token}/ws` (non-empty token). Protected
+V2 REST is tombstoned; live dashboard JSON is V4 only.
 
-## Inference (unchanged paths)
+**The authoritative route list is the router construction in
+`crates/ocg-core/src/dashboard_v4/mod.rs` (V4-native routes) and the remounted
+kernel in `crates/ocg-core/src/dashboard_v3/mod.rs`.** This page describes
+semantics and route families; it does not enumerate paths. Add, move, or
+retire routes in those routers — do not mirror them here.
 
-| Method | Path | Notes |
-| --- | --- | --- |
-| POST | `/v1/chat/completions` | OpenAI Chat |
-| POST | `/v1/responses` | OpenAI Responses (stateless; `store` / `previous_response_id` / `conversation` / `background` → 400) |
-| POST | `/v1/messages` | Anthropic Messages |
-| GET | `/v1/models` | Local list; auth required |
-| POST | `/claude-desktop/v1/messages` | Role alias rewrite then Messages |
-| GET | `/claude-desktop/v1/models` | Three role aliases |
-| POST | `/v1beta/models/{model}:*` and `/v1/models/{model}:*` | Gemini client format |
+## Inference
 
-## Dashboard V3 (`/dashboard/api/v3`)
+The `/v1/...` inference surface is registered in
+`crates/ocg-core/src/gateway/mod.rs` (`inference_router`) and dispatched by
+the handlers in `crates/ocg-core/src/gateway/handler.rs`: OpenAI Chat
+Completions and Responses, Anthropic Messages, the authenticated local
+`GET /v1/models`, and the Gemini client format
+`/v1beta/models/{model}:*` (also mounted under `/v1/`). The same endpoints
+are documented user-facing in [gateway.md](../user/gateway.md).
 
-Public: `/auth/status`, `/auth/register`, `/auth/login`, `/auth/logout`.
+Semantics the router does not state at a glance:
 
-Session-protected (non-exhaustive; see `dashboard_v3/mod.rs`):
-`/contract`, `/connection`, `/settings`, `/settings/test-proxy`,
-`/claude-desktop/models`, `/settings/check-update`,
-`/settings/update-status`, `/settings/install-update`,
-`/providers/{provider_id}/pricing`,
-`/providers/{provider_id}/pricing/refresh`,
-`/providers/{provider_id}/pricing/multipliers`, `/keys`,
-`/keys/primary/regenerate`, `/keys/{id}`, `/keys/{id}/regenerate`,
-`/accounts`, `/accounts/managed`, `/accounts/order`, `/accounts/{id}`,
-`/accounts/{id}/toggle`, `/accounts/{id}/browser`,
-`/accounts/{id}/browser-profile`, `/accounts/{id}/setup`,
-`/accounts/{id}/setup/verify-key`, `/accounts/{id}/reset-cooldown`,
-`/accounts/{id}/custom-config`, `/accounts/{id}/model-capabilities`,
-`/accounts/{id}/acknowledgements`, `/accounts/{id}/usage`,
-`/accounts/{id}/usage/refresh`, `/accounts/{id}/provider-usage`,
-`/accounts/{id}/verify`, `/providers`, `/providers/{provider_id}`,
-`/providers/models/discover`, `/providers/test`, `/providers/model-capabilities`,
-`/providers/zen-free`, `/providers/zen-free/models`,
-`/providers/zen-free/models/refresh`,
-`/providers/{provider_id}/models/refresh`, `/provider-contracts`,
-`/provider-contracts/provider/{scope_id}/model-protocol-overrides`,
-`/provider-contracts/custom-endpoint/{scope_id}/model-protocol-overrides`,
-`/providers/{provider_id}/protocol-probes`, `/browser/capabilities`,
-`/browser/sessions/{token}/ws`, `/gateway/status`,
-`/application-models`, `/dashboard/summary`,
-`/dashboard/daily-tokens-by-model`, `/logs/gateway`, `/logs/forward`,
-`/logs/forward/models`, `/logs/forward/keys`,
-`/custom/models/discover`.
+- `/v1/responses` is stateless: `store`, `previous_response_id`,
+  `conversation`, and `background` are rejected with **400**.
+- Gemini `{model}:{action}` dispatch (`gemini_model_action`):
+  `generateContent` and `streamGenerateContent` proxy upstream;
+  `countTokens` returns **501** as an expected fallback (Gemini CLI switches
+  to local estimation, and the request is not persisted as a failure);
+  `embedContent` returns **501** (embeddings are unsupported); an unknown
+  action is a Gemini-format **404**.
+- `GET /v1/models` is a local inventory (code-owned aliases plus eligible
+  saved names); it requires auth and performs no upstream I/O.
 
-`GET /contract` returns the current process's live revision / generation token
-(`revision`, `processGeneration`, `pricingRevision`).
+## Dashboard V3 Tombstone (`/dashboard/api/v3`)
 
-Go/Zen protocol probes are `POST /providers/{provider_id}/protocol-probes`.
-Custom is rejected there (`protocol probes for Custom API are account-owned`).
-Custom connection verify is `POST /accounts/{id}/verify`; model discovery is
-`POST /custom/models/discover`. Historical V2
-`POST /accounts/{id}/protocol-probes` is 410. User-defined Providers use
-`POST /providers`, `GET|PATCH|DELETE /providers/{provider_id}`,
-`POST /providers/models/discover`, and `POST /providers/test`. Save succeeds
-independently of discovery and test; a real test may consume upstream quota.
+`/dashboard/api/v3` and `/dashboard/api/v3/*` are retired. Anonymous
+requests get empty-body **401**. Authenticated requests get **410**
+`dashboardV3Removed`.
 
-## Static dashboard
+## Dashboard V4 (`/dashboard/api/v4`)
+
+Public (remounted, session-free): `/auth/status`, `/auth/register`,
+`/auth/login`, `/auth/logout`, plus the preserved WebSocket family listed
+above. Everything else is session-protected and groups into the families
+below; each family names its owning module. Exact paths and methods live in
+the two router constructions cited above.
+
+Remounted kernel (`crates/ocg-core/src/dashboard_v3/`):
+
+- **Connection, settings, updater** (`connection`, `settings`,
+  `proxy_test`, `updater` modules): read or mutate the single saved
+  connection, test the outbound proxy, and check or install updates.
+- **Gateway Keys** (`keys` module): create, list, and regenerate the
+  administrator Gateway Keys.
+- **Account lifecycle** (`accounts`, `usage`, `usage_refresh`,
+  `account_model_test`, `account_verify`, `managed_key_verify`,
+  `account_transfer` modules): create, reorder, and toggle accounts;
+  browser onboarding and profiles; setup with Key verification; cooldown
+  reset; custom config and model capabilities; usage and provider-usage
+  reads and refresh (including Command Code usage refresh); per-account
+  model tests and connection verify.
+- **Providers** (`providers`, `dynamic_providers` modules):
+  sealed and static provider rows. Pricing module routes are not registered
+  and answer with the ordinary V4 404. User-defined
+  Provider CRUD, model discovery, and live connection test; Zen `-free`
+  rows and model refresh.
+- **Provider contracts and model protocols** (the `provider-contracts`
+  family in the kernel): contract listing, per-scope model-protocol
+  overrides (provider and custom-endpoint scopes), catalog refresh, and
+  reset-static for static protocol tables.
+- **Protocol probes** (`providers` module): `POST
+  /providers/{provider_id}/protocol-probes` probes Go/Zen protocol support.
+  Custom is rejected there (`protocol probes for Custom API are
+  account-owned`), and the V2 `POST /accounts/{id}/protocol-probes` is 410.
+  Custom connection verify and model discovery belong to the account
+  lifecycle family and `custom_discovery` (`POST /accounts/{id}/verify`,
+  `POST /custom/models/discover`).
+- **Platform accounts** (`platforms` module): list, inspect, and refresh
+  platform accounts and platform linking.
+- **CPA** (`cpa` module): the remounted `/external-integrations/cpa/*`
+  catalog read and write.
+- **Observability** (`observability` module and the `application-models`
+  handler): gateway status, dashboard summary and daily tokens, and
+  gateway/forward logs with model and Key filters.
+- **Browser** (`browser` module): capability listing and the account
+  website WebSocket.
+
+V4-native (`crates/ocg-core/src/dashboard_v4/`):
+
+- **Control plane**: `GET /contract` is the V4-native ControlRevision
+  (`revision`, `processGeneration`). Generated `ControlRevision` still
+  includes `pricingRevision` as a legacy read string. It is not a CAS token
+  and it is not removed. The live client does not publish it and does
+  not send `expectedPricingRevision`.
+  `/templates`,
+  `/connections`, and `/accounts` list creation templates, connections,
+  and account identities.
+- **Destinations and catalog** (`destinations`, `destination_catalog`
+  modules): list destinations and credentials; mutate a destination or its
+  catalog. Destination mutations are CAS-protected and limited to
+  configurable HTTP rows; sealed and platform-managed rows are immutable.
+- **Credentials** (`credentials` module): rotate a credential and retry
+  its quota state.
+- **Billing** (`billing` module): per-account manual credit buckets,
+  calibration, and grants. A read reports active `pendingRequests` as 0.
+  The stored historical receipt stays exact. Explicit calibration is not
+  blocked by that receipt and does not settle or delete it. Reads do not
+  settle or reprice stored balances. A new request does not debit personal
+  credit.
+- **Official API references** (`official_api` module): official-API status
+  and balance refresh for matching presets. Price-table routes are not
+  registered.
+- **Platform Keys** (`platform_keys` module): import platform Keys into an
+  account.
+- **Onboarding and bindings** (`onboarding`, `bindings`, `identities`
+  modules): the atomic preset commit, Key-to-model bindings, and adding a
+  credential to an identity.
+- **Routing** (`routing`, `routing_cards` modules): `GET /routing/explain`
+  is read-only and performs no upstream I/O or Key decryption;
+  `/routing/cards` lists and replaces routing cards.
+- **CPA catalog** (`cpa` module): the V4-native `/cpa/models` endpoints.
+- **Catalog removal and alias publication** (`catalog`, `publication`
+  modules): remove models from a provider-contract catalog and read or
+  patch the public alias surface.
+- **Applications** (`applications` module): the DSH application status and
+  install endpoints.
+
+Compatibility shims and data-shape notes that the routers do not show:
+
+- `GET /account-records` and `GET /platform-accounts` keep the remounted
+  compatibility list bodies, reconstructed from destinations and
+  credentials. Key ciphertext stays on credential SQL rows and is not
+  copied into V4 GET destination/credential DTOs. `GET /accounts` is the
+  V4 identity listing, also reconstructed from credentials.
+- User-defined Providers use the kernel provider family: `POST /providers`,
+  `GET|PATCH|DELETE /providers/{provider_id}`, `POST
+  /providers/models/discover`, and `POST /providers/test`. Save succeeds
+  independently of discovery and test; a real test may consume upstream
+  quota.
+
+## Static Dashboard
 
 `GET /dashboard`, `GET /dashboard/`, `GET /dashboard/assets/{*path}`.
+
 ---
 
 [Maintainer guide index](../MAINTAINER.md) · [简体中文](http-routes.zh-CN.md) · [Docs index](../README.md)

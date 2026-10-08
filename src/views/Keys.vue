@@ -2,13 +2,19 @@
   <section class="keys-page" aria-labelledby="gateway-keys-title">
     <div class="keys-card">
       <div class="keys-head">
-        <h2 id="gateway-keys-title">{{ t("接入 Key") }}</h2>
+        <h2 id="gateway-keys-title" class="sr-only">{{ t("接入 Key") }}</h2>
         <p class="field-caption">
-          {{ t("主 Key 恒为有效，只能重置；子 Key 可分给不同设备，用量按 Key 记录，删除为软删除，历史日志保留归因。") }}
+          {{ t("主 Key 只能重置。子 Key 可分给不同设备。") }}
         </p>
       </div>
 
-      <n-alert v-if="loadError" type="error" :title="t('接入 Key 加载失败，请先重试')">
+      <n-alert v-if="connectionStore.refreshError" type="warning" :title="t('接入 Key 加载失败，请重试')">
+        <div class="keys-load-error">
+          <span>{{ t("加载接入 Key 失败：{error}", { error: connectionStore.refreshError }) }}</span>
+          <n-button size="small" secondary :loading="loading" @click="loadConnection">{{ t("重试") }}</n-button>
+        </div>
+      </n-alert>
+      <n-alert v-if="loadError" type="error" :title="t('接入 Key 加载失败，请重试')">
         <div class="keys-load-error">
           <span>{{ loadError }}</span>
           <n-button size="small" secondary :loading="loading" @click="loadConnection">{{ t("重试") }}</n-button>
@@ -21,7 +27,7 @@
             <span class="gateway-key-name">{{ t("主 Key") }}</span>
             <span class="gateway-key-badge">{{ t("恒为有效") }}</span>
           </div>
-          <code class="gateway-key-value">{{ maskConnectionKey(connection.primary_key) }}</code>
+          <code class="gateway-key-value">{{ presentConnectionKey(connection.primary_key) }}</code>
           <div class="gateway-key-actions">
             <n-tooltip trigger="hover">
               <template #trigger>
@@ -100,7 +106,7 @@
               </n-tooltip>
             </template>
           </div>
-          <code class="gateway-key-value">{{ maskConnectionKey(entry.value) }}</code>
+          <code class="gateway-key-value">{{ presentConnectionKey(entry.value) }}</code>
           <div class="gateway-key-actions">
             <n-tooltip trigger="hover">
               <template #trigger>
@@ -204,7 +210,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onActivated, onMounted, onUnmounted, ref } from "vue";
+import { computed, onActivated, onDeactivated, onMounted, onUnmounted, ref, watch } from "vue";
 import {
   NAlert,
   NButton,
@@ -225,12 +231,22 @@ import {
 import { DashboardRequestError } from "../api/dashboard";
 import type { ConnectionInfo, ConnectionSubKey } from "../api/dashboard";
 import { useConnectionStore } from "../stores/connection.ts";
+import { useSessionStore } from "../stores/session.ts";
+import { createRevalidateGate } from "../domain/revalidate.ts";
 import { t } from "../i18n/index.ts";
 import { useClipboard } from "../utils/format.ts";
 import { maskConnectionKey } from "./dashboard-connection";
 
 const message = useMessage();
 const connectionStore = useConnectionStore();
+const sessionStore = useSessionStore();
+const revalidateGate = createRevalidateGate(60_000);
+watch(() => sessionStore.authenticated, (ok) => {
+  if (ok) return;
+  revalidateGate.reset();
+  cancelRename();
+  newKeyName.value = "";
+});
 const { copiedTarget: keyCopied, copy, cleanup } = useClipboard();
 const loaded = ref(false);
 const loading = ref(false);
@@ -241,6 +257,57 @@ const renamingKeyId = ref("");
 const renameDraft = ref("");
 const keyMutation = ref("");
 let loadGeneration = 0;
+let keyFlow = 0;
+
+type KeyFlowMark = { flow: number; connection: number | null; shell: number | undefined };
+
+function captureKeyFlow(): KeyFlowMark {
+  const current = connectionStore.currentSession;
+  return {
+    flow: ++keyFlow,
+    connection: typeof current === "function" ? current() : null,
+    shell: typeof sessionStore.sessionEpoch === "number" ? sessionStore.sessionEpoch : undefined,
+  };
+}
+
+function keyFlowCurrent(mark: KeyFlowMark): boolean {
+  if (mark.flow !== keyFlow) return false;
+  const current = connectionStore.currentSession;
+  if (typeof current === "function" && mark.connection !== null && current() !== mark.connection) return false;
+  if (typeof sessionStore.sessionEpoch === "number" && mark.shell !== undefined && sessionStore.sessionEpoch !== mark.shell) return false;
+  return true;
+}
+
+/** Page-local only. A shared connection read may still commit after navigation. */
+function invalidateKeyPage(): void {
+  keyFlow += 1;
+  loadGeneration += 1;
+  mutating.value = false;
+  keyMutation.value = "";
+  loading.value = false;
+}
+
+function operationPlaintext(value: unknown): string {
+  if (typeof value === "string") return value;
+  if (value && typeof value === "object" && "value" in value) {
+    const inner = (value as { value?: unknown }).value;
+    if (typeof inner === "string") return inner;
+  }
+  return "";
+}
+
+function readableError(error: unknown): string {
+  if (error instanceof Error) return error.message;
+  if (typeof error === "string") return error;
+  return "";
+}
+
+type KeyReceipt = { value?: unknown; revalidation?: Promise<unknown> };
+
+function asKeyReceipt(value: unknown): KeyReceipt | null {
+  if (!value || typeof value !== "object") return null;
+  return value as KeyReceipt;
+}
 
 const EMPTY_CONNECTION: ConnectionInfo = {
   gateway_port: 9042,
@@ -250,6 +317,12 @@ const EMPTY_CONNECTION: ConnectionInfo = {
   revision: 0,
 };
 const connection = computed(() => connectionStore.info ?? EMPTY_CONNECTION);
+
+/** A loaded key with no cached secret is unknown plaintext, not an unconfigured key. */
+function presentConnectionKey(value: string): string {
+  if (!value && connectionStore.info) return t("未知");
+  return maskConnectionKey(value);
+}
 
 function applyConnection(next: ConnectionInfo): void {
   if (renamingKeyId.value && !next.sub_keys.some((entry) => entry.id === renamingKeyId.value)) {
@@ -271,7 +344,7 @@ async function loadConnection(): Promise<boolean> {
   } catch (error) {
     if (generation !== loadGeneration) return false;
     loadError.value = error instanceof Error ? error.message : String(error);
-    message.error(t("加载接入 Key 失败: {error}", { error: loadError.value }));
+    message.error(t("加载接入 Key 失败：{error}", { error: loadError.value }));
     return false;
   } finally {
     if (generation === loadGeneration) loading.value = false;
@@ -286,76 +359,76 @@ async function runKeyMutation(
   mutation: string,
   action: () => Promise<unknown>,
   successText: () => string,
-): Promise<boolean> {
-  if (!loaded.value || mutating.value) return false;
+): Promise<KeyFlowMark | null> {
+  if (!loaded.value || mutating.value) return null;
+  const mark = captureKeyFlow();
   const generation = ++loadGeneration;
   keyMutation.value = mutation;
   mutating.value = true;
-  let mutationError: unknown = null;
   try {
-    try {
-      await action();
-    } catch (error) {
-      mutationError = error;
-    }
-    try {
-      const latest = await connectionStore.load();
-      if (generation !== loadGeneration) return false;
-      applyConnection(latest);
-      if (mutationError === null) {
-        message.success(successText());
-        return true;
+    await action();
+    if (!keyFlowCurrent(mark) || generation !== loadGeneration) return null;
+    message.success(successText());
+    return mark;
+  } catch (error) {
+    if (!keyFlowCurrent(mark) || generation !== loadGeneration) return null;
+    if (isConflict(error)) {
+      try {
+        const latest = await connectionStore.load();
+        if (keyFlowCurrent(mark) && generation === loadGeneration) applyConnection(latest);
+      } catch {
+        // A failed read does not replay the write or clear the local draft.
       }
-      if (isConflict(mutationError)) {
+      if (keyFlowCurrent(mark)) {
         message.warning(t("接入 Key 已被其他操作修改，已刷新列表并保留本地修改，请再次保存"));
-      } else {
-        message.error(t("操作失败: {error}", { error: String(mutationError) }));
       }
-      return false;
-    } catch (reloadError) {
-      if (generation !== loadGeneration) return false;
-      loaded.value = false;
-      loadError.value = reloadError instanceof Error ? reloadError.message : String(reloadError);
-      if (mutationError === null) {
-        message.success(successText());
-      } else if (isConflict(mutationError)) {
-        message.warning(t("接入 Key 已被其他操作修改，已刷新列表并保留本地修改，请再次保存"));
-      } else {
-        message.error(t("操作失败: {error}", { error: String(mutationError) }));
-      }
-      message.error(t("加载接入 Key 失败: {error}", { error: loadError.value }));
-      return mutationError === null;
+      return null;
     }
+    message.error(t("操作失败：{error}", { error: readableError(error) }));
+    return null;
   } finally {
-    mutating.value = false;
-    keyMutation.value = "";
+    if (keyFlowCurrent(mark)) {
+      mutating.value = false;
+      keyMutation.value = "";
+    }
+  }
+}
+
+async function copyReceiptValue(receipt: unknown, mark: KeyFlowMark): Promise<void> {
+  const record = asKeyReceipt(receipt);
+  if (record?.revalidation) await record.revalidation;
+  if (!keyFlowCurrent(mark)) return;
+  const secret = operationPlaintext(record?.value);
+  if (!secret) return;
+  try {
+    await copy(`keys-secret-${mark.flow}`, secret, "Key");
+    if (!keyFlowCurrent(mark)) return;
+    message.success(t("新 Key 值已复制到剪贴板"));
+  } catch {
+    if (!keyFlowCurrent(mark)) return;
+    message.warning(t("自动复制失败，请在列表中手动复制新 Key"));
   }
 }
 
 async function rotatePrimaryKey(): Promise<void> {
-  let nextValue = "";
-  const ok = await runKeyMutation(
+  let receipt: unknown;
+  const mark = await runKeyMutation(
     "rotate-primary",
     async () => {
-      nextValue = await connectionStore.regeneratePrimaryKey();
+      receipt = await connectionStore.regeneratePrimaryKey();
+      return receipt;
     },
     () => t("Key 已刷新"),
   );
-  if (ok && nextValue) {
-    try {
-      await copy(`keys-rotated-${Date.now()}`, nextValue, "Key");
-      message.success(t("新 Key 值已复制到剪贴板"));
-    } catch {
-      message.warning(t("自动复制失败，请在列表中手动复制新 Key"));
-    }
-  }
+  if (mark) await copyReceiptValue(receipt, mark);
 }
 
 async function copyPrimaryKey(): Promise<void> {
-  if (!connection.value.primary_key) return;
+  const secret = operationPlaintext(connection.value.primary_key);
+  if (!secret) return;
   try {
-    await copy("keys-primary", connection.value.primary_key, "Key");
-    message.success(t("已复制 Key"));
+    await copy("keys-primary", secret, "Key");
+    message.success(t("Key 已复制"));
   } catch (error) {
     message.error(error instanceof Error ? error.message : t("复制失败"));
   }
@@ -364,23 +437,18 @@ async function copyPrimaryKey(): Promise<void> {
 async function createKey(): Promise<void> {
   const name = newKeyName.value.trim();
   if (!name || mutating.value || !loaded.value) return;
-  let createdValue = "";
-  const ok = await runKeyMutation(
+  let receipt: unknown;
+  const mark = await runKeyMutation(
     "create",
     async () => {
-      createdValue = (await connectionStore.createKey(name)).value;
+      receipt = await connectionStore.createKey(name);
+      return receipt;
     },
     () => t("Key 已创建"),
   );
-  if (ok && createdValue) {
-    newKeyName.value = "";
-    try {
-      await copy(`keys-created-${Date.now()}`, createdValue, "Key");
-      message.success(t("新 Key 值已复制到剪贴板"));
-    } catch {
-      message.warning(t("自动复制失败，请在列表中手动复制新 Key"));
-    }
-  }
+  if (!mark) return;
+  newKeyName.value = "";
+  await copyReceiptValue(receipt, mark);
 }
 
 function startRename(entry: ConnectionSubKey): void {
@@ -399,12 +467,12 @@ async function commitRename(entry: ConnectionSubKey): Promise<void> {
     cancelRename();
     return;
   }
-  await runKeyMutation(
+  const mark = await runKeyMutation(
     `rename:${entry.id}`,
     () => connectionStore.updateKey(entry.id, { name }),
     () => t("Key 名称已保存"),
   );
-  cancelRename();
+  if (mark) cancelRename();
 }
 
 async function toggleKey(entry: ConnectionSubKey, enabled: boolean): Promise<void> {
@@ -416,32 +484,27 @@ async function toggleKey(entry: ConnectionSubKey, enabled: boolean): Promise<voi
 }
 
 async function copyEntryKey(entry: ConnectionSubKey): Promise<void> {
-  if (!entry.value) return;
+  const secret = operationPlaintext(entry.value);
+  if (!secret) return;
   try {
-    await copy(`keys-${entry.id}`, entry.value, "Key");
-    message.success(t("已复制 Key"));
+    await copy(`keys-${entry.id}`, secret, "Key");
+    message.success(t("Key 已复制"));
   } catch (error) {
     message.error(error instanceof Error ? error.message : t("复制失败"));
   }
 }
 
 async function regenerateEntryKey(entry: ConnectionSubKey): Promise<void> {
-  let nextValue = "";
-  const ok = await runKeyMutation(
+  let receipt: unknown;
+  const mark = await runKeyMutation(
     `regenerate:${entry.id}`,
     async () => {
-      nextValue = (await connectionStore.regenerateKey(entry.id)).value;
+      receipt = await connectionStore.regenerateKey(entry.id);
+      return receipt;
     },
     () => t("Key 已重新生成"),
   );
-  if (ok && nextValue) {
-    try {
-      await copy(`keys-regenerated-${Date.now()}`, nextValue, "Key");
-      message.success(t("新 Key 值已复制到剪贴板"));
-    } catch {
-      message.warning(t("自动复制失败，请在列表中手动复制新 Key"));
-    }
-  }
+  if (mark) await copyReceiptValue(receipt, mark);
 }
 
 async function deleteEntryKey(entry: ConnectionSubKey): Promise<void> {
@@ -456,9 +519,16 @@ onMounted(() => {
   void loadConnection();
 });
 onActivated(() => {
-  if (!loading.value) void loadConnection();
+  if (loading.value) return;
+  if (connectionStore.info && !revalidateGate.shouldRun()) return;
+  revalidateGate.record();
+  void loadConnection();
 });
-onUnmounted(cleanup);
+onDeactivated(invalidateKeyPage);
+onUnmounted(() => {
+  invalidateKeyPage();
+  cleanup();
+});
 </script>
 
 <style scoped>
@@ -469,7 +539,7 @@ onUnmounted(cleanup);
 .keys-card {
   padding: 22px;
   border: 1px solid var(--ocg-border);
-  border-radius: 14px;
+  border-radius: var(--ocg-radius-lg);
   background: var(--ocg-surface);
   box-shadow: var(--ocg-shadow-sm);
 }
@@ -488,24 +558,24 @@ onUnmounted(cleanup);
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 12px;
+  gap: var(--ocg-space-md);
 }
 .key-create-row {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
   align-items: center;
-  gap: 8px;
+  gap: var(--ocg-space-sm);
   max-width: 28em;
-  margin-top: 16px;
+  margin-top: var(--ocg-space-lg);
 }
 .key-create-submit {
   min-width: 0;
-  padding-inline: 12px;
+  padding-inline: var(--ocg-space-md);
 }
 .gateway-key-list {
   display: grid;
-  gap: 8px;
-  margin: 16px 0 0;
+  gap: var(--ocg-space-sm);
+  margin: var(--ocg-space-lg) 0 0;
   padding: 0;
   list-style: none;
 }
@@ -513,18 +583,18 @@ onUnmounted(cleanup);
   display: grid;
   grid-template-columns: minmax(11em, 16em) minmax(0, 1fr) auto;
   align-items: center;
-  gap: 12px;
+  gap: var(--ocg-space-md);
   min-height: 48px;
-  padding: 8px 12px;
+  padding: var(--ocg-space-sm) var(--ocg-space-md);
   border: 1px solid var(--ocg-border);
-  border-radius: 6px;
+  border-radius: var(--ocg-radius-sm);
   background: var(--ocg-canvas);
 }
 .gateway-key-main {
   display: flex;
   min-width: 0;
   align-items: center;
-  gap: 8px;
+  gap: var(--ocg-space-sm);
 }
 .gateway-key-main .n-input {
   max-width: 240px;
@@ -540,7 +610,7 @@ onUnmounted(cleanup);
 }
 .gateway-key-badge {
   flex: none;
-  padding: 1px 8px;
+  padding: 1px var(--ocg-space-sm);
   border: 1px solid var(--ocg-border);
   border-radius: 999px;
   color: var(--ocg-subtle);

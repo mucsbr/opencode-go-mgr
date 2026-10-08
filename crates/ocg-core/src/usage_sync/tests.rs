@@ -380,19 +380,6 @@ fn expedite_guard_is_fifteen_minutes() {
 }
 
 #[test]
-fn inference_429_delay_stays_within_one_to_two_minutes() {
-    let now = fixed("2026-08-18T12:00:00Z");
-    assert_eq!(
-        compute_inference_429_delay(now, 0.0),
-        now + INFERENCE_429_DELAY_MIN
-    );
-    assert_eq!(
-        compute_inference_429_delay(now, 1.0),
-        now + INFERENCE_429_DELAY_MAX
-    );
-}
-
-#[test]
 fn auto_sync_excludes_disabled_non_ready_empty_key() {
     let provider = crate::provider::OPENCODE_PROVIDER_ID;
     assert!(!provider_account_is_auto_sync_candidate(
@@ -478,6 +465,7 @@ fn sample_snapshot() -> GoUsageSnapshot {
         monthly_percent: 10.0,
         rolling_resets_in_minutes: 180,
         weekly_resets_in_minutes: 1_440,
+        monthly_resets_in_minutes: 43200,
         earliest_resets_in_minutes: 180,
     }
 }
@@ -525,19 +513,16 @@ async fn manual_throttle_and_dedupe_share_one_upstream_call() {
     let rb = b.await.unwrap().unwrap();
     assert_eq!(ra.last_success_at, rb.last_success_at);
     assert_eq!(calls.load(AtomicOrdering::SeqCst), 1);
-    let success_events: Vec<_> = state
-        .db
-        .lock()
-        .list_gateway_logs(20)
-        .unwrap()
-        .into_iter()
-        .filter(|log| {
-            log.message
-                .starts_with("event=official_usage_refresh_succeeded account_id=acc-1")
-        })
-        .collect();
-    assert_eq!(success_events.len(), 1, "deduped refresh logs once");
-    assert!(!success_events[0].message.contains("sk-acc-1"));
+    assert!(state.db.lock().list_gateway_logs(20).unwrap().is_empty());
+    assert_eq!(
+        state
+            .db
+            .lock()
+            .query_operation_logs(&Default::default())
+            .unwrap()
+            .total,
+        0
+    );
 
     let throttled = refresh_official_usage(&state, "acc-1", UsageSyncTrigger::Manual).await;
     match throttled {
@@ -800,19 +785,16 @@ async fn failure_preserves_last_success_and_calibration() {
     assert_eq!(sync.last_success_at, success_at);
     assert_eq!(sync.failure_streak, 1);
     assert_eq!(sync.next_eligible_at, Some(later + failure_backoff(1)));
-    let failure_events: Vec<_> = state
+    assert!(state.db.lock().list_gateway_logs(20).unwrap().is_empty());
+    assert_eq!(
+        state
             .db
             .lock()
-            .list_gateway_logs(20)
+            .query_operation_logs(&Default::default())
             .unwrap()
-            .into_iter()
-            .filter(|log| {
-                log.message
-                    == "event=official_usage_refresh_failed account_id=acc-2 trigger=manual reason=upstream_timeout"
-            })
-            .collect();
-    assert_eq!(failure_events.len(), 1);
-    assert!(!failure_events[0].message.contains("sk-acc-2"));
+            .total,
+        0
+    );
 
     drop(state);
     std::fs::remove_dir_all(dir).unwrap();
@@ -845,6 +827,12 @@ async fn key_cas_leaves_windows_unchanged_when_account_changes() {
         .account_usage_with_limits("acc-3", &limits)
         .unwrap();
 
+    let sync_before = state
+        .db
+        .lock()
+        .account_usage_sync_state("acc-3")
+        .unwrap()
+        .unwrap();
     let now = fixed("2026-08-18T12:00:00Z");
     state.usage_sync.set_clock_for_test(move || now);
     state.usage_sync.set_jitter_for_test(|| 0.0);
@@ -893,13 +881,9 @@ async fn key_cas_leaves_windows_unchanged_when_account_changes() {
         .account_usage_sync_state("acc-3")
         .unwrap()
         .unwrap();
-    assert_eq!(sync.failure_streak, 1);
-    assert_eq!(sync.next_eligible_at, Some(now + failure_backoff(1)));
-    assert_eq!(sync.last_attempt_at, Some(now));
-    // Manual 15s throttle still exposed after CAS conflict.
     assert_eq!(
-        manual_next_allowed_at(sync.last_attempt_at, now),
-        Some(now + MANUAL_THROTTLE)
+        sync, sync_before,
+        "old-key results must not throttle the replacement"
     );
 
     state.usage_sync.clear_test_seams();
@@ -929,40 +913,6 @@ async fn official_rate_limited_status_does_not_write_cooldown() {
     assert!(stored.cooldown_month_until.is_none());
     assert!(stored.cooldown_generic_until.is_none());
     assert!(stored.cooldown_free_until.is_none());
-
-    drop(state);
-    std::fs::remove_dir_all(dir).unwrap();
-}
-
-#[tokio::test]
-async fn schedule_after_inference_429_only_pulls_next_eligible() {
-    let (dir, state) = test_state("infer-429");
-    let account = ready_account(&state, "acc-5", "sk-acc-5");
-    state.db.lock().create_account(&account).unwrap();
-    let now = fixed("2026-08-18T12:00:00Z");
-    state.usage_sync.set_clock_for_test(move || now);
-    state.usage_sync.set_jitter_for_test(|| 0.0);
-    // Far-future cadence baseline.
-    state
-        .db
-        .lock()
-        .record_account_usage_sync_success(
-            "acc-5",
-            now - Duration::hours(1),
-            now + Duration::hours(20),
-            false,
-        )
-        .unwrap();
-    schedule_after_inference_429(&state, "acc-5");
-    let sync = state
-        .db
-        .lock()
-        .account_usage_sync_state("acc-5")
-        .unwrap()
-        .unwrap();
-    assert_eq!(sync.next_eligible_at, Some(now + INFERENCE_429_DELAY_MIN));
-    let stored = state.db.lock().get_account("acc-5").unwrap().unwrap();
-    assert!(stored.cooldown_until.is_none());
 
     drop(state);
     std::fs::remove_dir_all(dir).unwrap();
@@ -1541,43 +1491,6 @@ fn inactive_to_active_pulls_hourly_without_overriding_failure_backoff() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
-#[test]
-fn inference_429_intentionally_overrides_failure_backoff_floor() {
-    let (dir, state) = test_state("429-override");
-    let account = ready_account(&state, "rl", "sk-rl");
-    state.db.lock().create_account(&account).unwrap();
-    let now = fixed("2026-08-18T12:00:00Z");
-    state.usage_sync.set_clock_for_test(move || now);
-    state.usage_sync.set_jitter_for_test(|| 0.0);
-    state
-        .db
-        .lock()
-        .record_account_usage_sync_failure(
-            "rl",
-            now - Duration::minutes(1),
-            2,
-            now + failure_backoff(2),
-        )
-        .unwrap();
-    schedule_after_inference_429(&state, "rl");
-    let sync = state
-        .db
-        .lock()
-        .account_usage_sync_state("rl")
-        .unwrap()
-        .unwrap();
-    assert_eq!(sync.failure_streak, 2);
-    assert_eq!(
-        sync.next_eligible_at,
-        Some(now + INFERENCE_429_DELAY_MIN),
-        "real inference 429 may intentionally pull earlier than failure backoff"
-    );
-
-    state.usage_sync.clear_test_seams();
-    drop(state);
-    let _ = std::fs::remove_dir_all(dir);
-}
-
 #[tokio::test]
 async fn goat_key_windows_are_independent_and_usage_failure_is_fail_soft() {
     let (dir, state) = test_state("goat-independent");
@@ -1669,7 +1582,6 @@ async fn goat_key_windows_are_independent_and_usage_failure_is_fail_soft() {
     assert_eq!(sync.last_attempt_at, None);
     assert_eq!(sync.next_eligible_at, None);
 
-    schedule_after_inference_429(&state, "goat-a");
     assert_eq!(
         state
             .db
@@ -1714,6 +1626,8 @@ struct FakeUsageInner {
     accounts: ParkingMutex<HashMap<String, Account>>,
     sync: ParkingMutex<HashMap<String, ProviderUsageSyncState>>,
     decrypts: ParkingMutex<HashMap<String, String>>,
+    /// How many times the refresh path announced rewritten preparation rows.
+    preparation_notes: AtomicUsize,
 }
 
 #[derive(Clone)]
@@ -1732,6 +1646,7 @@ impl FakeUsageHost {
                 accounts: ParkingMutex::new(HashMap::new()),
                 sync: ParkingMutex::new(HashMap::new()),
                 decrypts: ParkingMutex::new(HashMap::new()),
+                preparation_notes: AtomicUsize::new(0),
             }),
         }
     }
@@ -1799,6 +1714,11 @@ impl FakeUsageHost {
             self.settings_revision(),
             self.inner.process_generation,
         )
+    }
+
+    /// How many landed commits announced the preparation rows they rewrote.
+    fn preparation_notes(&self) -> usize {
+        self.inner.preparation_notes.load(AtomicOrdering::Acquire)
     }
 }
 
@@ -1897,7 +1817,12 @@ impl UsageSyncStore for FakeUsageInner {
         }
         Ok(())
     }
-    fn log_gateway(&self, _level: &str, _category: &str, _message: &str) -> anyhow::Result<()> {
+    fn log_program_event(
+        &self,
+        _level: &str,
+        _category: &str,
+        _message: &str,
+    ) -> anyhow::Result<()> {
         Ok(())
     }
 }
@@ -1936,6 +1861,13 @@ impl UsageSyncHost for FakeUsageHost {
         f(&self.inner)
     }
 
+    fn note_preparation_rows_changed(&self) {
+        self.inner
+            .preparation_notes
+            .fetch_add(1, AtomicOrdering::AcqRel);
+        self.bump_settings_revision();
+    }
+
     fn with_authorized_sync_store<F, R>(
         &self,
         authorization: &UsageSyncCommitAuthorization,
@@ -1962,26 +1894,6 @@ impl UsageSyncHost for FakeUsageHost {
     }
 }
 
-#[test]
-fn usage_sync_host_seam_schedules_inference_429_without_process_host() {
-    let host = FakeUsageHost::new();
-    host.insert_ready_go("acc-5", "sk-acc-5");
-    let now = fixed("2026-08-18T12:00:00Z");
-    host.usage_runtime().set_clock_for_test(move || now);
-    host.usage_runtime().set_jitter_for_test(|| 0.0);
-    host.inner
-        .sync
-        .lock()
-        .get_mut("acc-5")
-        .unwrap()
-        .next_eligible_at = Some(now + Duration::hours(20));
-
-    schedule_after_inference_429(&host, "acc-5");
-    let sync = host.inner.sync.lock().get("acc-5").cloned().unwrap();
-    assert_eq!(sync.next_eligible_at, Some(now + INFERENCE_429_DELAY_MIN));
-    assert_eq!(sync.failure_streak, 0);
-}
-
 #[tokio::test]
 async fn usage_sync_host_loop_exits_when_the_host_is_dropped() {
     let host = FakeUsageHost::new();
@@ -1999,4 +1911,292 @@ async fn usage_sync_host_loop_exits_when_the_host_is_dropped() {
         FakeUsageHost::upgrade(&weak).is_none(),
         "dropping the last host handle must end the scheduler lifetime"
     );
+}
+
+#[tokio::test]
+async fn authoritative_usage_replaces_exhaustion_but_preserves_temporary_cooldown() {
+    let (dir, state) = test_state("official-quota-evidence");
+    let mut account = ready_account(&state, "official-quota", "test-key");
+    let now = Utc::now();
+    account.cooldown_generic_until = Some(now + Duration::seconds(120));
+    account.cooldown_until = account.cooldown_generic_until;
+    state.db.lock().create_account(&account).unwrap();
+    state
+        .usage_sync
+        .set_fetch_for_test(|_, _| Box::pin(async { Ok(sample_snapshot()) }));
+    refresh_official_usage(&state, &account.id, UsageSyncTrigger::Scheduled)
+        .await
+        .unwrap();
+    let before = crate::db::quota_recovery::load_for_legacy_on(&state.db.lock().conn, &account.id)
+        .unwrap()
+        .unwrap()
+        .3
+        .unwrap();
+    assert_eq!(before.windows.len(), 1);
+    state
+        .usage_sync
+        .set_fetch_for_test(|_, _| Box::pin(async { Err(GoUsageError::Timeout) }));
+    assert!(
+        refresh_official_usage(&state, &account.id, UsageSyncTrigger::Scheduled)
+            .await
+            .is_err()
+    );
+    let after_failure =
+        crate::db::quota_recovery::load_for_legacy_on(&state.db.lock().conn, &account.id)
+            .unwrap()
+            .unwrap()
+            .3
+            .unwrap();
+    assert_eq!(
+        serde_json::to_value(&before).unwrap(),
+        serde_json::to_value(&after_failure).unwrap()
+    );
+    state.usage_sync.set_fetch_for_test(|_, _| {
+        Box::pin(async {
+            let mut snapshot = sample_snapshot();
+            snapshot.rolling_status = crate::go_usage::GoUsageWindowStatus::Ok;
+            Ok(snapshot)
+        })
+    });
+    refresh_official_usage(&state, &account.id, UsageSyncTrigger::Scheduled)
+        .await
+        .unwrap();
+    assert!(
+        crate::db::quota_recovery::load_for_legacy_on(&state.db.lock().conn, &account.id)
+            .unwrap()
+            .unwrap()
+            .3
+            .is_none()
+    );
+    assert_eq!(
+        state
+            .db
+            .lock()
+            .get_account(&account.id)
+            .unwrap()
+            .unwrap()
+            .cooldown_generic_until,
+        account.cooldown_generic_until
+    );
+    state.usage_sync.clear_test_seams();
+    drop(state);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// Official usage reconciliation rewrites `credentials.quota_recovery_json`,
+/// which the published preparation aggregate reads. Without invalidating that
+/// aggregate, a refreshed credential keeps routing against the exhaustion
+/// evidence the refresh just replaced — and, since nothing else here advances
+/// the revision, it keeps doing so until some unrelated writer happens to bump.
+#[tokio::test]
+async fn a_successful_usage_refresh_reaches_the_next_preparation_read() {
+    let (dir, state) = test_state("usage-reconcile-preparation");
+    let account = ready_account(&state, "reconciled", "test-key");
+    state.db.lock().create_account(&account).unwrap();
+    // The fixture writes its row directly, which is not a wired writer. Publish
+    // so the starting aggregate genuinely contains this credential rather than
+    // merely lacking it.
+    {
+        let _settings_update = state.settings_update.lock();
+        let db = state.db.lock();
+        state.publish_gateway_preparation(&db).unwrap();
+    }
+    {
+        let published = state.gateway_preparation().unwrap();
+        assert_eq!(published.revision(), state.settings_revision());
+        let credential = published
+            .routing()
+            .credentials
+            .iter()
+            .find(|credential| credential.id == account.id)
+            .expect("the fixture credential should be in the published routing rows");
+        assert_eq!(
+            credential.quota_recovery, None,
+            "the fixture starts with no recovery evidence, so a failure below can only come from the refresh"
+        );
+    }
+
+    state
+        .usage_sync
+        .set_fetch_for_test(|_, _| Box::pin(async { Ok(sample_snapshot()) }));
+    refresh_official_usage(&state, &account.id, UsageSyncTrigger::Scheduled)
+        .await
+        .expect("a successful refresh should commit");
+    assert!(
+        crate::db::quota_recovery::load_for_legacy_on(&state.db.lock().conn, &account.id)
+            .unwrap()
+            .unwrap()
+            .3
+            .is_some(),
+        "the refresh should have persisted the reconciled recovery row"
+    );
+
+    let published = state
+        .gateway_preparation()
+        .expect("the aggregate should rebuild after the refresh");
+    let credential = published
+        .routing()
+        .credentials
+        .iter()
+        .find(|credential| credential.id == account.id)
+        .expect("the fixture credential should still be in the published routing rows");
+    assert!(
+        credential.quota_recovery.is_some(),
+        "the reconciled recovery evidence must reach request preparation, not stay hidden in the database"
+    );
+    assert_eq!(
+        published.revision(),
+        state.settings_revision(),
+        "the rebuild must land on the current revision so later reads stay on the fast path"
+    );
+
+    drop(state);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// The commit the refresh path performs rewrites `credentials.quota_recovery_json`,
+/// which the published preparation aggregate reads. The host has to be told about
+/// that write from the same place that performs it, so a host whose commit lands
+/// must announce it — exactly once, from the landing and from nowhere else.
+#[tokio::test]
+async fn a_landed_commit_announces_the_preparation_rows_it_rewrote() {
+    let state = FakeUsageHost::new();
+    state.insert_ready_go("announced", "sk-announced");
+    let now = fixed("2026-08-18T12:00:00Z");
+    state.inner.runtime.set_clock_for_test(move || now);
+    state.inner.runtime.set_jitter_for_test(|| 0.0);
+    state
+        .inner
+        .runtime
+        .set_fetch_for_test(|_cfg, _key| Box::pin(async { Ok(sample_snapshot()) }));
+
+    assert_eq!(
+        state.preparation_notes(),
+        0,
+        "announcing is the commit path's job, so nothing before the refresh may announce"
+    );
+    refresh_official_usage(&state, "announced", UsageSyncTrigger::Scheduled)
+        .await
+        .expect("a successful refresh should commit");
+    assert_eq!(
+        state.preparation_notes(),
+        1,
+        "a landed commit rewrote quota recovery evidence, so it must announce that once"
+    );
+}
+
+/// The other half of the same contract: a commit that lands nothing must stay
+/// silent. The account or its key can change underneath a refresh, and then the
+/// guarded commit writes no row — announcing anyway would hand every later
+/// request a gated rebuild for rows nobody wrote.
+///
+/// The real store is what makes a landing observable, so this pins it there
+/// rather than on the fake host, whose commit seam never reports a no-op.
+#[tokio::test]
+async fn a_commit_that_lands_nothing_does_not_announce_preparation_rows() {
+    let (dir, state) = test_state("usage-unlanded-preparation");
+    let account = ready_account(&state, "unlanded", "test-key");
+    state.db.lock().create_account(&account).unwrap();
+    // Rotate the credential version while the fetch is in flight: the commit
+    // still matches the key cipher, but its version guard rejects the write.
+    let rotate = state.clone();
+    state.usage_sync.set_fetch_for_test(move |_, _| {
+        let rotate = rotate.clone();
+        Box::pin(async move {
+            rotate
+                .db
+                .lock()
+                .conn
+                .execute(
+                    "UPDATE credentials SET credential_version = credential_version + 1 WHERE legacy_account_id = 'unlanded'",
+                    [],
+                )
+                .unwrap();
+            Ok(sample_snapshot())
+        })
+    });
+
+    let revision = state.settings_revision();
+    assert!(matches!(
+        refresh_official_usage(&state, &account.id, UsageSyncTrigger::Scheduled).await,
+        Err(OfficialUsageRefreshError::Conflict(_))
+    ));
+    assert_eq!(
+        state.settings_revision(),
+        revision,
+        "a commit that wrote nothing must not invalidate the published preparation view"
+    );
+
+    state.usage_sync.clear_test_seams();
+    drop(state);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn changed_credential_version_with_same_cipher_rejects_usage_write() {
+    let (dir, state) = test_state("official-version-guard");
+    let account = ready_account(&state, "version-guard", "same-key");
+    state.db.lock().create_account(&account).unwrap();
+    let before = state
+        .db
+        .lock()
+        .account_usage_sync_state(&account.id)
+        .unwrap();
+    let mutate = state.clone();
+    state.usage_sync.set_fetch_for_test(move |_, _| {
+        let mutate = mutate.clone();
+        Box::pin(async move {
+            mutate.db.lock().conn.execute("UPDATE credentials SET credential_version = credential_version + 1 WHERE legacy_account_id = 'version-guard'", []).unwrap();
+            Ok(sample_snapshot())
+        })
+    });
+    assert!(matches!(
+        refresh_official_usage(&state, &account.id, UsageSyncTrigger::Inference429).await,
+        Err(OfficialUsageRefreshError::Conflict(_))
+    ));
+    assert!(
+        crate::db::quota_recovery::load_for_legacy_on(&state.db.lock().conn, &account.id)
+            .unwrap()
+            .unwrap()
+            .3
+            .is_none()
+    );
+    assert_eq!(
+        state
+            .db
+            .lock()
+            .account_usage_sync_state(&account.id)
+            .unwrap(),
+        before
+    );
+    state.usage_sync.clear_test_seams();
+    drop(state);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn first_reactive_attempt_creates_throttle_metadata_without_a_success() {
+    let (dir, state) = test_state("reactive-attempt-row");
+    let account = ready_account(&state, "first-reactive", "test-key");
+    state.db.lock().create_account(&account).unwrap();
+    let now = Utc::now();
+    {
+        let db = state.db.lock();
+        db.conn
+            .execute(
+                "DELETE FROM provider_usage_sync_state WHERE account_id = ?1",
+                [&account.id],
+            )
+            .unwrap();
+        db.touch_account_usage_sync_attempt(&account.id, now)
+            .unwrap();
+        let row = db.account_usage_sync_state(&account.id).unwrap().unwrap();
+        assert_eq!(
+            manual_next_allowed_at(row.last_attempt_at, now),
+            Some(now + MANUAL_THROTTLE)
+        );
+        assert!(row.last_success_at.is_none());
+    }
+    drop(state);
+    std::fs::remove_dir_all(dir).unwrap();
 }

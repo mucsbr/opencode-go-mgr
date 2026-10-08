@@ -4,16 +4,16 @@ import type {
   CpaModel,
   CpaOAuthProvider,
   CpaRuntime,
-  CpaRuntimeCheck,
   CpaRuntimeKey,
   CpaRuntimePhase,
 } from "../api/generated/dashboard-v3.ts";
+import type { MessageKey } from "../i18n/index.ts";
 
 /**
  * Pure state helpers for the CPA page. The external connection and the managed
  * installation are mutually exclusive modes derived from the integration flag
- * plus the runtime snapshot; every lifecycle control decision is a pure
- * function of (runtime, busy, last update check) so the view stays declarative.
+ * plus the runtime snapshot. Lifecycle eligibility comes from the server;
+ * this module applies local request gating and presentation only.
  */
 
 export type CpaRuntimeMode = "external" | "managed" | "unsupported";
@@ -54,30 +54,114 @@ export function cpaRuntimeMode(
   return managedSupported ? "managed" : "external";
 }
 
-/** A fresh supported host may install; an installed runtime must be OCG-owned. */
-export function cpaRuntimeLifecycleEditable(
-  runtime: Pick<CpaRuntime, "supported" | "owned" | "installed"> | null,
-): boolean {
-  return !!runtime && runtime.supported && (!runtime.installed || runtime.owned);
-}
-
 /** The Client Keys section exists only for an owned, installed managed runtime. */
 export function cpaClientKeysAvailable(
-  runtime: Pick<CpaRuntime, "supported" | "owned" | "installed"> | null,
+  runtime: Pick<CpaRuntime, "clientKeysAvailable"> | null,
 ): boolean {
-  return !!runtime && runtime.supported && runtime.owned && runtime.installed;
+  return runtime?.clientKeysAvailable === true;
 }
 
 /** Non-terminal phases reported while a lifecycle operation is in flight. */
-export const CPA_BUSY_PHASES: readonly CpaRuntimePhase[] = [
+const CPA_BUSY_PHASES: readonly CpaRuntimePhase[] = [
   "checking",
   "downloading",
   "installing",
   "starting",
 ];
 
-export function isCpaPhaseBusy(phase: CpaRuntimePhase): boolean {
-  return CPA_BUSY_PHASES.includes(phase);
+export function isCpaPhaseBusy(
+  phase: CpaRuntimePhase,
+): phase is Exclude<CpaRuntimePhase, "idle" | "failed"> {
+  return (CPA_BUSY_PHASES as readonly CpaRuntimePhase[]).includes(phase);
+}
+
+/**
+ * Operational status for the Accounts CPA pool card. Routing enablement stays
+ * on the existing Enabled tag; this is the managed process (or external
+ * connection) the pool actually talks to.
+ */
+export type CpaCardStatus =
+  | "checking"
+  | "downloading"
+  | "installing"
+  | "starting"
+  | "failed"
+  | "running"
+  | "stopped"
+  | "not_installed"
+  | "external";
+
+export const CPA_RUNTIME_PHASE_KEYS = {
+  idle: "空闲",
+  checking: "检查中",
+  downloading: "下载中",
+  installing: "安装中",
+  starting: "启动中",
+  failed: "失败",
+} as const satisfies Record<CpaRuntimePhase, MessageKey>;
+
+export const CPA_CARD_STATUS_KEYS = {
+  checking: "检查中",
+  downloading: "下载中",
+  installing: "安装中",
+  starting: "启动中",
+  failed: "失败",
+  running: "运行中",
+  stopped: "已停止",
+  not_installed: "未安装",
+  external: "外部连接",
+} as const satisfies Record<CpaCardStatus, MessageKey>;
+
+type CpaCardIntegration = Pick<
+  CpaIntegration,
+  "configured" | "runtimeOwned" | "runtimeRunning" | "installedVersion"
+>;
+type CpaCardRuntime = Pick<CpaRuntime, "installed" | "running" | "owned" | "phase">;
+
+/**
+ * Prefer an in-flight lifecycle phase. A managed install reports running /
+ * stopped; an external connection is not an OCG-owned process.
+ */
+export function cpaCardStatus(
+  integration: CpaCardIntegration | null,
+  runtime: CpaCardRuntime | null,
+): CpaCardStatus | null {
+  if (!integration) return null;
+  if (runtime && isCpaPhaseBusy(runtime.phase)) return runtime.phase;
+  if (runtime?.phase === "failed") return "failed";
+  const owned = integration.runtimeOwned || runtime?.owned === true;
+  if (owned) {
+    const installed = runtime?.installed ?? integration.installedVersion != null;
+    if (!installed) return "not_installed";
+    const running = runtime?.running ?? integration.runtimeRunning;
+    return running ? "running" : "stopped";
+  }
+  if (integration.configured) return "external";
+  return null;
+}
+
+export function cpaCardStatusTagType(
+  status: CpaCardStatus,
+): "success" | "warning" | "error" | "default" {
+  switch (status) {
+    case "running":
+      return "success";
+    case "failed":
+      return "error";
+    case "checking":
+    case "downloading":
+    case "installing":
+    case "starting":
+    case "not_installed":
+      return "warning";
+    default:
+      return "default";
+  }
+}
+
+/** A managed process that is not up yet should gray the Accounts pool card. */
+export function cpaCardProcessDown(status: CpaCardStatus | null | undefined): boolean {
+  return status != null && status !== "running" && status !== "external";
 }
 
 export type CpaRuntimeAction =
@@ -93,8 +177,6 @@ export type CpaRuntimeControlState = {
   runtime: CpaRuntime | null;
   /** A lifecycle request is in flight from this client. */
   busy: boolean;
-  /** Result of the last explicit check-update, if any. */
-  updateCheck: CpaRuntimeCheck | null;
 };
 
 const ALL_DISABLED: Record<CpaRuntimeAction, boolean> = {
@@ -108,24 +190,19 @@ const ALL_DISABLED: Record<CpaRuntimeAction, boolean> = {
 };
 
 /**
- * Control-availability matrix. Everything is disabled while any operation is
- * in flight (local request or a busy backend phase), on unsupported runtimes,
- * and on runtimes OCG does not own. `update` additionally requires a fresh check that
- * reported an available version, because its `expectedVersion` comes from it.
+ * Server eligibility with local request gating. A stale local update-check
+ * result never overrides the current runtime's actions.
  */
 export function cpaRuntimeControls(state: CpaRuntimeControlState): Record<CpaRuntimeAction, boolean> {
-  const { runtime, busy, updateCheck } = state;
-  if (!runtime || busy || isCpaPhaseBusy(runtime.phase)) return { ...ALL_DISABLED };
-  if (!cpaRuntimeLifecycleEditable(runtime)) return { ...ALL_DISABLED };
-  return {
-    install: !runtime.installed,
-    start: runtime.installed && !runtime.running,
-    stop: runtime.installed && runtime.running,
-    checkUpdate: true,
-    update: runtime.installed && updateCheck?.updateAvailable === true,
-    rollback: runtime.installed && !!runtime.previousVersion,
-    remove: runtime.installed,
-  };
+  const { runtime, busy } = state;
+  return !runtime || busy ? { ...ALL_DISABLED } : { ...runtime.actions };
+}
+
+/** Owned install with persisted run intent will restore on the next OCG process start. */
+export function cpaStartupRestorePending(
+  runtime: Pick<CpaRuntime, "startupRestorePending"> | null,
+): boolean {
+  return runtime?.startupRestorePending === true;
 }
 
 /** Client-side bound for the rendered log tail; the backend tail is bounded too. */
@@ -156,22 +233,29 @@ export function partitionCpaRuntimeKeys(keys: readonly CpaRuntimeKey[]): CpaRunt
   return { protectedKeys, directKeys };
 }
 
-export type CpaCatalogGroup = {
+export type CpaCatalogRow = {
+  id: string;
+  ownedBy?: string | null;
+};
+
+export type CpaCatalogGroup<T extends CpaCatalogRow = CpaModel> = {
   source: string;
-  models: CpaModel[];
+  models: T[];
 };
 
 /** Group the persisted CPA snapshot by CPA-reported `ownedBy`, unknown last. */
-export function groupCpaCatalogModels(models: readonly CpaModel[]): CpaCatalogGroup[] {
-  const groups = new Map<string, CpaModel[]>();
+export function groupCpaCatalogModels<T extends CpaCatalogRow>(
+  models: readonly T[],
+): CpaCatalogGroup<T>[] {
+  const groups = new Map<string, T[]>();
   for (const model of models) {
     const source = model.ownedBy?.trim() ?? "";
     const rows = groups.get(source);
     if (rows) rows.push(model);
     else groups.set(source, [model]);
   }
-  const known: CpaCatalogGroup[] = [];
-  let unknown: CpaCatalogGroup | null = null;
+  const known: CpaCatalogGroup<T>[] = [];
+  let unknown: CpaCatalogGroup<T> | null = null;
   for (const [source, rows] of groups) {
     rows.sort((left, right) => left.id.localeCompare(right.id));
     const group = { source, models: rows };
@@ -187,14 +271,30 @@ export function cpaAccountKey(account: Pick<CpaAccount, "name" | "authIndex">): 
   return `${account.name}:${account.authIndex ?? ""}`;
 }
 
-/** Quota payloads are opaque (`any`); render scalars directly and JSON otherwise. */
-export function formatCpaQuota(value: unknown): string {
-  if (typeof value === "string" || typeof value === "number") return String(value);
-  if (value === null || value === undefined) return "—";
+function isVacuousCpaQuota(value: unknown, seen = new WeakSet<object>()): boolean {
+  if (value === null || value === undefined) return true;
+  if (typeof value === "string") return value.trim() === "";
+  if (typeof value === "number") return !Number.isFinite(value);
+  if (typeof value !== "object") return true;
+  if (seen.has(value)) return true;
+  seen.add(value);
+  if (Array.isArray(value)) return value.length === 0 || value.every((item) => isVacuousCpaQuota(item, seen));
+  const entries = Object.values(value as Record<string, unknown>);
+  return entries.length === 0 || entries.every((item) => isVacuousCpaQuota(item, seen));
+}
+
+/**
+ * Quota payloads are opaque CPA trackers. Hide empty `{ signals: {} }` shells;
+ * render scalars directly and JSON otherwise.
+ */
+export function formatCpaQuota(value: unknown): string | null {
+  if (isVacuousCpaQuota(value)) return null;
+  if (typeof value === "string") return value.trim();
+  if (typeof value === "number") return String(value);
   try {
-    return JSON.stringify(value) ?? "—";
+    return JSON.stringify(value);
   } catch {
-    return "—";
+    return null;
   }
 }
 
@@ -206,6 +306,35 @@ export const CPA_OAUTH_PROVIDERS: ReadonlyArray<{ id: CpaOAuthProvider; label: s
   { id: "kimi", label: "Kimi" },
   { id: "xai", label: "xAI" },
 ];
+
+/**
+ * CPA account filename token for a CLI import. Anthropic logins are stored as
+ * `claude`; every other OAuth provider keeps its id.
+ */
+export function cpaCliImportFilenameToken(provider: CpaOAuthProvider): string {
+  return provider === "anthropic" ? "claude" : provider;
+}
+
+/** True when a CPA account was created by importing this provider's local CLI. */
+export function cpaCliImportAlreadyPresent(
+  provider: CpaOAuthProvider,
+  accounts: readonly Pick<CpaAccount, "name">[],
+): boolean {
+  const prefix = `ocg-cli-${cpaCliImportFilenameToken(provider)}-`.toLowerCase();
+  return accounts.some((account) => account.name.toLowerCase().startsWith(prefix));
+}
+
+/** Reverse of `cpaCliImportAlreadyPresent` for the account being deleted. */
+export function cpaOAuthProviderForCliAccount(
+  account: Pick<CpaAccount, "name">,
+): CpaOAuthProvider | null {
+  const name = account.name.toLowerCase();
+  for (const { id } of CPA_OAUTH_PROVIDERS) {
+    const prefix = `ocg-cli-${cpaCliImportFilenameToken(id)}-`.toLowerCase();
+    if (name.startsWith(prefix)) return id;
+  }
+  return null;
+}
 
 const CPA_OAUTH_TERMINAL_STATUSES = ["ok", "completed", "success", "cancelled", "failed", "expired", "error"];
 const CPA_OAUTH_SUCCESS_STATUSES = ["ok", "success", "completed"];

@@ -13,6 +13,8 @@ use crate::ids::{
     KIMI_PROVIDER_ID, MINIMAX_PROVIDER_ID, OLLAMA_PROVIDER_ID, OPENCODE_PROVIDER_ID,
     OPENCODE_ZEN_FREE_PROVIDER_ID, ZEN_FREE_ACCOUNT_ID,
 };
+#[cfg(feature = "schemars")]
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
@@ -30,8 +32,11 @@ pub const COMMAND_CODE_GOAT_BASE_URL: &str = "https://api.commandcode.ai/provide
 pub const COMMAND_CODE_GOAT_HOST: &str = "api.commandcode.ai";
 /// Relative to [`COMMAND_CODE_GOAT_BASE_URL`].
 pub const COMMAND_CODE_GOAT_CHAT_COMPLETIONS_PATH: &str = "/chat/completions";
+/// Relative to [`COMMAND_CODE_GOAT_BASE_URL`]. Catalog `supported_endpoints`
+/// decide which models actually serve this path.
+pub const COMMAND_CODE_GOAT_RESPONSES_PATH: &str = "/responses";
 /// Relative to [`COMMAND_CODE_GOAT_BASE_URL`]. Anthropic models use this path;
-/// OpenAI and open-source models use Chat Completions.
+/// OpenAI and open-source models use Chat Completions and, when listed, Responses.
 pub const COMMAND_CODE_GOAT_MESSAGES_PATH: &str = "/messages";
 /// Official public GET `/models` discovery path used for Provider catalog refresh.
 pub const COMMAND_CODE_GOAT_MODELS_PATH: &str = "/models";
@@ -50,9 +55,10 @@ pub const MAX_COMMAND_CODE_MODELS_CATALOG: usize = 1_000;
 
 /// Official MiniMax CN Token Plan endpoints. The Plan Key is sent as Bearer
 /// auth to catalog, Chat, and Messages surfaces; redirects stay disabled.
-pub const MINIMAX_CN_BASE_URL: &str = "https://api.minimaxi.com/v1";
+pub const MINIMAX_CN_BASE_URL: &str = "https://api.minimax.cn/v1";
 pub const MINIMAX_CN_CHAT_COMPLETIONS_PATH: &str = "/chat/completions";
-pub const MINIMAX_CN_ANTHROPIC_BASE_URL: &str = "https://api.minimaxi.com/anthropic";
+pub const MINIMAX_CN_RESPONSES_PATH: &str = "/responses";
+pub const MINIMAX_CN_ANTHROPIC_BASE_URL: &str = "https://api.minimax.cn/anthropic";
 pub const MINIMAX_CN_MESSAGES_PATH: &str = "/v1/messages";
 pub const MINIMAX_CN_MODELS_PATH: &str = "/models";
 pub const MINIMAX_CN_USAGE_URL: &str = "https://api.minimaxi.com/v1/token_plan/remains";
@@ -117,15 +123,19 @@ impl OllamaBillingTier {
     }
 }
 
-/// Models included by the GOAT subscription page. These are the default-on
-/// rows in the Provider model/protocol matrix. Models discovered beyond this
-/// preset remain visible but default off until an administrator enables them.
+/// Models included by the GOAT subscription page as of 2026-09-24. These
+/// are the default-on rows in the first Provider model/protocol snapshot.
+/// Later newly discovered rows use official catalog evidence and preserve
+/// saved operator switches.
 pub const COMMAND_CODE_GOAT_INCLUDED_MODEL_IDS: &[&str] = &[
     "gpt-5.6-sol",
     "gpt-5.6-luna",
+    "gpt-6-luna",
     "deepseek/deepseek-v4-pro",
     "deepseek/deepseek-v4-flash",
     "deepseek/deepseek-v4-flash-vision-exp",
+    "deepseek/deepseek-v4-flash-fast",
+    "deepseek/deepseek-v4.1-flash",
     "moonshotai/Kimi-K3",
     "moonshotai/Kimi-K2.7-Code",
     "moonshotai/Kimi-K2.7-Code-Highspeed",
@@ -136,13 +146,21 @@ pub const COMMAND_CODE_GOAT_INCLUDED_MODEL_IDS: &[&str] = &[
     "zai-org/GLM-5.2-Fast",
     "zai-org/GLM-5.1",
     "zai-org/GLM-5",
+    "z-ai/glm-5.3-flashx",
+    "z-ai/glm-5.3-flash",
     "MiniMaxAI/MiniMax-M3",
     "MiniMaxAI/MiniMax-M2.7",
     "MiniMaxAI/MiniMax-M2.5",
     "xiaomi/mimo-v2.5-pro",
     "xiaomi/mimo-v2.5",
+    "xiaomi/mimo-v2.6-flash",
+    "xiaomi/mimo-v2.6-pro",
+    "xiaomi/mimo-v2.6-pro-ultraspeed",
     "Qwen/Qwen3.8-Max",
     "Qwen/Qwen3.8-27B",
+    "Qwen/Qwen3.8-Omni-Flash",
+    "Qwen/Qwen3.8-Max-0902",
+    "Qwen/Qwen3.8-Flash",
     "Qwen/Qwen3.7-Max",
     "Qwen/Qwen3.7-Plus",
     "Qwen/Qwen3.7-Flash",
@@ -150,17 +168,26 @@ pub const COMMAND_CODE_GOAT_INCLUDED_MODEL_IDS: &[&str] = &[
     "Qwen/Qwen3.6-Plus",
     "stepfun/Step-3.7-Flash",
     "stepfun/Step-3.5-Flash",
+    "stepfun/Step-5-Preview",
     "tencent/hy3-paid",
     "google/gemini-3.7-flash",
+    "google/gemini-3.8-flash",
+    "tencent/hy4-preview",
+    "meituan/LongCat-2.0",
+    "inclusionai/ling-3.0-flash-sante:free",
     "nvidia/nemotron-3-ultra-550b-a55b",
     "thinkingmachines/inkling",
     "thinkingmachines/inkling-small",
-    "stealth/ox-alpha",
+    "stealth/space-bunny-alpha",
+    "typesafe/jev",
     "poolside/laguna-s-2.1-free",
     "meta/muse-spark-1.2",
     "meta/muse-spark-1.2-contributor",
+    "meta/muse-spark-1.3",
+    "meta/muse-spark-1.3-contributor",
     "xai/grok-4.5",
     "xai/grok-4.6",
+    "xai/grok-4.7",
 ];
 
 pub fn command_code_goat_includes_model(model_id: &str) -> bool {
@@ -276,7 +303,8 @@ pub const PROTOCOL_FALLBACK_CHAT_RESPONSES_MESSAGES: &[UpstreamProtocolKind] = &
 pub const OPENCODE_CONSTRUCTABLE_PROTOCOLS: &[UpstreamProtocolKind] =
     PROTOCOL_FALLBACK_CHAT_RESPONSES_MESSAGES;
 
-/// Command Code documented surfaces have no Responses path.
+/// Command Code and MiniMax CN share Chat+Messages as a two-protocol ceiling
+/// for adapters that do not expose Responses.
 pub const PROTOCOL_FALLBACK_CHAT_MESSAGES: &[UpstreamProtocolKind] = &[
     UpstreamProtocolKind::ChatCompletions,
     UpstreamProtocolKind::Messages,
@@ -408,12 +436,18 @@ const GO_PROTOCOLS: [UpstreamProtocolKind; 3] = [
     UpstreamProtocolKind::Responses,
     UpstreamProtocolKind::Messages,
 ];
-const GOAT_PROTOCOLS: [UpstreamProtocolKind; 2] = [
+const GOAT_PROTOCOLS: [UpstreamProtocolKind; 3] = [
     UpstreamProtocolKind::ChatCompletions,
+    UpstreamProtocolKind::Responses,
     UpstreamProtocolKind::Messages,
 ];
 const CHAT_MESSAGES_PROTOCOLS: [UpstreamProtocolKind; 2] = [
     UpstreamProtocolKind::ChatCompletions,
+    UpstreamProtocolKind::Messages,
+];
+const MINIMAX_CN_PROTOCOLS: [UpstreamProtocolKind; 3] = [
+    UpstreamProtocolKind::ChatCompletions,
+    UpstreamProtocolKind::Responses,
     UpstreamProtocolKind::Messages,
 ];
 const CHAT_PROTOCOLS: [UpstreamProtocolKind; 1] = [UpstreamProtocolKind::ChatCompletions];
@@ -441,7 +475,7 @@ pub const BUILTIN_PROVIDERS: [BuiltinProvider; 8] = [
         managed_registration: true,
         pricing_availability: "available",
         usage_availability: "available",
-        manual_usage_calibration: false,
+        manual_usage_calibration: true,
         quota_unit: "usd",
         model_source: "builtin_go_protocol_table",
         key_prefix: None,
@@ -492,7 +526,7 @@ pub const BUILTIN_PROVIDERS: [BuiltinProvider; 8] = [
         routable: true,
         managed_registration: false,
         pricing_availability: "available",
-        usage_availability: "local_state",
+        usage_availability: "available",
         manual_usage_calibration: true,
         quota_unit: "usd",
         model_source: COMMAND_CODE_GOAT_MODEL_SOURCE,
@@ -523,7 +557,7 @@ pub const BUILTIN_PROVIDERS: [BuiltinProvider; 8] = [
         model_source: MINIMAX_CN_MODEL_SOURCE,
         key_prefix: Some("sk-cp"),
         auth_schemes: &BEARER_AUTH,
-        upstream_protocols: &CHAT_MESSAGES_PROTOCOLS,
+        upstream_protocols: &MINIMAX_CN_PROTOCOLS,
         form_fields: &MINIMAX_CN_FORM_FIELDS,
     },
     BuiltinProvider {
@@ -629,6 +663,94 @@ pub const BUILTIN_PROVIDERS: [BuiltinProvider; 8] = [
         form_fields: &[],
     },
 ];
+
+include!(concat!(env!("OUT_DIR"), "/preset_offerings.rs"));
+
+/// Resolve the persisted `offering` for a dynamic Provider that carries a
+/// `preset_id`. The table is generated at build time from
+/// `resources/provider-presets.json`. Plan-offering presets map to `"plan"`;
+/// missing, unknown, or empty ids map to `"api"`. Builtin adapters do not
+/// consume this.
+pub fn preset_offering(preset_id: &str) -> &'static str {
+    let trimmed = preset_id.trim();
+    if trimmed.is_empty() {
+        return "api";
+    }
+    PRESET_OFFERINGS
+        .iter()
+        .find(|(id, _)| *id == trimmed)
+        .map(|(_, offering)| *offering)
+        .unwrap_or("api")
+}
+
+/// Sealed offering for builtin adapters: paid families are Plans, free and
+/// account-owned surfaces are API. Point-in-time mirror of the v42 seed.
+pub fn builtin_offering(provider_id: &str) -> &'static str {
+    match provider_id {
+        OPENCODE_PROVIDER_ID
+        | COMMAND_CODE_PROVIDER_ID
+        | MINIMAX_PROVIDER_ID
+        | KIMI_PROVIDER_ID
+        | OLLAMA_PROVIDER_ID => "plan",
+        _ => "api",
+    }
+}
+
+/// Provenance of a row in the unified `providers` table. The column is
+/// additive in v42 and never feeds routing decisions: builtin adapters stay
+/// sealed, and dynamic rows keep their `ConfigurableHttp` adapter path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+#[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "schemars", schemars(rename_all = "snake_case"))]
+pub enum ProviderOrigin {
+    Builtin,
+    Preset,
+    Custom,
+}
+
+impl ProviderOrigin {
+    pub const ALL: [Self; 3] = [Self::Builtin, Self::Preset, Self::Custom];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Builtin => "builtin",
+            Self::Preset => "preset",
+            Self::Custom => "custom",
+        }
+    }
+}
+
+impl fmt::Display for ProviderOrigin {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl TryFrom<&str> for ProviderOrigin {
+    type Error = ProviderBindingError;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "builtin" => Ok(Self::Builtin),
+            "preset" => Ok(Self::Preset),
+            "custom" => Ok(Self::Custom),
+            other => Err(ProviderBindingError::UnknownUpstreamProtocol(
+                other.to_string(),
+            )),
+        }
+    }
+}
+
+/// Resolve the persisted `origin` for a dynamic Provider. Preset-bearing rows
+/// are `preset`; manual rows are `custom`. Builtin rows are never constructed
+/// through this path.
+pub fn provider_origin_from_preset(preset_id: Option<&str>) -> ProviderOrigin {
+    match preset_id {
+        Some(value) if !value.trim().is_empty() => ProviderOrigin::Preset,
+        _ => ProviderOrigin::Custom,
+    }
+}
 
 pub fn default_provider_id() -> String {
     OPENCODE_PROVIDER_ID.to_string()
@@ -804,6 +926,10 @@ impl ProviderRegistry {
         Some(ProviderDescriptor::from_plan(kind, plan))
     }
 
+    pub fn get_by_kind(kind: ProviderAdapterKind) -> Option<ProviderDescriptor> {
+        Self::iter().find(|descriptor| descriptor.kind == kind)
+    }
+
     pub fn iter() -> impl Iterator<Item = ProviderDescriptor> {
         BUILTIN_PROVIDERS
             .iter()
@@ -937,8 +1063,9 @@ pub enum ProtocolMatrixKind {
 pub enum StructuralProbeCeiling {
     /// This adapter does not expose provider-scoped request-path probes.
     Unavailable,
-    /// Command Code GOAT has both route families, while each model's sealed
-    /// family rule selects the one path worth probing.
+    /// Command Code GOAT documents Chat, Responses, and Messages paths.
+    /// Per-model enablement still comes from catalog `supported_endpoints`
+    /// and persisted enabled protocols, not this ceiling.
     CommandCodeConstructable,
     /// This sealed provider exposes exactly the listed documented paths.
     Fixed(&'static [UpstreamProtocolKind]),
@@ -954,7 +1081,6 @@ pub enum StructuralProbeCeiling {
 pub struct ProtocolProbeDescriptor {
     pub request_path_may_trial: bool,
     pub matrix: ProtocolMatrixKind,
-    pub unknown_zen_free_defaults_to_chat: bool,
     pub fallback_priority: &'static [UpstreamProtocolKind],
     /// Dedicated admin probe surface. Request paths must stay false.
     pub explicit_probe: bool,
@@ -997,6 +1123,7 @@ pub struct UsageDescriptor {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PricingDescriptor {
     pub availability: &'static str,
+    pub multiplier_editable: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1041,6 +1168,10 @@ impl ProviderAdapterKind {
 fn catalog_pricing(plan: BuiltinProvider) -> PricingDescriptor {
     PricingDescriptor {
         availability: plan.pricing_availability,
+        multiplier_editable: matches!(
+            plan.provider_id,
+            OPENCODE_PROVIDER_ID | COMMAND_CODE_PROVIDER_ID
+        ),
     }
 }
 
@@ -1068,7 +1199,6 @@ fn open_code_go_capabilities(plan: BuiltinProvider) -> ProviderCapabilities {
         protocol_probe: ProtocolProbeDescriptor {
             request_path_may_trial: false,
             matrix: ProtocolMatrixKind::OpenCodeModelProtocols,
-            unknown_zen_free_defaults_to_chat: false,
             fallback_priority: PROTOCOL_FALLBACK_CHAT_RESPONSES_MESSAGES,
             explicit_probe: true,
             structural_ceiling: StructuralProbeCeiling::OpenCodeConstructable,
@@ -1133,7 +1263,6 @@ fn zen_free_capabilities(plan: BuiltinProvider) -> ProviderCapabilities {
         protocol_probe: ProtocolProbeDescriptor {
             request_path_may_trial: false,
             matrix: ProtocolMatrixKind::OpenCodeModelProtocols,
-            unknown_zen_free_defaults_to_chat: true,
             fallback_priority: PROTOCOL_FALLBACK_CHAT_RESPONSES_MESSAGES,
             explicit_probe: true,
             structural_ceiling: StructuralProbeCeiling::ZenFreeConstructable,
@@ -1198,8 +1327,7 @@ fn command_code_goat_capabilities(plan: BuiltinProvider) -> ProviderCapabilities
         protocol_probe: ProtocolProbeDescriptor {
             request_path_may_trial: false,
             matrix: ProtocolMatrixKind::CommandCodeNative,
-            unknown_zen_free_defaults_to_chat: false,
-            fallback_priority: PROTOCOL_FALLBACK_CHAT_MESSAGES,
+            fallback_priority: PROTOCOL_FALLBACK_CHAT_RESPONSES_MESSAGES,
             explicit_probe: true,
             structural_ceiling: StructuralProbeCeiling::CommandCodeConstructable,
         },
@@ -1263,10 +1391,9 @@ fn minimax_cn_capabilities(plan: BuiltinProvider) -> ProviderCapabilities {
         protocol_probe: ProtocolProbeDescriptor {
             request_path_may_trial: false,
             matrix: ProtocolMatrixKind::FixedProviderProtocols,
-            unknown_zen_free_defaults_to_chat: false,
-            fallback_priority: &CHAT_MESSAGES_PROTOCOLS,
+            fallback_priority: &MINIMAX_CN_PROTOCOLS,
             explicit_probe: true,
-            structural_ceiling: StructuralProbeCeiling::Fixed(&CHAT_MESSAGES_PROTOCOLS),
+            structural_ceiling: StructuralProbeCeiling::Fixed(&MINIMAX_CN_PROTOCOLS),
         },
         verification: VerificationDescriptor {
             policy: plan.verification_policy,
@@ -1328,7 +1455,6 @@ fn ollama_cloud_capabilities(plan: BuiltinProvider) -> ProviderCapabilities {
         protocol_probe: ProtocolProbeDescriptor {
             request_path_may_trial: false,
             matrix: ProtocolMatrixKind::FixedProviderProtocols,
-            unknown_zen_free_defaults_to_chat: false,
             fallback_priority: &CHAT_PROTOCOLS,
             explicit_probe: false,
             structural_ceiling: StructuralProbeCeiling::Unavailable,
@@ -1393,7 +1519,6 @@ fn kimi_cn_capabilities(plan: BuiltinProvider) -> ProviderCapabilities {
         protocol_probe: ProtocolProbeDescriptor {
             request_path_may_trial: false,
             matrix: ProtocolMatrixKind::FixedProviderProtocols,
-            unknown_zen_free_defaults_to_chat: false,
             fallback_priority: &CHAT_MESSAGES_PROTOCOLS,
             explicit_probe: true,
             structural_ceiling: StructuralProbeCeiling::Fixed(&CHAT_MESSAGES_PROTOCOLS),
@@ -1458,7 +1583,6 @@ fn configurable_http_capabilities(plan: BuiltinProvider) -> ProviderCapabilities
         protocol_probe: ProtocolProbeDescriptor {
             request_path_may_trial: false,
             matrix: ProtocolMatrixKind::AccountDeclaredProtocol,
-            unknown_zen_free_defaults_to_chat: false,
             fallback_priority: PROTOCOL_FALLBACK_CHAT_RESPONSES_MESSAGES,
             explicit_probe: false,
             structural_ceiling: StructuralProbeCeiling::Unavailable,
@@ -1525,7 +1649,6 @@ fn cpa_capabilities(plan: BuiltinProvider) -> ProviderCapabilities {
         protocol_probe: ProtocolProbeDescriptor {
             request_path_may_trial: false,
             matrix: ProtocolMatrixKind::FixedStandardProtocols,
-            unknown_zen_free_defaults_to_chat: false,
             fallback_priority: PROTOCOL_FALLBACK_CHAT_RESPONSES_MESSAGES,
             explicit_probe: false,
             structural_ceiling: StructuralProbeCeiling::Unavailable,

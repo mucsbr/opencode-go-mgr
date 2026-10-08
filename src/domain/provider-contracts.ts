@@ -6,15 +6,14 @@ import type {
   CustomEndpointContract,
   EffectiveCatalog,
   EffectiveModelContract,
+  ModelProtocolOverrideUpdate,
   ProviderAccountChoice,
   ProviderCatalogEntry,
   ProviderContractsResponse,
   ProviderProtocol,
 } from "../api/providers.ts";
 import {
-  planFamilyLabel,
-  planForAccount,
-  PLAN_DEFINITIONS,
+  findCatalogEntry,
 } from "./plans.ts";
 
 export const PROVIDER_PROTOCOLS: readonly ProviderProtocol[] = [
@@ -30,6 +29,22 @@ export function modelProtocolOverrideKey(
   protocol: ProviderProtocol,
 ): string {
   return JSON.stringify([scopeKind, scopeId, modelId, protocol]);
+}
+
+/**
+ * The single protocol a built-in row connection test submits: the preferred
+ * protocol when its effective state is enabled, otherwise the first enabled
+ * fallback. Null when nothing is enabled — no blind multi-protocol scan.
+ */
+export function effectiveModelTestProtocol(
+  model: Pick<EffectiveModelContract, "preferred_protocol" | "protocols"> | undefined,
+): ProviderProtocol | null {
+  if (!model) return null;
+  if (model.protocols[model.preferred_protocol]?.enabled) return model.preferred_protocol;
+  for (const protocol of PROVIDER_PROTOCOLS) {
+    if (model.protocols[protocol]?.enabled) return protocol;
+  }
+  return null;
 }
 
 export const CATALOG_SOURCE_STATIC = "static";
@@ -54,7 +69,6 @@ export interface ProviderScopeView {
   accounts: ProviderAccountChoice[];
   catalog: EffectiveCatalog;
   models: ProviderModelContract[];
-  pricing: CapabilitySummary;
   usage: CapabilitySummary;
   card: CardCapabilitySummary;
   catalog_routable: boolean;
@@ -66,6 +80,8 @@ export interface ProviderScopeView {
 /** Provider rows may publish a stable client Alias alongside their raw upstream id. */
 export type ProviderModelContract = EffectiveModelContract & {
   alias?: string;
+  /** Extra identity shown under the alias; HTTP uses the upstream model. */
+  secondary?: string;
 };
 
 export function providerScopeKey(scopeKind: string, scopeId: string): string {
@@ -77,8 +93,7 @@ export function findAccountScopeView(
   scopes: readonly ProviderScopeView[],
   account: Pick<Account, "id" | "provider_id">,
 ): ProviderScopeView | undefined {
-  const plan = planForAccount(account);
-  if (plan?.kind === "custom") {
+  if (account.provider_id === "custom") {
     return scopes.find((scope) => (
       scope.scope_kind === "custom_endpoint" && scope.scope_id === account.id
     ));
@@ -87,6 +102,179 @@ export function findAccountScopeView(
     scope.scope_kind === "provider"
     && scope.provider_id === account.provider_id
   ));
+}
+
+/** Protocols the contract marks available for this model. */
+export function modelAvailableProtocols(
+  model: ProviderModelContract,
+): ProviderProtocol[] {
+  return PROVIDER_PROTOCOLS.filter((protocol) => (
+    model.protocols[protocol]?.available === true
+  ));
+}
+
+/**
+ * The protocol whose row switch should read ON: the enabled preferred
+ * protocol, then the first enabled fallback. When any protocol is actually
+ * enabled the UI must never present the row as off, so this always wins over
+ * available-but-disabled evidence.
+ */
+function modelEnabledTarget(model: ProviderModelContract): ProviderProtocol | null {
+  const preferred = model.preferred_protocol;
+  if (preferred && model.protocols[preferred]?.enabled) return preferred;
+  for (const protocol of PROVIDER_PROTOCOLS) {
+    if (model.protocols[protocol]?.enabled) return protocol;
+  }
+  return null;
+}
+
+/**
+ * The protocol shown while the row is off: the available preferred protocol,
+ * then the first available fallback. Null when the model has no protocol
+ * evidence at all (the row stays disabled).
+ */
+function modelAvailableTarget(model: ProviderModelContract): ProviderProtocol | null {
+  const preferred = model.preferred_protocol;
+  if (preferred && model.protocols[preferred]?.available) return preferred;
+  for (const protocol of PROVIDER_PROTOCOLS) {
+    if (model.protocols[protocol]?.available) return protocol;
+  }
+  return null;
+}
+
+export function modelTargetProtocol(
+  model: ProviderModelContract,
+  _scope: ProviderScopeView,
+): ProviderProtocol | null {
+  const enabled = modelEnabledTarget(model);
+  if (enabled) return enabled;
+  if (model.preferred_protocol && model.protocols[model.preferred_protocol]?.available) {
+    return model.preferred_protocol;
+  }
+  return modelAvailableTarget(model);
+}
+
+/**
+ * Whether any protocol is enabled. The allow-routing switch binds to this.
+ */
+export function modelEffectiveOn(
+  model: ProviderModelContract,
+  _scope?: ProviderScopeView,
+): boolean {
+  return PROVIDER_PROTOCOLS.some((protocol) => model.protocols[protocol]?.enabled === true);
+}
+
+/**
+ * The protocols an override batch may legally write for one model. Built-in
+ * provider scopes accept exactly the model's non-null protocol evidence rows
+ * (a CN model's Responses slot is null and absent, so it is never written);
+ * Custom endpoint contracts retain all three rows but only the declared
+ * (available) ones are writable. The backend validator rejects anything
+ * outside this ceiling — even `force_off` — so batches must never exceed it.
+ * Filtering is by writability, never by enabled state, so a fully disabled
+ * row stays re-enableable.
+ */
+function modelWritableProtocols(
+  model: ProviderModelContract,
+  scope: ProviderScopeView,
+): ProviderProtocol[] {
+  return PROVIDER_PROTOCOLS.filter((protocol) => (
+    scope.scope_kind === "custom_endpoint"
+      ? model.protocols[protocol]?.available === true
+      : model.protocols[protocol] !== undefined
+  ));
+}
+
+/**
+ * Build the override batch that toggles each model in `modelIds` fully on or
+ * fully off, touching only the model's legal writable protocols (see
+ * {@link modelWritableProtocols}).
+ *
+ * on=true force-enables every available protocol and never force-disables
+ * siblings — never `auto` on the enabled set, because under `auto` GOAT
+ * extras stay off. on=false force-disables every writable protocol and
+ * stamps `preferred: true` on the current preferred so the choice survives.
+ */
+export function buildModelToggleOverrides(
+  scope: ProviderScopeView,
+  modelIds: readonly string[],
+  on: boolean,
+): ModelProtocolOverrideUpdate[] {
+  const overrides: ModelProtocolOverrideUpdate[] = [];
+  for (const modelId of modelIds) {
+    const model = scope.models.find((entry) => entry.model_id === modelId);
+    if (!model) continue;
+    const writable = modelWritableProtocols(model, scope);
+    if (writable.length === 0) continue;
+    if (!on) {
+      const preferred = scope.scope_kind === "provider"
+        ? modelPreferredStamp(model, writable)
+        : null;
+      for (const protocol of writable) {
+        overrides.push({
+          model_id: modelId,
+          protocol,
+          state: "force_off",
+          ...(preferred === protocol ? { preferred: true } : {}),
+        });
+      }
+      continue;
+    }
+    const available = modelAvailableProtocols(model).filter((protocol) => (
+      writable.includes(protocol)
+    ));
+    if (available.length === 0) continue;
+    for (const protocol of available) {
+      overrides.push({
+        model_id: modelId,
+        protocol,
+        state: "force_on",
+      });
+    }
+  }
+  return overrides;
+}
+
+function modelPreferredStamp(
+  model: ProviderModelContract,
+  writable: readonly ProviderProtocol[],
+): ProviderProtocol | null {
+  if (model.preferred_protocol && writable.includes(model.preferred_protocol)) {
+    return model.preferred_protocol;
+  }
+  return modelAvailableTarget(model);
+}
+
+/**
+ * Persist the conversion default. When the row is on, the chosen protocol is
+ * force-enabled and siblings are left alone. When the row is off, every
+ * writable protocol stays force_off and only the choice is stored.
+ */
+export function buildPreferredProtocolOverrides(
+  scope: ProviderScopeView,
+  modelId: string,
+  protocol: ProviderProtocol,
+): ModelProtocolOverrideUpdate[] {
+  const model = scope.models.find((entry) => entry.model_id === modelId);
+  if (!model) return [];
+  const available = modelAvailableProtocols(model);
+  if (!available.includes(protocol)) return [];
+  const writable = modelWritableProtocols(model, scope);
+  if (!writable.includes(protocol)) return [];
+  if (modelEffectiveOn(model, scope)) {
+    return [{
+      model_id: modelId,
+      protocol,
+      state: "force_on",
+      preferred: true,
+    }];
+  }
+  return writable.map((choice) => ({
+    model_id: modelId,
+    protocol: choice,
+    state: "force_off" as const,
+    ...(choice === protocol ? { preferred: true } : {}),
+  }));
 }
 
 export function protocolDisplayName(protocol: ProviderProtocol): string {
@@ -121,9 +309,7 @@ function providerLabel(
   providerId: string,
   catalog: readonly ProviderCatalogEntry[] | null | undefined,
 ): string {
-  const plan = PLAN_DEFINITIONS.find((item) => item.provider_id === providerId);
-  if (plan) return planFamilyLabel(plan, catalog);
-  return providerId;
+  return findCatalogEntry(catalog, providerId)?.display_name.trim() || providerId;
 }
 
 function customEndpointLabel(
@@ -132,8 +318,7 @@ function customEndpointLabel(
 ): string {
   const name = endpoint.account.name.trim();
   if (name) return name;
-  const plan = PLAN_DEFINITIONS.find((item) => item.kind === "custom");
-  return plan ? planFamilyLabel(plan, catalog) : endpoint.scope_id;
+  return findCatalogEntry(catalog, "custom")?.display_name.trim() || endpoint.scope_id;
 }
 
 export function flattenProviderScopes(
@@ -150,7 +335,6 @@ export function flattenProviderScopes(
     accounts: group.accounts,
     catalog: group.catalog,
     models: group.models,
-    pricing: group.pricing,
     usage: group.usage,
     card: group.card,
     catalog_routable: group.catalog_routable,
@@ -168,7 +352,6 @@ export function flattenProviderScopes(
     accounts: [endpoint.account],
     catalog: endpoint.catalog,
     models: endpoint.models,
-    pricing: endpoint.pricing,
     usage: endpoint.usage,
     card: endpoint.card,
     catalog_routable: endpoint.catalog_routable,
@@ -179,30 +362,11 @@ export function flattenProviderScopes(
   return [...providers, ...custom];
 }
 
-export function selectProviderScope(
-  scopes: readonly ProviderScopeView[],
-  scopeKind: string | null | undefined,
-  scopeId: string | null | undefined,
-): { scope: ProviderScopeView | null; fellBack: boolean } {
-  if (scopes.length === 0) return { scope: null, fellBack: false };
-  const match = scopes.find((scope) => (
-    scope.scope_kind === scopeKind && scope.scope_id === scopeId
-  ));
-  if (match) return { scope: match, fellBack: false };
-  return { scope: scopes[0] ?? null, fellBack: Boolean(scopeKind || scopeId) };
-}
-
 export function catalogRefreshSupported(scope: Pick<ProviderScopeView, "card" | "catalog">): boolean {
   return scope.card.catalog_refresh || scope.catalog.refresh_supported;
 }
 
-export function enabledProtocols(scope: Pick<ProviderScopeView, "models">): ProviderProtocol[] {
-  return PROVIDER_PROTOCOLS.filter((protocol) => (
-    scope.models.some((model) => model.protocols[protocol]?.enabled)
-  ));
-}
-
-export function mergeModelContract(
+function mergeModelContract(
   models: readonly ProviderModelContract[],
   next: ProviderModelContract,
 ): ProviderModelContract[] {

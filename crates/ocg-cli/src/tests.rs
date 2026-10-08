@@ -1,22 +1,57 @@
 use super::{
-    Cli, Commands, KeyAction, build_state, key_command, ping_keys, resolve_cipher_with,
-    resolve_dashboard_dir, resolve_data_dir, start_serve, status_command, stop_serve,
-    toggle_account,
+    Cli, Commands, KeyAction, SkillAction, build_state, key_command, ping_keys,
+    register_dsh_application_host, resolve_cipher_with, resolve_dashboard_dir, resolve_data_dir,
+    start_serve, status_command, stop_serve, toggle_account,
 };
 use chrono::Utc;
 use clap::{CommandFactory, Parser};
 use ocg_core::browser::browser_profile_paths;
 use ocg_core::crypto::{KeyCipher, StaticKeyCipher};
-use ocg_core::models::{Account, AccountSetupStep, AccountType, AccountUpdate};
+use ocg_core::log_types::{OperationLog, OperationLogQuery, OperationOutcome, OperationSource};
+use ocg_core::models::{
+    Account, AccountCustomConfigInput, AccountModelCapabilityInput, AccountSetupStep, AccountType,
+    AccountUpdate,
+};
 use ocg_core::provider::{
     BUILTIN_PROVIDERS, CUSTOM_PROVIDER_ID, ConnectionVerificationStatus, CredentialKind,
-    OPENCODE_PROVIDER_ID, ZEN_FREE_ACCOUNT_ID,
+    OPENCODE_PROVIDER_ID, UpstreamProtocolKind, ZEN_FREE_ACCOUNT_ID,
 };
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener as StdTcpListener};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+#[tokio::test]
+async fn stop_receipt_spans_shutdown_and_releases_the_listener_lock_while_waiting() {
+    let dir = temp_dir("delayed-stop");
+    let state = build_state(dir.clone(), test_cipher()).unwrap();
+    let (shutdown, stopped) = tokio::sync::oneshot::channel();
+    let probe = state.clone();
+    let task = tokio::spawn(async move {
+        stopped.await.unwrap();
+        assert!(probe.gateway.try_lock().is_some());
+        tokio::time::sleep(Duration::from_millis(120)).await;
+    });
+    *state.gateway.lock() = Some(ocg_core::state::GatewayHandle {
+        port: 1234,
+        listen_addr: SocketAddr::from(([127, 0, 0, 1], 1234)),
+        dashboard_is_local: true,
+        shutdown,
+        task,
+    });
+    stop_serve(&state).await;
+    let items = operation_items(&state);
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].action, "gateway.stop");
+    assert_eq!(items[0].outcome, OperationOutcome::Success);
+    let elapsed = items[0].completed_at.unwrap() - items[0].started_at;
+    assert!(elapsed.num_milliseconds() >= 100);
+    assert!(state.gateway.lock().is_none());
+    drop(state);
+    std::fs::remove_dir_all(dir).unwrap();
+}
 
 fn temp_dir(label: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("ocg-cli-test-{}-{}", label, uuid::Uuid::new_v4()));
@@ -95,7 +130,21 @@ fn cli_parses_key_and_status_subcommands() {
         Cli::try_parse_from(["ocg-manager-cli", "status"])
             .unwrap()
             .command,
-        Commands::Status
+        Commands::Status { show_key: false }
+    ));
+    assert!(matches!(
+        Cli::try_parse_from(["ocg-manager-cli", "status", "--show-key"])
+            .unwrap()
+            .command,
+        Commands::Status { show_key: true }
+    ));
+    assert!(matches!(
+        Cli::try_parse_from(["ocg-manager-cli", "skill", "sync"])
+            .unwrap()
+            .command,
+        Commands::Skill {
+            action: SkillAction::Sync
+        }
     ));
 }
 
@@ -105,6 +154,26 @@ fn resolve_data_dir_prefers_explicit_path() {
     assert_eq!(resolve_data_dir(Some(explicit.clone())), explicit);
     let fallback = resolve_data_dir(None);
     assert!(fallback.ends_with(".ocg-mgr-cli"));
+}
+
+#[test]
+fn dsh_application_host_matches_the_native_cli_build_capability() {
+    let dir = temp_dir("dsh-host-capability");
+    let state = build_state(dir.clone(), test_cipher()).unwrap();
+    assert!(state.dsh_application_host().is_none());
+    assert!(state.byok_application_host().is_none());
+
+    register_dsh_application_host(&state);
+
+    assert_eq!(
+        state.dsh_application_host().is_some(),
+        cfg!(feature = "dsh-local-host")
+    );
+    assert_eq!(
+        state.byok_application_host().is_some(),
+        cfg!(feature = "dsh-local-host")
+    );
+    let _ = std::fs::remove_dir_all(dir);
 }
 
 fn assert_cipher_matches_static(
@@ -238,7 +307,9 @@ async fn key_lifecycle_and_status_cover_cli_account_commands() {
     key_command(dir.clone(), cipher.clone(), KeyAction::List)
         .await
         .unwrap();
-    status_command(dir.clone(), cipher.clone()).await.unwrap();
+    status_command(dir.clone(), cipher.clone(), false)
+        .await
+        .unwrap();
 
     key_command(
         dir.clone(),
@@ -500,6 +571,30 @@ async fn cli_key_operations_reject_the_provider_owned_zen_singleton() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+async fn spawn_status_upstream(
+    status: u16,
+    body: &'static [u8],
+) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+            let mut buf = vec![0_u8; 4096];
+            let _ = stream.read(&mut buf).await;
+            let header = format!(
+                "HTTP/1.1 {status} ERR\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(header.as_bytes()).await;
+            let _ = stream.write_all(body).await;
+        }
+    });
+    (addr, server)
+}
+
 async fn spawn_json_upstream(hits: Arc<AtomicUsize>) -> (SocketAddr, tokio::task::JoinHandle<()>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -580,28 +675,33 @@ async fn ping_keys_hits_configured_upstream_and_handles_empty_targets() {
     let missing = ping_keys(&state, Some("nope"), "deepseek-v4-flash", "ping", 3).await;
     assert!(missing.is_err());
 
-    // Reopen with a different cipher so decrypt fails while the account still exists.
-    let wrong_cipher: Arc<dyn KeyCipher + Send + Sync> =
-        Arc::new(StaticKeyCipher::new("other-secret"));
-    let wrong_state = build_state(dir.clone(), wrong_cipher).unwrap();
-    let wrong_id = wrong_state
+    let key_cipher_before = state
         .db
         .lock()
-        .list_accounts()
+        .get_account(&account_id)
         .unwrap()
-        .into_iter()
-        .find(|account| account.name == "pingable")
+        .expect("pingable account")
+        .key_cipher;
+    let wrong_cipher: Arc<dyn KeyCipher + Send + Sync> =
+        Arc::new(StaticKeyCipher::new("other-secret"));
+    let open_error = match build_state(dir.clone(), wrong_cipher) {
+        Ok(_) => panic!("wrong host cipher must fail closed on open, not during ping"),
+        Err(error) => format!("{error:#}"),
+    };
+    assert!(open_error.contains("host cipher rejected"), "{open_error}");
+    assert!(
+        !open_error.contains("sk-ping"),
+        "wrong-cipher open must not leak the plaintext key: {open_error}"
+    );
+
+    let recovered = build_state(dir.clone(), cipher).unwrap();
+    let restored = recovered
+        .db
+        .lock()
+        .get_account(&account_id)
         .unwrap()
-        .id;
-    ping_keys(
-        &wrong_state,
-        Some(wrong_id.as_str()),
-        "deepseek-v4-flash",
-        "ping",
-        3,
-    )
-    .await
-    .unwrap();
+        .expect("account still exists after rejected open");
+    assert_eq!(restored.key_cipher, key_cipher_before);
 
     server.abort();
     let _ = std::fs::remove_dir_all(dir);
@@ -629,9 +729,28 @@ async fn start_serve_binds_port_persists_override_and_stops_cleanly() {
     assert_eq!(state.config().gateway_port, port);
     assert_eq!(state.dashboard_dir(), Some(dash.clone()));
     assert!(std::net::TcpStream::connect(SocketAddr::from(([127, 0, 0, 1], port))).is_ok());
+    let started = operation_items(&state);
+    assert_eq!(started.len(), 1);
+    assert_eq!(started[0].action, "gateway.start");
+    assert_eq!(started[0].source, OperationSource::Cli);
+    assert_eq!(started[0].outcome, OperationOutcome::Success);
+    assert!(started[0].completed_at.is_some());
 
     stop_serve(&state).await;
     assert!(state.gateway.lock().is_none());
+    assert!(state.gateway_last_error().is_none());
+    let stopped = operation_items(&state);
+    assert_eq!(stopped.len(), 2);
+    assert_eq!(stopped[1].action, "gateway.stop");
+    assert_eq!(stopped[1].outcome, OperationOutcome::Success);
+    assert_ne!(stopped[0].operation_id, stopped[1].operation_id);
+    let gateway_logs = state.db.lock().list_gateway_logs(20).unwrap();
+    assert!(
+        gateway_logs
+            .iter()
+            .all(|row| !row.message.contains("cli gateway")),
+        "listener transitions stay out of gateway history"
+    );
     assert!(
         std::net::TcpStream::connect(SocketAddr::from(([127, 0, 0, 1], port))).is_err(),
         "gateway port should reject connections after graceful stop"
@@ -641,6 +760,40 @@ async fn start_serve_binds_port_persists_override_and_stops_cleanly() {
     let reopened = build_state(dir.clone(), cipher).unwrap();
     assert_eq!(reopened.config().gateway_port, port);
 
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn start_serve_schedules_cpa_restore_without_blocking_gateway() {
+    let dir = temp_dir("serve-cpa-restore");
+    let dash = dir.join("custom-dist");
+    std::fs::create_dir_all(&dash).unwrap();
+    std::fs::create_dir_all(dir.join("cpa")).unwrap();
+    std::fs::write(
+        dir.join("cpa").join("managed.json"),
+        format!(
+            "{{\"currentVersion\":\"7.2.147\",\"assetSha256\":\"{}\",\"port\":8317,\"desiredRunning\":true}}",
+            "a".repeat(64)
+        ),
+    )
+    .unwrap();
+    let port = free_port();
+    let started = Instant::now();
+    let state = start_serve(
+        dir.clone(),
+        test_cipher(),
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
+        Some(port),
+        Some(dash),
+    )
+    .await
+    .unwrap();
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "CPA restore must not block native CLI gateway startup"
+    );
+    assert!(std::net::TcpStream::connect(SocketAddr::from(([127, 0, 0, 1], port))).is_ok());
+    stop_serve(&state).await;
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -676,6 +829,28 @@ fn custom_draft(state: &ocg_core::state::CoreStateInner, id: &str) -> Account {
     }
 }
 
+fn create_pending_custom_fixture(state: &ocg_core::state::CoreStateInner, id: &str) {
+    // Pending verification is valid; a Custom credential without its HTTP
+    // destination and declared catalog is not a valid reopenable fixture.
+    state
+        .db
+        .lock()
+        .create_account_with_contract(
+            &custom_draft(state, id),
+            Some(&AccountCustomConfigInput {
+                endpoint_url: "https://custom-cli.example/v1/chat/completions".into(),
+                upstream_protocol: UpstreamProtocolKind::ChatCompletions,
+            }),
+            &[AccountModelCapabilityInput {
+                public_model: "cli-custom-model".into(),
+                upstream_model: "vendor/cli-custom-model".into(),
+                protocol: UpstreamProtocolKind::ChatCompletions,
+                source: None,
+            }],
+        )
+        .unwrap();
+}
+
 #[tokio::test]
 async fn cli_key_mutations_share_control_plane_revision_in_process() {
     let dir = temp_dir("cli-cas-split");
@@ -709,7 +884,9 @@ async fn cli_key_mutations_share_control_plane_revision_in_process() {
     key_command(dir.clone(), cipher.clone(), KeyAction::List)
         .await
         .unwrap();
-    status_command(dir.clone(), cipher.clone()).await.unwrap();
+    status_command(dir.clone(), cipher.clone(), false)
+        .await
+        .unwrap();
 
     let go = serving
         .db
@@ -802,11 +979,7 @@ async fn cli_enable_allows_pending_custom_without_verification() {
     let dir = temp_dir("cli-custom-enable");
     let cipher = test_cipher();
     let state = build_state(dir.clone(), cipher.clone()).unwrap();
-    state
-        .db
-        .lock()
-        .create_account(&custom_draft(&state, "cli-custom"))
-        .unwrap();
+    create_pending_custom_fixture(&state, "cli-custom");
     let before = state
         .db
         .lock()
@@ -856,11 +1029,7 @@ fn cli_update_shaped_writes_skip_revision_unlike_dashboard() {
     let dir = temp_dir("cli-update-shape");
     let cipher = test_cipher();
     let state = build_state(dir.clone(), cipher).unwrap();
-    state
-        .db
-        .lock()
-        .create_account(&custom_draft(&state, "rename-me"))
-        .unwrap();
+    create_pending_custom_fixture(&state, "rename-me");
     let revision = state.settings_revision();
     state
         .db
@@ -887,5 +1056,276 @@ fn cli_update_shaped_writes_skip_revision_unlike_dashboard() {
         "renamed"
     );
 
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+fn operation_items(state: &ocg_core::state::CoreStateInner) -> Vec<OperationLog> {
+    let mut items = state
+        .db
+        .lock()
+        .query_operation_logs(&OperationLogQuery::default())
+        .unwrap()
+        .items;
+    items.sort_by(|left, right| {
+        left.started_at
+            .cmp(&right.started_at)
+            .then(left.operation_id.cmp(&right.operation_id))
+    });
+    items
+}
+
+fn receipt_text(items: &[OperationLog]) -> String {
+    serde_json::to_string(items).unwrap()
+}
+
+#[tokio::test]
+async fn explicit_cli_mutations_record_terminal_receipts_without_secrets() {
+    let dir = temp_dir("cli-receipts");
+    let cipher = test_cipher();
+    let state = build_state(dir.clone(), cipher.clone()).unwrap();
+
+    let rejected = key_command(
+        dir.clone(),
+        cipher.clone(),
+        KeyAction::Add {
+            name: "  ".into(),
+            key: "sk-secret-value".into(),
+            username: None,
+            password: Some("pw-secret".into()),
+        },
+    )
+    .await;
+    assert!(rejected.is_err());
+    let rejected_rows = operation_items(&state);
+    assert_eq!(rejected_rows.len(), 1);
+    assert_eq!(rejected_rows[0].action, "account.create");
+    assert_eq!(rejected_rows[0].source, OperationSource::Cli);
+    assert_eq!(rejected_rows[0].outcome, OperationOutcome::Rejected);
+    assert_eq!(rejected_rows[0].reason_code.as_deref(), Some("invalid"));
+    assert_eq!(rejected_rows[0].subject_id, None);
+    let rejected_text = receipt_text(&rejected_rows);
+    assert!(!rejected_text.contains("sk-secret-value"));
+    assert!(!rejected_text.contains("pw-secret"));
+    assert!(!rejected_text.contains("name is required"));
+
+    ping_keys(&state, None, "model-needle", "receipt-needle", 1)
+        .await
+        .unwrap();
+    let empty_ping = operation_items(&state);
+    assert_eq!(empty_ping.len(), 2);
+    let empty = empty_ping
+        .iter()
+        .find(|row| row.action == "account.ping")
+        .unwrap();
+    assert_eq!(empty.outcome, OperationOutcome::Success);
+    assert_eq!(empty.metadata.requested_count, Some(0));
+    assert_eq!(empty.metadata.completed_count, Some(0));
+    assert_eq!(empty.metadata.failed_count, Some(0));
+    assert!(empty.metadata.related_ids.is_empty());
+
+    key_command(
+        dir.clone(),
+        cipher.clone(),
+        KeyAction::Add {
+            name: "receipt-main".into(),
+            key: "sk-receipt-secret".into(),
+            username: None,
+            password: None,
+        },
+    )
+    .await
+    .unwrap();
+    let account_id = state
+        .db
+        .lock()
+        .list_accounts()
+        .unwrap()
+        .into_iter()
+        .find(|account| account.name == "receipt-main")
+        .expect("added key")
+        .id;
+    let added = operation_items(&state);
+    assert_eq!(added.len(), 3);
+    let added_row = added
+        .iter()
+        .find(|row| row.action == "account.create" && row.outcome == OperationOutcome::Success)
+        .unwrap();
+    assert_eq!(added_row.subject_id.as_deref(), Some(account_id.as_str()));
+    assert_eq!(added_row.metadata.completed_count, Some(1));
+    assert!(added_row.metadata.revision.is_some());
+    assert!(added_row.reason_code.is_none());
+
+    let before_reads = added.len();
+    key_command(dir.clone(), cipher.clone(), KeyAction::List)
+        .await
+        .unwrap();
+    status_command(dir.clone(), cipher.clone(), false)
+        .await
+        .unwrap();
+    assert_eq!(operation_items(&state).len(), before_reads);
+
+    key_command(
+        dir.clone(),
+        cipher.clone(),
+        KeyAction::Disable {
+            id: account_id.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    key_command(
+        dir.clone(),
+        cipher.clone(),
+        KeyAction::Enable {
+            id: account_id.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    let toggled = operation_items(&state);
+    assert_eq!(toggled.len(), 5);
+    for action in ["account.disable", "account.enable"] {
+        let row = toggled.iter().find(|row| row.action == action).unwrap();
+        assert_eq!(row.outcome, OperationOutcome::Success);
+        assert_eq!(row.subject_id.as_deref(), Some(account_id.as_str()));
+        assert_eq!(row.metadata.changed_fields, vec!["enabled".to_string()]);
+        assert_eq!(row.metadata.completed_count, Some(1));
+    }
+
+    let (addr, upstream) = spawn_status_upstream(500, b"upstream-body-needle").await;
+    let mut config = state.config();
+    config.upstream_base_url = format!("http://{addr}");
+    config.proxy_mode = ocg_core::models::ProxyMode::Direct;
+    config.non_stream_timeout_secs = 5;
+    state.set_config(config).unwrap();
+    ping_keys(
+        &state,
+        Some(account_id.as_str()),
+        "model-needle",
+        "receipt-needle",
+        1,
+    )
+    .await
+    .unwrap();
+    let pinged = operation_items(&state);
+    let ping = pinged
+        .iter()
+        .find(|row| row.action == "account.ping" && row.outcome == OperationOutcome::Failed)
+        .unwrap();
+    assert_eq!(ping.action, "account.ping");
+    assert_eq!(ping.outcome, OperationOutcome::Failed);
+    assert_eq!(ping.reason_code.as_deref(), Some("upstream"));
+    assert_eq!(ping.metadata.requested_count, Some(1));
+    assert_eq!(ping.metadata.completed_count, Some(0));
+    assert_eq!(ping.metadata.failed_count, Some(1));
+    assert_eq!(ping.metadata.related_ids, vec![account_id.clone()]);
+
+    let missing = key_command(
+        dir.clone(),
+        cipher.clone(),
+        KeyAction::Remove {
+            id: "missing-key".into(),
+        },
+    )
+    .await;
+    assert!(missing.is_err());
+    let missing_row = operation_items(&state).pop().unwrap();
+    assert_eq!(missing_row.action, "account.delete");
+    assert_eq!(missing_row.outcome, OperationOutcome::Rejected);
+    assert_eq!(missing_row.reason_code.as_deref(), Some("notfound"));
+    assert_eq!(missing_row.subject_id.as_deref(), Some("missing-key"));
+
+    key_command(
+        dir.clone(),
+        cipher.clone(),
+        KeyAction::Remove {
+            id: account_id.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(state.db.lock().get_account(&account_id).unwrap().is_none());
+    let removed = operation_items(&state);
+    let delete = removed
+        .iter()
+        .find(|row| row.action == "account.delete" && row.outcome == OperationOutcome::Success)
+        .unwrap();
+    assert_eq!(delete.action, "account.delete");
+    assert_eq!(delete.outcome, OperationOutcome::Success);
+    assert_eq!(delete.subject_id.as_deref(), Some(account_id.as_str()));
+    assert_eq!(delete.metadata.completed_count, Some(1));
+    assert!(delete.metadata.revision.is_some());
+
+    let text = receipt_text(&removed);
+    for secret in [
+        "sk-secret-value",
+        "pw-secret",
+        "sk-receipt-secret",
+        "receipt-main",
+        "receipt-needle",
+        "model-needle",
+        "upstream-body-needle",
+        "127.0.0.1",
+        "name is required",
+        "key not found",
+    ] {
+        assert!(!text.contains(secret), "{secret} leaked into {text}");
+    }
+    assert!(
+        state
+            .db
+            .lock()
+            .list_gateway_logs(20)
+            .unwrap()
+            .iter()
+            .all(|row| !row.message.contains("cli gateway"))
+    );
+
+    upstream.abort();
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn serve_bind_failure_records_saved_port_as_partial_without_a_listener() {
+    let dir = temp_dir("serve-bind-fail");
+    let dash = dir.join("dist");
+    std::fs::create_dir_all(&dash).unwrap();
+    let occupied = StdTcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = occupied.local_addr().unwrap().port();
+    let cipher = test_cipher();
+
+    let error = start_serve(
+        dir.clone(),
+        cipher.clone(),
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
+        Some(port),
+        Some(dash),
+    )
+    .await;
+    assert!(error.is_err());
+
+    let state = build_state(dir.clone(), cipher).unwrap();
+    assert_eq!(state.config().gateway_port, port);
+    assert!(state.gateway.lock().is_none());
+    let items = operation_items(&state);
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].action, "gateway.start");
+    assert_eq!(items[0].source, OperationSource::Cli);
+    assert_eq!(items[0].outcome, OperationOutcome::Partial);
+    assert_eq!(items[0].metadata.changed_fields, vec!["gateway_port"]);
+    assert_eq!(items[0].reason_code.as_deref(), Some("bind.failed"));
+    let text = receipt_text(&items);
+    assert!(!text.contains("127.0.0.1"), "{text}");
+    assert!(
+        state
+            .db
+            .lock()
+            .list_gateway_logs(20)
+            .unwrap()
+            .iter()
+            .all(|row| !row.message.contains("cli gateway"))
+    );
+
+    drop(occupied);
     let _ = std::fs::remove_dir_all(dir);
 }

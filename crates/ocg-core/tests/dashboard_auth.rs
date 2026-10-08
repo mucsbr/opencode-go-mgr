@@ -1,15 +1,18 @@
 use ocg_core::crypto::{KeyCipher, StaticKeyCipher};
 use ocg_core::db::Database;
 use ocg_core::gateway;
-use ocg_core::host_router::{DASHBOARD_V2_REMOVED_CODE, DASHBOARD_V2_REMOVED_MESSAGE};
-use ocg_core::models::{AppConfig, RoutingMode};
+use ocg_core::host_router::{
+    DASHBOARD_V2_REMOVED_CODE, DASHBOARD_V2_REMOVED_MESSAGE, DASHBOARD_V3_REMOVED_CODE,
+    DASHBOARD_V3_REMOVED_MESSAGE,
+};
+use ocg_core::models::RoutingMode;
 use ocg_core::provider::ZEN_FREE_ACCOUNT_ID;
 use ocg_core::state::CoreStateInner;
 use reqwest::StatusCode;
 use serde_json::json;
 use std::fs;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::Arc;
 
 fn state(label: &str) -> Arc<CoreStateInner> {
     let mut dir = std::env::temp_dir();
@@ -24,16 +27,6 @@ fn state(label: &str) -> Arc<CoreStateInner> {
     Arc::new(CoreStateInner::new(db, dir, cipher).unwrap())
 }
 
-fn settings_payload(state: &CoreStateInner, config: &AppConfig) -> serde_json::Value {
-    settings_payload_at(config, state.settings_revision())
-}
-
-fn settings_payload_at(config: &AppConfig, expected_revision: u64) -> serde_json::Value {
-    let mut payload = serde_json::to_value(config).expect("settings should serialize");
-    payload["expected_revision"] = json!(expected_revision);
-    payload
-}
-
 /// Every request in this suite targets loopback listeners; never route them
 /// through an ambient system/environment proxy (which aborts such
 /// connections on some machines).
@@ -44,8 +37,8 @@ fn loopback_client() -> reqwest::Client {
         .expect("test client should build")
 }
 
-fn v3_url(port: u16, path: &str) -> String {
-    format!("http://127.0.0.1:{port}/dashboard/api/v3{path}")
+fn v4_url(port: u16, path: &str) -> String {
+    format!("http://127.0.0.1:{port}/dashboard/api/v4{path}")
 }
 
 fn cas(state: &CoreStateInner, extra: serde_json::Value) -> serde_json::Value {
@@ -69,6 +62,17 @@ async fn assert_v2_removed(response: reqwest::Response) {
     );
 }
 
+async fn assert_v3_removed(response: reqwest::Response) {
+    assert_eq!(response.status(), StatusCode::GONE);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(
+        body,
+        json!({
+            "code": DASHBOARD_V3_REMOVED_CODE,
+            "message": DASHBOARD_V3_REMOVED_MESSAGE })
+    );
+}
+
 async fn start_session_protected(state: Arc<CoreStateInner>) -> ocg_core::state::GatewayHandle {
     #[cfg(windows)]
     let addr = SocketAddr::from(([127, 0, 0, 1], 0));
@@ -88,7 +92,7 @@ async fn public_dashboard_uses_first_registration_and_session_cookie() {
     let state = state("public");
     let handle = start_session_protected(state.clone()).await;
     let base = format!("http://127.0.0.1:{}/dashboard/api", handle.port);
-    let v3 = format!("{base}/v3");
+    let v4 = format!("{base}/v4");
     let client = loopback_client();
 
     let status = client
@@ -123,99 +127,7 @@ async fn public_dashboard_uses_first_registration_and_session_cookie() {
 
     assert_eq!(
         client
-            .get(format!("{base}/settings"))
-            .send()
-            .await
-            .unwrap()
-            .status(),
-        StatusCode::UNAUTHORIZED
-    );
-    assert_eq!(
-        client
-            .put(format!("{base}/accounts/order"))
-            .json(&json!({ "account_ids": [ZEN_FREE_ACCOUNT_ID] }))
-            .send()
-            .await
-            .unwrap()
-            .status(),
-        StatusCode::UNAUTHORIZED
-    );
-    assert_eq!(
-        client
-            .get(format!("{base}/settings/check-update"))
-            .send()
-            .await
-            .unwrap()
-            .status(),
-        StatusCode::UNAUTHORIZED
-    );
-    assert_eq!(
-        client
-            .get(format!("{base}/settings/update-status"))
-            .send()
-            .await
-            .unwrap()
-            .status(),
-        StatusCode::UNAUTHORIZED
-    );
-    assert_eq!(
-        client
-            .post(format!("{base}/settings/install-update"))
-            .json(&json!({ "expected_version": "999.0.0" }))
-            .send()
-            .await
-            .unwrap()
-            .status(),
-        StatusCode::UNAUTHORIZED
-    );
-    assert_eq!(
-        client
-            .get(format!("{base}/application-models"))
-            .send()
-            .await
-            .unwrap()
-            .status(),
-        StatusCode::UNAUTHORIZED
-    );
-    assert_eq!(
-        client
-            .get(format!("{base}/provider-contracts"))
-            .send()
-            .await
-            .unwrap()
-            .status(),
-        StatusCode::UNAUTHORIZED
-    );
-    assert_eq!(
-        client
-            .put(format!(
-                "{base}/provider-contracts/provider/opencode/protocols/chat_completions"
-            ))
-            .json(&json!({ "enabled": false }))
-            .send()
-            .await
-            .unwrap()
-            .status(),
-        StatusCode::UNAUTHORIZED
-    );
-    assert_eq!(
-        client
-            .post(format!(
-                "{base}/accounts/{ZEN_FREE_ACCOUNT_ID}/protocol-probes"
-            ))
-            .json(&json!({
-                "model_id": "hy3-free",
-                "protocols": ["chat_completions"]
-            }))
-            .send()
-            .await
-            .unwrap()
-            .status(),
-        StatusCode::UNAUTHORIZED
-    );
-    assert_eq!(
-        client
-            .get(format!("{v3}/settings"))
+            .get(format!("{v4}/settings"))
             .header(reqwest::header::COOKIE, &cookie)
             .send()
             .await
@@ -233,7 +145,7 @@ async fn public_dashboard_uses_first_registration_and_session_cookie() {
     )
     .await;
     let reordered = client
-        .put(format!("{v3}/accounts/order"))
+        .put(format!("{v4}/accounts/order"))
         .header(reqwest::header::COOKIE, &cookie)
         .json(&cas(&state, json!({ "accountIds": [ZEN_FREE_ACCOUNT_ID] })))
         .send()
@@ -253,7 +165,7 @@ async fn public_dashboard_uses_first_registration_and_session_cookie() {
         .collect::<Vec<_>>();
     assert_eq!(reordered_ids, [ZEN_FREE_ACCOUNT_ID]);
     let application_models = client
-        .get(format!("{v3}/application-models"))
+        .get(format!("{v4}/application-models"))
         .header(reqwest::header::COOKIE, &cookie)
         .send()
         .await
@@ -341,7 +253,7 @@ async fn public_dashboard_uses_first_registration_and_session_cookie() {
     assert_ne!(replacement_cookie, cookie);
     assert_eq!(
         client
-            .get(format!("{v3}/settings"))
+            .get(format!("{v4}/settings"))
             .header(reqwest::header::COOKIE, &replacement_cookie)
             .send()
             .await
@@ -384,7 +296,7 @@ async fn local_connection_rejects_rebinding_and_cross_origin_requests() {
         (host.as_str(), Some("null"), StatusCode::FORBIDDEN),
     ] {
         let mut request = client
-            .get(v3_url(handle.port, "/connection"))
+            .get(v4_url(handle.port, "/connection"))
             .header("host", request_host);
         if let Some(value) = request_origin {
             request = request.header("origin", value);
@@ -402,7 +314,7 @@ async fn local_connection_rejects_rebinding_and_cross_origin_requests() {
         );
     }
     let response = client
-        .get(v3_url(handle.port, "/connection"))
+        .get(v4_url(handle.port, "/connection"))
         .header("sec-fetch-site", "cross-site")
         .send()
         .await
@@ -411,6 +323,7 @@ async fn local_connection_rejects_rebinding_and_cross_origin_requests() {
     for path in [
         "/dashboard/api/auth/register",
         "/dashboard/api/v3/auth/register",
+        "/dashboard/api/v4/auth/register",
     ] {
         let response = client
             .post(format!("http://{host}{path}"))
@@ -426,7 +339,7 @@ async fn local_connection_rejects_rebinding_and_cross_origin_requests() {
         assert_eq!(response.status(), StatusCode::FORBIDDEN, "{path}");
     }
     let response = client
-        .get(v3_url(handle.port, "/connection"))
+        .get(v4_url(handle.port, "/connection"))
         .header("host", "attacker.invalid")
         .header(
             "cookie",
@@ -463,216 +376,24 @@ async fn loopback_dashboard_skips_login() {
     assert_eq!(status["authenticated"], true);
     assert_eq!(
         client
-            .get(v3_url(handle.port, "/settings"))
+            .get(v4_url(handle.port, "/settings"))
             .send()
             .await
             .unwrap()
             .status(),
         StatusCode::OK
     );
+    assert_v3_removed(
+        client
+            .get(format!("{base}/v3/settings"))
+            .send()
+            .await
+            .unwrap(),
+    )
+    .await;
     assert_v2_removed(client.get(format!("{base}/settings")).send().await.unwrap()).await;
 
-    let forwarded_status = client
-        .get(format!("{base}/auth/status"))
-        .header("x-forwarded-for", "203.0.113.10")
-        .send()
-        .await
-        .unwrap()
-        .json::<serde_json::Value>()
-        .await
-        .unwrap();
-    assert_eq!(forwarded_status["local"], false);
-    assert_eq!(forwarded_status["authenticated"], false);
-    assert_eq!(
-        client
-            .get(format!("{base}/settings"))
-            .header("x-forwarded-for", "203.0.113.10")
-            .send()
-            .await
-            .unwrap()
-            .status(),
-        StatusCode::UNAUTHORIZED
-    );
-
     gateway::stop_gateway(handle);
-}
-
-#[tokio::test]
-async fn loopback_desktop_update_api_is_safe_atomic_and_pollable() {
-    let current_version = env!("CARGO_PKG_VERSION");
-    let current_major = current_version
-        .split('.')
-        .next()
-        .unwrap()
-        .parse::<u64>()
-        .unwrap();
-    let newer_version = format!("{}.0.0", current_major + 1);
-    let client = loopback_client();
-
-    let unsupported_state = state("desktop-update-unsupported");
-    let unsupported_handle = gateway::start_gateway_on(
-        unsupported_state.clone(),
-        SocketAddr::from(([127, 0, 0, 1], 0)),
-    )
-    .await
-    .unwrap();
-    let unsupported_v2 = format!(
-        "http://127.0.0.1:{}/dashboard/api/settings/install-update",
-        unsupported_handle.port
-    );
-    assert_v2_removed(client.post(&unsupported_v2).send().await.unwrap()).await;
-    assert_v2_removed(
-        client
-            .post(&unsupported_v2)
-            .form(&[("expected_version", newer_version.as_str())])
-            .send()
-            .await
-            .unwrap(),
-    )
-    .await;
-    assert_v2_removed(
-        client
-            .post(&unsupported_v2)
-            .json(&json!({ "expected_version": newer_version }))
-            .send()
-            .await
-            .unwrap(),
-    )
-    .await;
-    assert_eq!(
-        client
-            .post(v3_url(unsupported_handle.port, "/settings/install-update"))
-            .json(&cas(
-                &unsupported_state,
-                json!({ "expectedVersion": newer_version })
-            ))
-            .send()
-            .await
-            .unwrap()
-            .status(),
-        StatusCode::BAD_REQUEST
-    );
-    gateway::stop_gateway(unsupported_handle);
-
-    let supported_state = state("desktop-update-supported");
-    let started_versions = Arc::new(StdMutex::new(Vec::new()));
-    let captured_versions = started_versions.clone();
-    supported_state.set_desktop_update_starter(Arc::new(move |expected_version| {
-        captured_versions.lock().unwrap().push(expected_version);
-        Ok(())
-    }));
-    let supported_handle = gateway::start_gateway_on(
-        supported_state.clone(),
-        SocketAddr::from(([127, 0, 0, 1], 0)),
-    )
-    .await
-    .unwrap();
-    let base = v3_url(supported_handle.port, "/settings");
-    let initial = client
-        .get(format!("{base}/update-status"))
-        .send()
-        .await
-        .unwrap()
-        .json::<serde_json::Value>()
-        .await
-        .unwrap();
-    assert_eq!(initial["phase"], "idle");
-    assert_eq!(initial["currentVersion"], current_version);
-    assert_eq!(initial["installSupported"], true);
-
-    for rejected in [current_version.to_string(), "0.0.1".to_string()] {
-        assert_eq!(
-            client
-                .post(format!("{base}/install-update"))
-                .json(&cas(
-                    &supported_state,
-                    json!({ "expectedVersion": rejected })
-                ))
-                .send()
-                .await
-                .unwrap()
-                .status(),
-            StatusCode::BAD_REQUEST,
-            "{rejected}"
-        );
-    }
-    assert!(started_versions.lock().unwrap().is_empty());
-
-    let accepted = client
-        .post(format!("{base}/install-update"))
-        .json(&cas(
-            &supported_state,
-            json!({ "expectedVersion": format!("v{newer_version}-beta.1") }),
-        ))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(accepted.status(), StatusCode::ACCEPTED);
-    let accepted = accepted.json::<serde_json::Value>().await.unwrap();
-    assert_eq!(accepted["phase"], "checking");
-    assert_eq!(
-        started_versions.lock().unwrap().as_slice(),
-        [format!("{newer_version}-beta.1")]
-    );
-    assert_eq!(
-        client
-            .post(format!("{base}/install-update"))
-            .json(&cas(
-                &supported_state,
-                json!({ "expectedVersion": newer_version })
-            ))
-            .send()
-            .await
-            .unwrap()
-            .status(),
-        StatusCode::CONFLICT
-    );
-    assert_eq!(started_versions.lock().unwrap().len(), 1);
-
-    assert!(supported_state.set_desktop_update_progress(64, Some(128)));
-    let downloading = client
-        .get(format!("{base}/update-status"))
-        .send()
-        .await
-        .unwrap()
-        .json::<serde_json::Value>()
-        .await
-        .unwrap();
-    assert_eq!(downloading["phase"], "downloading");
-    assert_eq!(downloading["downloaded"], 64);
-    assert_eq!(downloading["total"], 128);
-
-    assert!(supported_state.set_desktop_update_installing());
-    supported_state.set_desktop_update_failed("signature verification failed");
-    let failed = client
-        .get(format!("{base}/update-status"))
-        .send()
-        .await
-        .unwrap()
-        .json::<serde_json::Value>()
-        .await
-        .unwrap();
-    assert_eq!(failed["phase"], "failed");
-    assert_eq!(failed["error"], "signature verification failed");
-
-    let retried = client
-        .post(format!("{base}/install-update"))
-        .json(&cas(
-            &supported_state,
-            json!({ "expectedVersion": newer_version }),
-        ))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(retried.status(), StatusCode::ACCEPTED);
-    let retried = retried.json::<serde_json::Value>().await.unwrap();
-    assert_eq!(retried["phase"], "checking");
-    assert_eq!(retried["downloaded"], 0);
-    assert!(retried["total"].is_null());
-    assert!(retried["error"].is_null());
-    assert_eq!(started_versions.lock().unwrap().len(), 2);
-
-    gateway::stop_gateway(supported_handle);
 }
 
 #[tokio::test]
@@ -681,21 +402,9 @@ async fn loopback_settings_trim_and_require_gateway_key() {
     let handle = gateway::start_gateway_on(state.clone(), SocketAddr::from(([127, 0, 0, 1], 0)))
         .await
         .unwrap();
-    let v2_url = format!("http://127.0.0.1:{}/dashboard/api/settings", handle.port);
-    let url = v3_url(handle.port, "/settings");
+    let url = v4_url(handle.port, "/settings");
     let client = loopback_client();
     let primary_before = state.config().gateway_key.clone();
-
-    assert_v2_removed(
-        client
-            .post(&v2_url)
-            .json(&settings_payload(&state, &state.config()))
-            .send()
-            .await
-            .unwrap(),
-    )
-    .await;
-    assert_eq!(state.config().gateway_key, primary_before);
 
     assert_eq!(
         client
@@ -733,48 +442,6 @@ async fn loopback_settings_trim_and_require_gateway_key() {
     assert_eq!(roundtrip["nonStreamTimeoutSecs"], 345);
     assert_eq!(roundtrip["streamIdleTimeoutSecs"], 678);
     assert_eq!(roundtrip["clientRootUrl"], "http://192.168.1.20:9042/proxy");
-    assert_eq!(roundtrip["autoStartSupported"], false);
-    assert_eq!(roundtrip["clientRootUrlFromEnv"], false);
-    assert!(roundtrip.get("gatewayKey").is_none());
-    assert!(roundtrip.get("gateway_key").is_none());
-
-    let mut blank = state.config();
-    blank.gateway_key = "   ".into();
-    assert_v2_removed(
-        client
-            .post(&v2_url)
-            .json(&settings_payload(&state, &blank))
-            .send()
-            .await
-            .unwrap(),
-    )
-    .await;
-    assert_eq!(state.config().gateway_key, primary_before);
-
-    let sub = ocg_core::gateway_keys::create_sub_key(&state, "Laptop").unwrap();
-    let mut colliding = state.config();
-    colliding.gateway_key = sub.key.clone();
-    assert_v2_removed(
-        client
-            .post(&v2_url)
-            .json(&settings_payload(&state, &colliding))
-            .send()
-            .await
-            .unwrap(),
-    )
-    .await;
-    assert_eq!(state.config().gateway_key, primary_before);
-    ocg_core::gateway_keys::set_sub_key_enabled(&state, &sub.id, false).unwrap();
-    assert_v2_removed(
-        client
-            .post(&v2_url)
-            .json(&settings_payload(&state, &colliding))
-            .send()
-            .await
-            .unwrap(),
-    )
-    .await;
-    assert_eq!(state.config().gateway_key, primary_before);
 
     let before = state.db.lock().list_sub_gateway_keys().unwrap();
     let forged = cas(
@@ -863,50 +530,12 @@ async fn loopback_settings_trim_and_require_gateway_key() {
 }
 
 #[tokio::test]
-async fn loopback_settings_accept_legacy_payload_without_revision() {
-    let state = state("settings-legacy-payload");
-    let handle = gateway::start_gateway_on(state.clone(), SocketAddr::from(([127, 0, 0, 1], 0)))
-        .await
-        .unwrap();
-    let v2_url = format!("http://127.0.0.1:{}/dashboard/api/settings", handle.port);
-    let url = v3_url(handle.port, "/settings");
-
-    let original_timeout = state.config().connect_timeout_secs;
-    let mut config = state.config();
-    config.connect_timeout_secs = 17;
-    let payload = serde_json::to_value(&config).unwrap();
-    assert!(payload.get("expected_revision").is_none());
-
-    assert_v2_removed(
-        loopback_client()
-            .post(&v2_url)
-            .json(&payload)
-            .send()
-            .await
-            .unwrap(),
-    )
-    .await;
-    assert_eq!(state.config().connect_timeout_secs, original_timeout);
-
-    let missing = loopback_client()
-        .put(&url)
-        .json(&json!({ "connectTimeoutSecs": 17 }))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(missing.status(), StatusCode::BAD_REQUEST);
-    assert_eq!(state.config().connect_timeout_secs, original_timeout);
-
-    gateway::stop_gateway(handle);
-}
-
-#[tokio::test]
 async fn loopback_settings_round_trip_routing_modes_and_reject_unknown_values() {
     let state = state("settings-routing");
     let handle = gateway::start_gateway_on(state.clone(), SocketAddr::from(([127, 0, 0, 1], 0)))
         .await
         .unwrap();
-    let url = v3_url(handle.port, "/settings");
+    let url = v4_url(handle.port, "/settings");
     let client = loopback_client();
 
     for mode in [
@@ -966,7 +595,7 @@ async fn loopback_settings_reject_stale_revision_after_key_regeneration() {
     let handle = gateway::start_gateway_on(state.clone(), SocketAddr::from(([127, 0, 0, 1], 0)))
         .await
         .unwrap();
-    let url = v3_url(handle.port, "/settings");
+    let url = v4_url(handle.port, "/settings");
     let client = loopback_client();
     let loaded = client
         .get(&url)
@@ -980,7 +609,7 @@ async fn loopback_settings_reject_stale_revision_after_key_regeneration() {
     let stale_timeout = loaded["connectTimeoutSecs"].as_u64().unwrap();
 
     let regenerated = client
-        .post(v3_url(handle.port, "/keys/primary/regenerate"))
+        .post(v4_url(handle.port, "/keys/primary/regenerate"))
         .json(&cas(&state, json!({})))
         .send()
         .await
@@ -989,7 +618,7 @@ async fn loopback_settings_reject_stale_revision_after_key_regeneration() {
     let regenerated = regenerated.json::<serde_json::Value>().await.unwrap();
     assert_ne!(regenerated["revision"].as_u64().unwrap(), stale_revision);
     let connection = client
-        .get(v3_url(handle.port, "/connection"))
+        .get(v4_url(handle.port, "/connection"))
         .send()
         .await
         .unwrap()

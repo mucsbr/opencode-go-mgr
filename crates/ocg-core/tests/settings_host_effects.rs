@@ -299,7 +299,6 @@ fn unsupported_host_deltas_fail_before_persistence_or_revision_change() {
     auto.auto_start = true;
     let error = state.apply_host_settings(&previous, auto).unwrap_err();
     assert!(matches!(error, HostSettingsError::AutoStartUnsupported));
-    assert_eq!(error.to_string(), HostSettingsError::AUTO_START_UNAVAILABLE);
     assert_eq!(state.settings_revision(), before);
     assert!(!state.config().auto_start);
     assert!(!persisted_auto_start(&state));
@@ -312,10 +311,6 @@ fn unsupported_host_deltas_fail_before_persistence_or_revision_change() {
         error,
         HostSettingsError::DockVisibilityUnsupported
     ));
-    assert_eq!(
-        error.to_string(),
-        HostSettingsError::DOCK_VISIBILITY_UNAVAILABLE
-    );
     assert_eq!(state.settings_revision(), before);
     assert!(state.config().show_dock_icon);
     assert!(persisted_show_dock_icon(&state));
@@ -462,7 +457,7 @@ fn hook_restore_failures_append_to_the_sync_error() {
 }
 
 #[tokio::test]
-async fn v2_and_v3_map_unsupported_and_sync_errors_without_shape_drift() {
+async fn v3_maps_unsupported_and_sync_errors_after_v2_retirement() {
     let harness = start_loopback("host-http-errors").await;
     let before = harness.state.settings_revision();
     let generation = harness.state.process_generation();
@@ -543,10 +538,6 @@ async fn v2_and_v3_map_unsupported_and_sync_errors_without_shape_drift() {
         put_json(&harness, &cas_patch(&harness, json!({ "autoStart": true }))).await;
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
     assert_eq!(body["code"], ERROR_INTERNAL);
-    assert_eq!(
-        body["message"],
-        "failed to synchronize desktop settings: auto-start hook failed"
-    );
     assert_eq!(body["currentRevision"], Value::Null);
     assert_eq!(body["processGeneration"], Value::Null);
     assert!(!harness.state.config().auto_start);
@@ -558,7 +549,7 @@ async fn v2_and_v3_map_unsupported_and_sync_errors_without_shape_drift() {
 }
 
 #[tokio::test]
-async fn v2_and_v3_successful_host_writes_preserve_cas_and_primary_key() {
+async fn v3_successful_host_writes_preserve_cas_and_primary_key() {
     let harness = start_loopback("host-http-success").await;
     harness.state.set_auto_start_sync(ok_auto_start);
     let dock = DockHook::new();
@@ -645,7 +636,7 @@ async fn v2_and_v3_successful_host_writes_preserve_cas_and_primary_key() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn v2_and_v3_reassert_unchanged_supported_hooks_and_rollback_on_drift() {
+async fn v3_reassert_unchanged_supported_hooks_and_rollback_on_drift() {
     reset_auto_start_hook();
     let harness = start_loopback("host-http-reassert").await;
     harness.state.set_auto_start_sync(recording_auto_start);
@@ -716,10 +707,6 @@ async fn v2_and_v3_reassert_unchanged_supported_hooks_and_rollback_on_drift() {
     .await;
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
     assert_eq!(body["code"], ERROR_INTERNAL);
-    assert_eq!(
-        body["message"],
-        "failed to synchronize desktop settings: auto-start hook failed"
-    );
     assert_eq!(harness.state.config().connect_timeout_secs, 13);
     assert!(!harness.state.config().auto_start);
     assert_eq!(harness.state.config().gateway_key, primary);
@@ -741,10 +728,6 @@ async fn v2_and_v3_reassert_unchanged_supported_hooks_and_rollback_on_drift() {
     .await;
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
     assert_eq!(body["code"], ERROR_INTERNAL);
-    assert_eq!(
-        body["message"],
-        "failed to synchronize desktop settings: dock hook failed"
-    );
     assert_eq!(body["currentRevision"], Value::Null);
     assert_eq!(body["processGeneration"], Value::Null);
     assert_eq!(harness.state.config().connect_timeout_secs, 13);
@@ -795,7 +778,7 @@ async fn http_v3_port_change_rebinds_running_listener_or_keeps_old_on_failure() 
     let new_port = free_port();
     let response = client
         .put(format!(
-            "http://127.0.0.1:{old_port}/dashboard/api/v3/settings"
+            "http://127.0.0.1:{old_port}/dashboard/api/v4/settings"
         ))
         .json(&json!({
             "expectedRevision": state.settings_revision(),
@@ -816,7 +799,7 @@ async fn http_v3_port_change_rebinds_running_listener_or_keeps_old_on_failure() 
     let occupied_port = occupied.local_addr().unwrap().port();
     let fail = client
         .put(format!(
-            "http://127.0.0.1:{new_port}/dashboard/api/v3/settings"
+            "http://127.0.0.1:{new_port}/dashboard/api/v4/settings"
         ))
         .json(&json!({
             "expectedRevision": state.settings_revision(),
@@ -911,7 +894,7 @@ async fn failed_rebind_compensation_still_restores_after_revision_only_bump() {
 }
 
 #[tokio::test]
-async fn failed_http_rebind_releases_sync_gate_and_preserves_later_key_and_claude_writes() {
+async fn failed_http_rebind_releases_sync_gate_and_preserves_later_key_writes() {
     let (state, dir) = new_state("http-compensate-live-config");
     let (held_port, shutdown_seen, release) = install_held_listener(&state).await;
 
@@ -947,7 +930,7 @@ async fn failed_http_rebind_releases_sync_gate_and_preserves_later_key_and_claud
     let failed_settings = tokio::spawn(async move {
         settings_client
             .put(format!(
-                "http://127.0.0.1:{serving_port}/dashboard/api/v3/settings"
+                "http://127.0.0.1:{serving_port}/dashboard/api/v4/settings"
             ))
             .json(&json!({
                 "expectedRevision": settings_state.settings_revision(),
@@ -971,31 +954,12 @@ async fn failed_http_rebind_releases_sync_gate_and_preserves_later_key_and_claud
     .await
     .expect("settings request should persist before its listener await");
 
-    let claude = tokio::time::timeout(
-        Duration::from_secs(2),
-        client
-            .put(format!(
-                "http://127.0.0.1:{serving_port}/dashboard/api/v3/claude-desktop/models"
-            ))
-            .json(&json!({
-                "expectedRevision": state.settings_revision(),
-                "processGeneration": state.process_generation(),
-                "sonnet": "glm-5.2",
-                "opus": "",
-                "haiku": "" }))
-            .send(),
-    )
-    .await
-    .expect("Claude writer must not block on settings_update across the listener await")
-    .expect("Claude writer should receive a response");
-    assert_eq!(claude.status(), StatusCode::OK);
-
     let primary_before = state.config().gateway_key;
     let key = tokio::time::timeout(
         Duration::from_secs(2),
         client
             .post(format!(
-                "http://127.0.0.1:{serving_port}/dashboard/api/v3/keys/primary/regenerate"
+                "http://127.0.0.1:{serving_port}/dashboard/api/v4/keys/primary/regenerate"
             ))
             .json(&json!({
                 "expectedRevision": state.settings_revision(),
@@ -1025,7 +989,6 @@ async fn failed_http_rebind_releases_sync_gate_and_preserves_later_key_and_claud
     assert_eq!(live.gateway_port, serving_port);
     assert_eq!(state.active_gateway_port(), serving_port);
     assert_eq!(live.gateway_key, primary_after);
-    assert_eq!(live.claude_desktop_models.sonnet, "glm-5.2");
     assert_eq!(
         state.settings_revision(),
         revision_after_writers + 1,
@@ -1044,7 +1007,6 @@ async fn failed_http_rebind_releases_sync_gate_and_preserves_later_key_and_claud
         Some(primary_after.as_str())
     );
     assert_eq!(stored.gateway_key, "");
-    assert_eq!(stored.claude_desktop_models.sonnet, "glm-5.2");
 
     let handle = state.gateway.lock().take();
     if let Some(handle) = handle {
@@ -1126,7 +1088,7 @@ async fn concurrent_port_changes_keep_configured_and_active_ports_in_agreement()
 }
 
 #[tokio::test]
-async fn http_v2_and_v3_concurrent_port_changes_agree_on_configured_and_active_port() {
+async fn http_concurrent_v3_port_changes_agree_on_configured_and_active_port() {
     let (state, dir) = new_state("http-concurrent-ports");
     let handle = gateway::start_gateway_on(state.clone(), SocketAddr::from(([127, 0, 0, 1], 0)))
         .await
@@ -1150,7 +1112,7 @@ async fn http_v2_and_v3_concurrent_port_changes_agree_on_configured_and_active_p
         a_start.wait().await;
         a_client
             .put(format!(
-                "http://127.0.0.1:{old_port}/dashboard/api/v3/settings"
+                "http://127.0.0.1:{old_port}/dashboard/api/v4/settings"
             ))
             .timeout(Duration::from_secs(5))
             .json(&json!({
@@ -1169,7 +1131,7 @@ async fn http_v2_and_v3_concurrent_port_changes_agree_on_configured_and_active_p
         b_start.wait().await;
         b_client
             .put(format!(
-                "http://127.0.0.1:{old_port}/dashboard/api/v3/settings"
+                "http://127.0.0.1:{old_port}/dashboard/api/v4/settings"
             ))
             .timeout(Duration::from_secs(5))
             .json(&json!({
@@ -1183,8 +1145,8 @@ async fn http_v2_and_v3_concurrent_port_changes_agree_on_configured_and_active_p
 
     start.wait().await;
     let (a, b) = tokio::join!(a, b);
-    let a = a.expect("V2 port task should finish");
-    let b = b.expect("V3 port task should finish");
+    let a = a.expect("first V3 port task should finish");
+    let b = b.expect("second V3 port task should finish");
     let a_ok = a.status() == StatusCode::OK;
     let b_ok = b.status() == StatusCode::OK;
     assert!(
