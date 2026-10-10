@@ -4,6 +4,7 @@
 //! the immediate real-time estimator after the last successful calibration.
 //! Manual and background paths share one secure fetch + key CAS implementation.
 
+mod inflight_guard;
 pub mod provider_adapter;
 mod provider_refresh;
 mod singleflight;
@@ -357,6 +358,7 @@ pub trait UsageSyncHost: Clone + Send + Sync + 'static {
 #[derive(Clone)]
 struct InflightEntry {
     generation: u64,
+    waiters: usize,
     future: RefreshFuture,
     authorization: UsageSyncCommitAuthorization,
 }
@@ -366,7 +368,7 @@ pub struct UsageSyncRuntime {
     #[cfg(debug_assertions)]
     reactive_enabled_for_test: AtomicBool,
     global: AsyncMutex<()>,
-    inflight: AsyncMutex<HashMap<String, InflightEntry>>,
+    inflight: ParkingMutex<HashMap<String, InflightEntry>>,
     inflight_generation: AtomicU64,
     /// Arc so the scheduler can wait without pinning the process host alive.
     wake: Arc<Notify>,
@@ -394,7 +396,7 @@ impl UsageSyncRuntime {
             #[cfg(debug_assertions)]
             reactive_enabled_for_test: AtomicBool::new(true),
             global: AsyncMutex::new(()),
-            inflight: AsyncMutex::new(HashMap::new()),
+            inflight: ParkingMutex::new(HashMap::new()),
             inflight_generation: AtomicU64::new(1),
             wake: Arc::new(Notify::new()),
             loop_started: AtomicBool::new(false),
@@ -912,8 +914,9 @@ pub(crate) async fn refresh_official_usage_with_authorization<H: UsageSyncHost>(
     }
 
     let (future, generation, owner_authorization) = {
-        let mut inflight = state.usage_runtime().inflight.lock().await;
-        if let Some(existing) = inflight.get(account_id) {
+        let mut inflight = state.usage_runtime().inflight.lock();
+        if let Some(existing) = inflight.get_mut(account_id) {
+            existing.waiters += 1;
             (
                 existing.future.clone(),
                 existing.generation,
@@ -943,6 +946,7 @@ pub(crate) async fn refresh_official_usage_with_authorization<H: UsageSyncHost>(
                 account_id.to_string(),
                 InflightEntry {
                     generation,
+                    waiters: 1,
                     future: shared.clone(),
                     authorization,
                 },
@@ -951,13 +955,15 @@ pub(crate) async fn refresh_official_usage_with_authorization<H: UsageSyncHost>(
         }
     };
 
+    let _waiter =
+        inflight_guard::InflightWaiter::new(state.usage_runtime(), account_id, generation);
     let result = future.await;
     let cleanup_hook = state.usage_runtime().before_inflight_cleanup.lock().clone();
     if let Some(hook) = cleanup_hook {
         hook().await;
     }
     {
-        let mut inflight = state.usage_runtime().inflight.lock().await;
+        let mut inflight = state.usage_runtime().inflight.lock();
         take_inflight_if_generation(&mut inflight, account_id, generation);
     }
 

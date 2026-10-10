@@ -8,6 +8,7 @@ import { createReadLifecycle, PAGE_READ_MAX_AGE_MS, type ReadOptions } from "./r
 import { useControlPlaneStore } from "./controlPlane.ts";
 import { invalidateManagementPages } from "./managementPages.ts";
 import { mapWithConcurrency } from "../utils/async.ts";
+import { withAccountRefreshDeadline } from "../domain/account-refresh-deadline.ts";
 
 export const ACCOUNT_PAGE_SIZE = 10;
 export const ACCOUNT_CARD_ROW_SIZE = 5;
@@ -47,6 +48,7 @@ export const useAccountPageStore = defineStore("accountPage", () => {
   const detailGenerations = new Map<string, number>();
   const cardGenerations = new Map<string, number>();
   const refreshFlights = new Map<string, Promise<AccountPageRefresh | null>>();
+  const refreshControllers = new Set<AbortController>();
   const controllers = new Set<AbortController>();
   let generation = 0;
   let session = 0;
@@ -286,11 +288,16 @@ export const useAccountPageStore = defineStore("accountPage", () => {
     const capturedSession = session;
     const boundVersion = page.value?.cards.flatMap(card => card.rows).find(row => row.account?.id === id)?.account?.updatedAt;
     refreshStates.value = { ...refreshStates.value, [id]: "running" };
+    const controller = new AbortController();
+    refreshControllers.add(controller);
     let promise!: Promise<AccountPageRefresh | null>;
     promise = (async () => {
       try {
-        if (!expectation && !control.hasTokens()) await control.refresh();
-        const result = await pagesApi.refreshAccount(id, mode, expectation ?? control.expectation());
+        const result = await withAccountRefreshDeadline(async signal => {
+          if (!expectation && !control.hasTokens()) await control.refresh();
+          signal.throwIfAborted();
+          return pagesApi.refreshAccount(id, mode, expectation ?? control.expectation(), signal);
+        }, controller.signal);
         if (capturedSession !== session || !currentProcess(result.revision)) return null;
         const rowVersion = page.value?.cards.flatMap(card => card.rows).find(row => row.account?.id === id)?.account?.updatedAt;
         if (boundVersion !== rowVersion || (page.value?.revision.processGeneration === result.revision.processGeneration
@@ -309,6 +316,7 @@ export const useAccountPageStore = defineStore("accountPage", () => {
         }
         return result;
       } finally {
+        refreshControllers.delete(controller);
         if (capturedSession === session) {
           const next = { ...refreshStates.value };
           delete next[id];
@@ -348,6 +356,8 @@ export const useAccountPageStore = defineStore("accountPage", () => {
 
   function clear(): void {
     session++;
+    for (const controller of refreshControllers) controller.abort();
+    refreshControllers.clear();
     invalidate();
     page.value = null;
     query.value = normalizeAccountsQuery();

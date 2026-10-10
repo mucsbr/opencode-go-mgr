@@ -1,7 +1,17 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { dashboardErrorDetail } from './errors.ts';
-import { setLocale } from '../i18n/index.ts';
+import { setLocale, t } from '../i18n/index.ts';
+import { AccountRefreshTimeoutError, ACCOUNT_REFRESH_ERROR_KEYS } from '../domain/account-refresh-deadline.ts';
+
+test('account refresh deadline uses the semantic localized error mapping', () => {
+  for (const locale of ['zh-CN', 'en-US'] as const) {
+    setLocale(locale);
+    const error = new AccountRefreshTimeoutError();
+    assert.equal(dashboardErrorDetail(error), t(ACCOUNT_REFRESH_ERROR_KEYS[error.code]));
+  }
+  setLocale('zh-CN');
+});
 
 test('known recoverable errors use the active locale while unknown diagnostics survive', () => {
   const migrationError = 'migration password is incorrect or the backup file is damaged';

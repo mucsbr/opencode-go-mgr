@@ -12,6 +12,9 @@ use crate::state::{CoreState, CoreStateInner};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
+#[path = "inflight_guard/tests.rs"]
+mod cancellation;
+
 fn fixed(ts: &str) -> DateTime<Utc> {
     DateTime::parse_from_rfc3339(ts)
         .unwrap()
@@ -1232,6 +1235,7 @@ fn take_inflight_if_generation_ignores_stale_waiters() {
         "a".into(),
         InflightEntry {
             generation: 1,
+            waiters: 1,
             future: finished.clone(),
             authorization: UsageSyncCommitAuthorization::Unconditional,
         },
@@ -1241,6 +1245,7 @@ fn take_inflight_if_generation_ignores_stale_waiters() {
         "a".into(),
         InflightEntry {
             generation: 2,
+            waiters: 1,
             future: finished,
             authorization: UsageSyncCommitAuthorization::Unconditional,
         },

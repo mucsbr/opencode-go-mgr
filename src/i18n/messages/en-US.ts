@@ -1,6 +1,7 @@
 import { managedAccountEnUSMessages } from "./managed-account.ts";
 
 export const enUSMessages = {
+  "额度刷新超时，请稍后重试": "Quota refresh timed out. Please retry later.",
   "还有更多 Key；再次导入将继续下一批。": "More Keys remain; import again to continue with the next batch.",
   "模型列表被截断，未修改已保存的模型。": "The model list was truncated; saved models were not changed.",
   "移到卡片": "Move to card",

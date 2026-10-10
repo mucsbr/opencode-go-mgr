@@ -1,4 +1,5 @@
 import { t, type MessageKey } from "../i18n/index.ts";
+import { AccountRefreshTimeoutError, ACCOUNT_REFRESH_ERROR_KEYS } from "../domain/account-refresh-deadline.ts";
 
 export const LOCAL_MUTATION_ERROR_KEYS = {
   LocalMutationBusyError: "此项操作正在保存，完成后可继续修改。",
@@ -16,6 +17,7 @@ export function userFacingError(error: unknown, networkFallback: string): string
 
 /** Error text for dashboard API failures, with the shared network fallback. */
 export function dashboardErrorDetail(error: unknown): string {
+  if (error instanceof AccountRefreshTimeoutError) return t(ACCOUNT_REFRESH_ERROR_KEYS[error.code]);
   if (error instanceof Error && Object.hasOwn(LOCAL_MUTATION_ERROR_KEYS, error.name)) {
     return t(LOCAL_MUTATION_ERROR_KEYS[error.name as keyof typeof LOCAL_MUTATION_ERROR_KEYS]);
   }

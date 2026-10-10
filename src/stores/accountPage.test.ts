@@ -4,8 +4,64 @@ import { createPinia, setActivePinia } from "pinia";
 import { pagesApi, type AccountsPage, type AccountDetail, type AccountCardCredentialsPage, type AccountPageCard, type AccountPageRow } from "../api/pages.ts";
 import { useAccountPageStore, normalizeAccountsQuery } from "./accountPage.ts";
 import { useControlPlaneStore } from "./controlPlane.ts";
+import { AccountRefreshTimeoutError, ACCOUNT_REFRESH_TIMEOUT_MS } from "../domain/account-refresh-deadline.ts";
 
 const original = { accounts: pagesApi.accounts, accountDetail: pagesApi.accountDetail, accountCredentials: pagesApi.accountCredentials, refreshAccount: pagesApi.refreshAccount };
+
+test("refresh timeout clears the spinner, keeps last-good content and allows retry without late commits", async t => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const store = setup();
+  pagesApi.accounts = async () => snapshot("last-good");
+  await store.load();
+  const before = store.page;
+  const gate = deferred<Awaited<ReturnType<typeof pagesApi.refreshAccount>>>();
+  let signal!: AbortSignal;
+  let calls = 0;
+  pagesApi.refreshAccount = async (_id, _mode, _expectation, current) => {
+    calls++; signal = current!; return gate.promise;
+  };
+  const expectation = { expectedRevision: 1, processGeneration: 1 };
+  const pending = store.refreshAccount("synthetic", "automatic", expectation);
+  const follower = store.refreshAccount("synthetic", "manual", expectation);
+  await Promise.resolve();
+  const rejected = Promise.all([pending, follower].map(result =>
+    assert.rejects(result, error => error instanceof AccountRefreshTimeoutError)));
+  t.mock.timers.tick(ACCOUNT_REFRESH_TIMEOUT_MS);
+  await rejected;
+  assert.equal(signal.aborted, true);
+  assert.equal(store.refreshStates.synthetic, undefined);
+  assert.equal(store.page, before);
+  assert.equal(calls, 1);
+  const receipt = { revision: snapshot("retry").revision, outcome: "fresh", account: null, billing: null,
+    refresh: { supported: true, observedAt: null, freshUntil: null, nextAllowedAt: null }, errors: [] };
+  pagesApi.refreshAccount = async () => receipt;
+  assert.equal((await store.refreshAccount("synthetic", "manual", expectation))?.outcome, "fresh");
+  gate.resolve({ ...receipt, outcome: "refreshed", revision: { ...receipt.revision, revision: 99 } });
+  await Promise.resolve();
+  assert.equal(store.page, before);
+  assert.equal(store.refreshStates.synthetic, undefined);
+});
+
+test("logout cancels a refresh and a late receipt cannot restore the page", async () => {
+  const store = setup();
+  pagesApi.accounts = async () => snapshot("session");
+  await store.load();
+  let signal!: AbortSignal;
+  const gate = deferred<Awaited<ReturnType<typeof pagesApi.refreshAccount>>>();
+  pagesApi.refreshAccount = async (_id, _mode, _expectation, current) => { signal = current!; return gate.promise; };
+  const pending = store.refreshAccount("synthetic", "automatic", { expectedRevision: 1, processGeneration: 1 });
+  await Promise.resolve();
+  const rejected = assert.rejects(pending, { name: "AbortError" });
+  store.clear();
+  await rejected;
+  assert.equal(signal.aborted, true);
+  assert.deepEqual(store.refreshStates, {});
+  assert.equal(store.page, null);
+  gate.resolve({ revision: snapshot("old").revision, outcome: "refreshed", account: null, billing: null,
+    refresh: { supported: true, observedAt: null, freshUntil: null, nextAllowedAt: null }, errors: [] });
+  await Promise.resolve();
+  assert.equal(store.page, null);
+});
 afterEach(() => Object.assign(pagesApi, original));
 function deferred<T>() { let resolve!: (value: T) => void; let reject!: (cause: unknown) => void;
   const promise = new Promise<T>((yes, no) => { resolve = yes; reject = no; }); return { promise, resolve, reject }; }

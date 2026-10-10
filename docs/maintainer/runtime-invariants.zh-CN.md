@@ -146,6 +146,12 @@
 
 ## 用量同步
 
+官方 Go 的在途条目记录仍在等待的调用者数量。取消只释放当前调用者；最后一个
+调用者离开时，移除同一代未完成请求并释放全局并发名额。取消不记录成功、失败
+或额度健康。仍有调用者时保留最初调用者的 CAS 提交授权。账号页刷新从排队到
+I/O 共用 90 秒客户端截止时间；超时或退出登录会取消该调用者，保留最后成功
+内容并退出按钮加载状态，不重放写操作。
+
 - 只有 OpenCode Go 的既有调度器仍是周期性用量调度器。官方 `https://opencode.ai/zen/go/v1/usage`（`go_usage.rs`）用观测到的百分比和重置替换额度窗口：已用是观测百分比，上限是 100。缺少观测时不会造出一个可用的零窗口。缺失、null 或空白观测不会存成 0。内置 OpenCode Go 与密封 Plan 对 5 小时、周、月三个百分比窗口开启手工校准。Zen、MiniMax、Kimi、Custom 和 CPA 保持关闭。显式为假的元数据不提供这个编辑，不支持的适配器返回 `invalid_request`。读取这份用量会保留已存的 5 小时、周、月费用偏移，不会改写它们。之后的请求不会把 `forward_logs` 费用累加到这些窗口上。已保存的手工百分比会保留到下一次官方或手工写入。`usage_sync.rs` 继续以全局并发 1、jitter 和可注入 seams 协调手动与已存在的调度路径；ready+enabled 账号保持原有节奏，disabled/not-ready/空 Key 账号不进入调度。手动 `POST /dashboard/api/v4/accounts/{id}/usage/refresh` 仍受节流并发去重。真实推理 429 在 adapter 支持时额外排入同一条异步、合并、节流的刷新；请求绝不等待该 I/O，也不增加全局轮询循环。失败、限流或不支持的刷新保留最后成功依据或未知。只有获取到的 Go 观测可以建立或清除 Go 额度状态。同步元数据仍在 `provider_usage_sync_state`，共享实现保留 CAS、三窗校准与全局代理。官方 Go 文档未列出该端点。
 - Command Code GOAT 保留经由 `command_code_usage.rs` / `dashboard_v3/command_code_usage_refresh.rs` 的显式 V4 刷新路径。它只把选中账号解密后的 Key 经全局代理发送到固定、不跟随重定向的端点，限制响应、校验返回上限，并在 I/O 后复查 CAS 与账号身份，再在既有节流下提交展示基线。其观测只用于展示，不能建立或清除持久化额度状态。失败保留最后成功数据或未知，绝不写推理冷却、`credentials.goat_plan_cooldowns_json` 或 `auth_error`。
 
