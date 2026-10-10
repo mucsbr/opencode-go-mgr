@@ -2,7 +2,7 @@
 //!
 //! Outbound clients should send stable lowercase kebab-case aliases. The
 //! original OpenCode Go protocol table defines its shared names. Other sealed
-//! adapters contribute unique names from their saved catalogs. Saved Zen Free rows use
+//! adapters contribute unique names from their saved catalogs. Zen-only rows use
 //! the official `-free` suffix: the original ID stays an exact raw pin, and
 //! the suffix-stripped name is published as an Alias
 //! (`muse-spark-1.3-contributor-free` → `muse-spark-1.3-contributor`).
@@ -41,6 +41,8 @@ use ocg_domain::zen::{ZenFreeModelCatalog, stripped_free_alias};
 use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::sync::OnceLock;
+
+mod opencode_go_free;
 
 /// Machine-readable error code for a raw ID that matches more than one mapping.
 pub const AMBIGUOUS_MODEL_ID: &str = "ambiguous_model_id";
@@ -328,11 +330,10 @@ fn build_runtime_registry(catalogs: RuntimeCatalogs<'_>) -> Registry {
     insert_extra_catalogs(&mut registry, catalogs.extra);
     if !catalogs.builtin_aliases.is_empty() {
         for id in catalogs.go {
-            if !is_free_model(id) {
-                insert_raw_mapping(&mut registry, go_mapping(id));
-            }
+            insert_raw_mapping(&mut registry, go_mapping(id));
         }
     }
+    opencode_go_free::insert_catalog(&mut registry, catalogs);
     replace_builtin_aliases(&mut registry, catalogs.builtin_aliases);
     join_cpa_shared_public_names(&mut registry, catalogs);
     registry
@@ -538,8 +539,7 @@ fn published_routeable_from_index(index: &RuntimeCatalogIndex) -> Vec<PublishedA
         });
     }
     for id in catalogs.go {
-        if is_free_model(id)
-            || has_builtin_override(catalogs, OPENCODE_PROVIDER_ID, id)
+        if has_builtin_override(catalogs, OPENCODE_PROVIDER_ID, id)
             || published.iter().any(|item| item.alias == *id)
         {
             continue;
@@ -1497,7 +1497,8 @@ pub fn published_routeable_aliases_with_runtime_catalogs(
 }
 
 /// Client-visible names: generated and explicit aliases plus uniquely resolved
-/// exact Go IDs. Discovery alone does not create shared aliases. Hosts
+/// exact Go IDs. Go's saved full `-free` public names may share the identical
+/// Zen ID; other newly discovered Go IDs stay pins. Hosts
 /// still apply protocol enablement and the operator publication switch.
 pub fn published_routeable_models_with_runtime_catalogs(
     catalogs: RuntimeCatalogs<'_>,

@@ -862,10 +862,9 @@ async fn dashboard_v3_provider_contracts_project_builtin_scopes_and_custom_endpo
 }
 
 #[tokio::test]
-async fn dashboard_v3_provider_contracts_hide_zen_free_models_from_go_scope() {
+async fn dashboard_v3_provider_contracts_preserve_go_free_models_in_go_scope() {
     let harness = start_loopback("providers-contracts-go-free-filter").await;
-    // Simulate a persisted Go catalog row that still contains Zen Free ids
-    // (written before the refresh write filter existed).
+    // Go directory membership is authoritative even for IDs ending in `-free`.
     let now = chrono::Utc::now();
     harness
         .state
@@ -907,13 +906,13 @@ async fn dashboard_v3_provider_contracts_hide_zen_free_models_from_go_scope() {
         .expect("go group");
     assert!(go.catalog.models.contains(&"glm-5.3".to_string()));
     assert!(
-        !go.catalog.models.iter().any(|id| is_free_model(id)),
+        go.catalog.models.iter().any(|id| is_free_model(id)),
         "{:?}",
         go.catalog.models
     );
     assert!(go.models.iter().any(|model| model.model_id == "glm-5.3"));
     assert!(
-        !go.models.iter().any(|model| is_free_model(&model.model_id)),
+        go.models.iter().any(|model| is_free_model(&model.model_id)),
         "{:?}",
         go.models
             .iter()

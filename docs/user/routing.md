@@ -31,6 +31,16 @@ This does not re-enable models you explicitly disabled or removed, and does
 not probe protocols during inference. A local catalog/protocol test is not
 proof that a live account has access to the model.
 
+Go keeps every valid ID from its own official directory, including `-free`
+models; that suffix does not make a model Zen-only. A saved lowercase kebab
+Go ID such as `step-5-preview-free` is published with its full name. If Zen's
+saved directory also contains that exact ID, the full name can select either
+channel in account order. Go uses `/zen/go/v1` with the selected Go Key; Zen
+uses `/zen/v1` without a Key. Both send the unchanged `-free` upstream ID.
+The suffix-stripped Zen alias keeps its existing meaning. Protocol switches,
+model scopes, grants and cooldowns still apply independently. After upgrading,
+refresh the Go model catalog to restore rows excluded by older versions.
+
 ## 429 Cooldowns And Official Observation
 
 An unrecognized upstream `429` starts a temporary cooldown for the exact Key that

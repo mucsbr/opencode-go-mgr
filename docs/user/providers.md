@@ -164,7 +164,8 @@ Provider namespace and strips a known plan suffix only when the shorter name is
 already authorized. Normalization collisions and names reserved to raw-only Go
 rows stay unpublished; every row retains its exact raw upstream ID. Explicit saved names keep their target within the same provider; a later row whose generated name conflicts keeps its exact raw pin and needs a distinct public name. A Zen Free row
 publishes its suffix-stripped Alias from the official `-free` suffix;
-the original `-free` ID remains an exact raw pin,
+a Zen-only original ID remains an exact raw pin; matching Go rows also
+authorize the full shared public name,
 as described under
 [Zen Free models](routing.md#zen-free-models).
 

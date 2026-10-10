@@ -25,7 +25,6 @@ use std::time::Duration;
 
 use crate::alias;
 use crate::goat;
-use crate::kernel::ids::is_free_model;
 #[cfg(debug_assertions)]
 use crate::kernel::zen::{ZEN_MODELS_SOURCE_URL, parse_catalog};
 use crate::kernel::zen::{ZenFreeModelCatalog, model_views};
@@ -399,21 +398,8 @@ async fn refresh_go_or_command_catalog(
     )
     .await;
     let official_protocols = discovery.protocol_baseline.prefer_catalog(docs_protocols);
-    // Zen Free owns every `-free` id; keep them out of the persisted Go
-    // catalog so they never reach the Go provider-contracts surface.
-    let models = if provider_id == OPENCODE_PROVIDER_ID {
-        let filtered: Vec<String> = models.into_iter().filter(|id| !is_free_model(id)).collect();
-        if filtered.is_empty() {
-            audit_catalog_failure(state, provider_id, "zen_only_catalog");
-            return Err(V3ApiError::outbound_failed(
-                state,
-                "provider model refresh returned only Zen Free models",
-            ));
-        }
-        filtered
-    } else {
-        models
-    };
+    // The directory belongs to the requested provider. Go also officially
+    // serves some `-free` IDs; the suffix does not transfer ownership to Zen.
 
     let now = Utc::now();
     let _settings_update = state.settings_update.lock();
@@ -1353,14 +1339,13 @@ struct PreparedProtocolProbe {
 fn ensure_probe_model_is_current(
     state: &CoreState,
     scope: &ContractScope,
-    provider_id: &str,
+    _provider_id: &str,
     model_id: &str,
 ) -> Result<(), V3ApiError> {
     let contracts = state.provider_contracts();
-    let catalog_contains_model = contracts.scope(scope).is_some_and(|contract| {
-        contract.catalog.models.iter().any(|id| id == model_id)
-            && !(provider_id == OPENCODE_PROVIDER_ID && is_free_model(model_id))
-    });
+    let catalog_contains_model = contracts
+        .scope(scope)
+        .is_some_and(|contract| contract.catalog.models.iter().any(|id| id == model_id));
     if catalog_contains_model {
         Ok(())
     } else {
@@ -1989,7 +1974,7 @@ pub(crate) fn provider_contracts_from_capture(
             .filter(|account| account.provider_id == plan.provider_id)
             .map(|account| account_choice(account, statuses))
             .collect();
-        let mut catalog = catalog_from_domain(&contract.catalog);
+        let catalog = catalog_from_domain(&contract.catalog);
         let aliases = crate::alias::catalog_aliases(descriptor.provider_id, alias_catalogs);
         let mut models: Vec<EffectiveModelContract> = contract
             .models
@@ -2014,14 +1999,6 @@ pub(crate) fn provider_contracts_from_capture(
                     model.alias = saved.public_model.clone();
                 }
             }
-        }
-        if descriptor.provider_id == OPENCODE_PROVIDER_ID {
-            // Presentation-only filter: Zen Free owns every `-free` id, so the
-            // Go scope must not project them even when a persisted catalog row
-            // still contains them. The effective contract set used by gateway
-            // routing is left untouched.
-            catalog.models.retain(|id| !is_free_model(id));
-            models.retain(|model| !is_free_model(&model.model_id));
         }
         let presentation = saved_projection
             .destinations

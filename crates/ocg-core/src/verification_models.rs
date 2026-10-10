@@ -118,12 +118,8 @@ pub(crate) fn discovered_go_contract(
         ContractEvidenceSource, PersistedModelProtocol, PersistedScopeRow,
     };
     let scope = ContractScope::provider(crate::provider::OPENCODE_PROVIDER_ID);
-    let models: Vec<_> = models
-        .into_iter()
-        .filter(|id| !crate::gateway::free_models::is_free_model(id))
-        .collect();
     if models.is_empty() {
-        return Err("OpenCode Go directory returned no paid models; refresh its model directory and retry Key verification".into());
+        return Err("OpenCode Go directory returned no models; refresh its model directory and retry Key verification".into());
     }
     let now = chrono::Utc::now();
     let mut persisted = persisted.clone();

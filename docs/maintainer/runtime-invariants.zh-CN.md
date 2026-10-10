@@ -103,14 +103,14 @@
 
 - 动态供应商模型默认继承供应商地址和协议，`upstream_override` 可显式覆盖二者。实际转发与账号模型测试共用有效路由解析，鉴权仍归供应商所有。覆盖地址使用与供应商地址相同的可信管理员校验。隔离的 Custom/动态带密钥发送要求实际解析出的端点 id **和** Origin 都在已存绑定授权中；当前连接 URL 不是隐式授权。显式授权过的、当前已配置的外站 Origin 覆盖可以发送；未授权覆盖的 HTTP 命中为零。改供应商 URL 不会授权。路由解析可以构造外站覆盖 AttemptSpec；存档授权才是解密/发送门闩。无鉴权定义仍可指向另一 Origin。已存 Key 的协议探测与账号模型测试走同一条实时授权路径。密封适配器保持密封（官方 Origin 或文档化的回环测试缝）。同一准确上游 ID 的多个公开别名必须解析为相同协议和推理地址；保存或导入时拒绝冲突，不按行顺序挑选。覆盖与模板来源分开保存。草稿测试只请求配置指定的路由，不猜测同级路径。
 
-- 客户端别名位于 `ocg_gateway::alias`（`ocg-core` 的 `alias.rs` 是兼容 facade）。Go 种子由代码持有；新发现的 MiniMax CN、Kimi CN、GOAT 与 Ollama 别名从完整已保存目录生成，使用归一化最后一节或词干，Ollama 同词干多标签时使用完整标签别名。已保存旧别名保持不变。升级过的 Nemotron 只保留旧短别名，新增目录行使用完整的最后一节名称。保存的 Kimi 滚动名称保持不变，新发现的 `k3` 使用 `k3`。Command 去掉 Provider 命名空间，只有在短名已获授权时才去掉 `-paid` / `-free`；命名结果与目录顺序无关。管理投影和运行时解析使用同一套完整目录冲突规则。已保存自定义别名只替换其精确上游映射。Alias 拼写可以大小写折叠；内置 raw ID 则严格区分大小写，包括官方混合大小写 ID，以及含 `/`、`_` 或空格的 ID。Custom 声明 ID 保持原有大小写折叠 matcher。raw ID 若恰好只有一条注册表映射，则在检查可路由性前先固定到该 mapping；不可路由的 mapping 仍被识别，但无法产生生产路由。重叠的精确 raw ID返回 `ambiguous_model_id`，不会调用上游。每一行都保留精确 raw ID。Zen Free 的 `foo-free` 始终是精确 raw pin，并按官方 `-free` 后缀公布 Alias `foo`；共享的已授权 Alias 按账号卡片持久化顺序选择。带日期标签的快照 id 是运行时目录数据，严禁写进代码。符合条件的 Custom 声明 ID 叠加进解析与 `/v1/models`，但不得抢占已发布 Alias。`/v1/models` 只有在精确保存目录行仍存在且至少一个 mapping 有启用的 effective 协议时才发布该 Alias；供应商全关后不产生路由。转发日志区分 `requested_model`、`resolved_alias` 与 `upstream_model`；`native_cost_*` 为可选。
+- 客户端别名位于 `ocg_gateway::alias`（`ocg-core` 的 `alias.rs` 是兼容 facade）。Go 种子由代码持有；新发现的 MiniMax CN、Kimi CN、GOAT 与 Ollama 别名从完整已保存目录生成，使用归一化最后一节或词干，Ollama 同词干多标签时使用完整标签别名。已保存旧别名保持不变。升级过的 Nemotron 只保留旧短别名，新增目录行使用完整的最后一节名称。保存的 Kimi 滚动名称保持不变，新发现的 `k3` 使用 `k3`。Command 去掉 Provider 命名空间，只有在短名已获授权时才去掉 `-paid` / `-free`；命名结果与目录顺序无关。管理投影和运行时解析使用同一套完整目录冲突规则。已保存自定义别名只替换其精确上游映射。Alias 拼写可以大小写折叠；内置 raw ID 则严格区分大小写，包括官方混合大小写 ID，以及含 `/`、`_` 或空格的 ID。Custom 声明 ID 保持原有大小写折叠 matcher。raw ID 若恰好只有一条注册表映射，则在检查可路由性前先固定到该 mapping；不可路由的 mapping 仍被识别，但无法产生生产路由。没有已授权共享公开名称的重叠精确 raw ID 返回 `ambiguous_model_id`，不会调用上游。每一行都保留精确 raw ID。仅有 Zen 的 `foo-free` 保留精确 raw pin 并公布 Alias `foo`；Go 自己的目录也保存该小写 kebab ID 时，完整名称成为可与相同 Zen 行共享的公开名称，两条映射均保留原始上游 ID；共享的已授权 Alias 按账号卡片持久化顺序选择。带日期标签的快照 id 是运行时目录数据，严禁写进代码。符合条件的 Custom 声明 ID 叠加进解析与 `/v1/models`，但不得抢占已发布 Alias。`/v1/models` 只有在精确保存目录行仍存在且至少一个 mapping 有启用的 effective 协议时才发布该 Alias；供应商全关后不产生路由。转发日志区分 `requested_model`、`resolved_alias` 与 `upstream_model`；`native_cost_*` 为可选。
 
 | 判定 | 结果 |
 | --- | --- |
 | 代码持有的 kebab Alias | 解析为 Alias；仅在已保存目录行存在且至少一个 mapping 有启用的 effective 协议时发布 |
 | 唯一 raw ID | 在检查可路由性前固定到该 mapping；不可路由 mapping 仍被识别但不发布 |
 | 重叠的精确 raw ID | `400` `ambiguous_model_id`；不上游 |
-| Zen `foo-free` | 始终是精确 raw pin；同时按 `-free` 后缀公布 Alias `foo` |
+| OpenCode `foo-free` | 仅有 Zen 时为精确 raw pin 加 Alias `foo`；Go 也保存时，完整名称可与相同 Zen 行共享，绝不替换为付费 ID |
 | GOAT 长名 / 后缀 | 新增行使用归一化最后一节；仅在短名已获授权时剥 `-paid`/`-free`；Nemotron 短名只为升级过的已保存别名保留 |
 | MiniMax / Kimi 目录别名 | 新增行使用归一化最后一节；已保存旧别名保持不变；每一行保留精确 raw pin |
 | 符合条件的 Custom 声明 ID | 叠加进解析与 `/v1/models`；不得抢占已发布 Alias |
@@ -128,7 +128,7 @@
 
 ## Zen Free
 
-- Zen Free 是特殊的内置账号，没有 Key；只有账号卡片启用开关。管理员在 Providers 页点击“获取模型” (Fetch Models) 时，请求固定官方目录，仅保留以 `-free` 结尾的规范化有效 ID并持久化上次成功快照。每个保存 ID 都保留精确 raw pin，去掉 `-free` 后公布对应 Alias。刷新失败或空结果不会覆盖旧快照。不需要 Free 时关闭卡片；启用时按卡片顺序与其他账号一起被选择。协议探测控件也在 Providers 页，而不是账号卡片。Zen Free 与 Go 使用独立的 `cooldown_free_until`；Zen Free 配额按出口 IP 共享，429 限制匿名 Free 通道而不切换 Key。已知重置证据持久化为 Free 冷却，恢复未知则进入本地单飞等待。路由继续尝试后续兼容卡片；仅有 Free 本地等待且无已知重置时返回 503，不虚构额度截止时间。Zen Free 的推理 `401` 原样返回。OpenCode Go 仅在已限长 JSON 错误体精确满足 `/error/type == "CreditsError"` 时换号并写入 `auth_error`；`ModelError`、未知、畸形、截断或读取失败的 401 仍原样返回。重新保存同一个 Key 会清除该断路状态。面板 Ping / Key 验证的 401 仍记录 `auth_error`。Free 通道成功行记录 `cost_state=free`，不计入 Go 配额。
+- Zen Free 是特殊的内置账号，没有 Key；只有账号卡片启用开关。管理员在 Providers 页点击“获取模型” (Fetch Models) 时，请求固定官方目录，仅保留以 `-free` 结尾的规范化有效 ID并持久化上次成功快照。仅有 Zen 的 ID 保留精确 raw pin；Go 也保存相同小写 kebab 行时，完整名称可共享。去掉 `-free` 后仍公布原有 Zen Alias。刷新失败或空结果不会覆盖旧快照。不需要 Free 时关闭卡片；启用时按卡片顺序与其他账号一起被选择。协议探测控件也在 Providers 页，而不是账号卡片。Zen Free 与 Go 使用独立的 `cooldown_free_until`；Zen Free 配额按出口 IP 共享，429 限制匿名 Free 通道而不切换 Key。已知重置证据持久化为 Free 冷却，恢复未知则进入本地单飞等待。路由继续尝试后续兼容卡片；仅有 Free 本地等待且无已知重置时返回 503，不虚构额度截止时间。Zen Free 的推理 `401` 原样返回。OpenCode Go 仅在已限长 JSON 错误体精确满足 `/error/type == "CreditsError"` 时换号并写入 `auth_error`；`ModelError`、未知、畸形、截断或读取失败的 401 仍原样返回。重新保存同一个 Key 会清除该断路状态。面板 Ping / Key 验证的 401 仍记录 `auth_error`。Free 通道成功行记录 `cost_state=free`，不计入 Go 配额。
 
 ## OpenRouter Free
 

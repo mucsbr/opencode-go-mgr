@@ -1116,7 +1116,7 @@ async fn command_code_contract_refresh_leaves_undocumented_rows_unavailable_and_
 }
 
 #[tokio::test]
-async fn go_model_refresh_filters_zen_free_models_before_persisting() {
+async fn go_model_refresh_preserves_official_free_models_before_persisting() {
     let harness = start_loopback("go-refresh-free-filter").await;
     force_direct_proxy(&harness);
     let go_origin = start_origin(
@@ -1141,19 +1141,68 @@ async fn go_model_refresh_filters_zen_free_models_before_persisting() {
     assert_eq!(status, StatusCode::OK, "{go_models}");
     assert_eq!(
         go_models["models"],
-        json!(["glm-5.3"]),
-        "Zen Free ids must be filtered out of the persisted Go catalog"
+        json!(["glm-5.3", "hy3-free"]),
+        "Go directory membership must not be filtered by a model suffix"
     );
 
-    // The persisted catalog (and therefore the reloaded routing view) is
-    // filtered, so future rebuilds cannot surface Zen Free ids under Go.
+    // The complete official Go directory survives reload independently of Zen.
     let contracts = harness.state.provider_contracts();
     let go_scope = contracts
         .providers
         .get(OPENCODE_PROVIDER_ID)
         .expect("go scope");
-    assert_eq!(go_scope.catalog.models, vec!["glm-5.3".to_string()]);
-    assert!(!go_scope.models.contains_key("hy3-free"));
+    assert_eq!(
+        go_scope.catalog.models,
+        vec!["glm-5.3".to_string(), "hy3-free".to_string()]
+    );
+    assert!(go_scope.models.contains_key("hy3-free"));
+    harness.stop();
+}
+
+#[tokio::test]
+async fn go_free_only_catalog_refresh_is_keyless_and_keeps_documented_protocol() {
+    let harness = start_loopback("go-free-only-refresh").await;
+    force_direct_proxy(&harness);
+    let _docs = ocg_core::dashboard_v3::install_official_protocol_fetch_for_tests(
+        harness.state.process_generation(),
+        |_| {
+            ocg_core::dashboard_v3::OfficialProtocolBaseline::mapped([(
+                "step-5-preview-free",
+                ocg_core::provider::UpstreamProtocolKind::ChatCompletions,
+            )])
+        },
+    );
+    let origin = start_origin(
+        StatusCode::OK,
+        r#"{"data":[{"id":"step-5-preview-free"}]}"#,
+        Duration::ZERO,
+    )
+    .await;
+    let mut config = harness.state.config();
+    config.upstream_base_url = format!("{}/zen/go", origin.url);
+    harness.state.set_config(config).unwrap();
+    let (status, receipt) = send_json(
+        &harness,
+        Method::POST,
+        &format!("/providers/{OPENCODE_PROVIDER_ID}/models/refresh"),
+        &cas(&harness, json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{receipt}");
+    assert_eq!(receipt["models"], json!(["step-5-preview-free"]));
+    let contracts = harness.state.provider_contracts();
+    let go = contracts.providers.get(OPENCODE_PROVIDER_ID).unwrap();
+    assert!(go.models["step-5-preview-free"].routable);
+    assert!(
+        go.models["step-5-preview-free"]
+            .enabled_protocols()
+            .contains(&ocg_core::provider::UpstreamProtocolKind::ChatCompletions)
+    );
+    let calls = origin.calls.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].path, "/zen/go/v1/models");
+    assert!(calls[0].authorization.is_none());
+    assert!(calls[0].x_api_key.is_none());
     harness.stop();
 }
 

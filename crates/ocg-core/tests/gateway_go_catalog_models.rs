@@ -109,6 +109,112 @@ async fn issue58_refreshed_go_models_reach_correct_upstream_and_preserve_client_
 }
 
 #[tokio::test]
+async fn go_free_directory_model_routes_by_card_order_without_leaking_keys_to_zen() {
+    use ocg_core::provider::{OPENCODE_ZEN_FREE_PROVIDER_ID, ZEN_FREE_ACCOUNT_ID};
+    const MODEL: &str = "step-5-preview-free";
+    let p = PreparedFallback::zen_go(&[("key-1", &[ok(), ok()]), ("", &[ok()])], &["key-1"]).await;
+    set_catalog(&p.state, MODEL, UpstreamProtocolKind::ChatCompletions, true);
+    let now = Utc::now();
+    let zen_scope = ContractScope::provider(OPENCODE_ZEN_FREE_PROVIDER_ID);
+    {
+        let db = p.state.db.lock();
+        db.set_contract_catalog(
+            &zen_scope,
+            &[MODEL.into()],
+            Some(now),
+            "official_zen",
+            "https://opencode.ai/zen/v1/models",
+            now,
+        )
+        .unwrap();
+        db.apply_official_protocol_baseline(
+            &zen_scope,
+            &[MODEL.into()],
+            &OfficialProtocolBaseline::mapped([(MODEL, UpstreamProtocolKind::ChatCompletions)]),
+            now,
+        )
+        .unwrap();
+        db.set_zen_free_enabled(false).unwrap();
+        db.reorder_accounts(&["acct-1".into(), ZEN_FREE_ACCOUNT_ID.into()])
+            .unwrap();
+    }
+    p.state.reload_provider_contracts().unwrap();
+    let h = p.bind().await;
+    let (status, models) = h.models().await;
+    assert_eq!(status, StatusCode::OK);
+    let models: Value = serde_json::from_str(&models).unwrap();
+    assert!(
+        models["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["id"] == MODEL)
+    );
+    assert!(h.calls.lock().unwrap().is_empty());
+    assert_eq!(
+        h.protocol("/v1/chat/completions", MODEL).await.0,
+        StatusCode::OK
+    );
+    h.state.db.lock().set_zen_free_enabled(true).unwrap();
+    assert_eq!(h.protocol("/v1/responses", MODEL).await.0, StatusCode::OK);
+    h.state
+        .db
+        .lock()
+        .reorder_accounts(&[ZEN_FREE_ACCOUNT_ID.into(), "acct-1".into()])
+        .unwrap();
+    assert_eq!(
+        h.protocol("/v1/chat/completions", MODEL).await.0,
+        StatusCode::OK
+    );
+    let calls = h.calls.lock().unwrap();
+    assert_eq!(calls.len(), 3);
+    for call in &calls[..2] {
+        assert_eq!(call.path, "/zen/go/v1/chat/completions");
+        assert_eq!(call.authorization.as_deref(), Some("Bearer key-1"));
+        assert_eq!(
+            serde_json::from_str::<Value>(&call.body).unwrap()["model"],
+            MODEL
+        );
+    }
+    assert_eq!(calls[2].path, "/zen/v1/chat/completions");
+    assert!(calls[2].authorization.is_none());
+    assert!(calls[2].x_api_key.is_none());
+    assert!(calls[2].x_goog_api_key.is_none());
+    assert_eq!(
+        serde_json::from_str::<Value>(&calls[2].body).unwrap()["model"],
+        MODEL
+    );
+}
+
+#[tokio::test]
+async fn disabled_go_free_model_is_unpublished_and_never_sends() {
+    const MODEL: &str = "step-5-preview-free";
+    let p = PreparedFallback::go(&[("key-1", &[ok()])], &["key-1"]).await;
+    set_catalog(
+        &p.state,
+        MODEL,
+        UpstreamProtocolKind::ChatCompletions,
+        false,
+    );
+    let h = p.bind().await;
+    let (status, models) = h.models().await;
+    assert_eq!(status, StatusCode::OK);
+    let models: Value = serde_json::from_str(&models).unwrap();
+    assert!(
+        !models["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["id"] == MODEL)
+    );
+    assert_ne!(
+        h.protocol("/v1/chat/completions", MODEL).await.0,
+        StatusCode::OK
+    );
+    assert!(h.calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn issue58_unlisted_disabled_and_removed_models_never_send_upstream() {
     let p = PreparedFallback::go(&[("key-1", &[ok()])], &["key-1"]).await;
     set_catalog(

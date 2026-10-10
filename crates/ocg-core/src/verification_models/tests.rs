@@ -243,6 +243,48 @@ fn discovery_requires_actual_protocol_facts_and_preserves_saved_controls() {
 }
 
 #[test]
+fn discovery_accepts_free_only_go_directory_without_guessing_protocols() {
+    let saved_scope = scope();
+    let projection = crate::destination_projection::DestinationProjection {
+        destinations: vec![
+            ocg_domain::destination::destination_from_legacy(
+                &ocg_domain::destination::LegacyDestinationFacts::Builtin {
+                    provider_id: OPENCODE_PROVIDER_ID.into(),
+                },
+            )
+            .unwrap(),
+        ],
+        credentials: Vec::new(),
+    };
+    for (baseline, available) in [
+        (crate::goat::OfficialProtocolBaseline::Unavailable, false),
+        (
+            crate::goat::OfficialProtocolBaseline::mapped([(
+                "step-5-preview-free",
+                UpstreamProtocolKind::ChatCompletions,
+            )]),
+            true,
+        ),
+    ] {
+        let discovered = discovered_go_contract(
+            vec!["step-5-preview-free".into()],
+            &baseline,
+            &saved_scope,
+            &Default::default(),
+            &projection,
+            "https://opencode.ai/zen/go",
+        )
+        .unwrap();
+        assert_eq!(discovered.catalog.models, ["step-5-preview-free"]);
+        let selected = select_verification_model(&discovered, Some("step-5-preview-free"));
+        assert_eq!(selected.is_ok(), available);
+        if let Ok(selected) = selected {
+            assert_eq!(selected.model, "step-5-preview-free");
+        }
+    }
+}
+
+#[test]
 fn go_directory_parser_and_official_docs_enable_a_real_fresh_projection() {
     let dir = std::env::temp_dir().join(format!("ocg-verification-fresh-{}", uuid::Uuid::new_v4()));
     let db = crate::db::Database::open(dir.clone()).unwrap();
