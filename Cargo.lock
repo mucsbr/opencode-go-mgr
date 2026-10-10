@@ -2290,6 +2290,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "jsonc-parser"
+version = "0.34.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0ecded084f9b9a718d39668a42657c32253663d1f6afb3fbb9134f0305f73f48"
+dependencies = [
+ "serde_json",
+]
+
+[[package]]
 name = "jsonptr"
 version = "0.6.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2811,7 +2820,7 @@ dependencies = [
 
 [[package]]
 name = "ocg-browser-worker"
-version = "2.10.0"
+version = "2.11.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -2829,7 +2838,7 @@ dependencies = [
 
 [[package]]
 name = "ocg-core"
-version = "2.10.0"
+version = "2.11.0"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -2844,6 +2853,7 @@ dependencies = [
  "getrandom 0.3.4",
  "hex",
  "hmac",
+ "jsonc-parser",
  "nix",
  "ocg-domain",
  "ocg-gateway",
@@ -2872,7 +2882,7 @@ dependencies = [
 
 [[package]]
 name = "ocg-domain"
-version = "2.10.0"
+version = "2.11.0"
 dependencies = [
  "chrono",
  "schemars 1.2.2",
@@ -2884,7 +2894,7 @@ dependencies = [
 
 [[package]]
 name = "ocg-gateway"
-version = "2.10.0"
+version = "2.11.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -2895,7 +2905,7 @@ dependencies = [
 
 [[package]]
 name = "ocg-infra"
-version = "2.10.0"
+version = "2.11.0"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -2909,7 +2919,7 @@ dependencies = [
 
 [[package]]
 name = "ocg-manager"
-version = "2.10.0"
+version = "2.11.0"
 dependencies = [
  "anyhow",
  "nix",
@@ -2929,7 +2939,7 @@ dependencies = [
 
 [[package]]
 name = "ocg-manager-cli"
-version = "2.10.0"
+version = "2.11.0"
 dependencies = [
  "anyhow",
  "chrono",

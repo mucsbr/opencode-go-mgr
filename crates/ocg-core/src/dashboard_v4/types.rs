@@ -4,6 +4,9 @@
 //! fields as `T | null`. Listings and onboarding results are secret-free. The
 //! error envelope reuses the V3 DTO so clients can share one decoder.
 
+mod copilot;
+pub use copilot::*;
+
 pub use super::pages::types::*;
 
 use schemars::JsonSchema;
@@ -19,7 +22,7 @@ pub use crate::billing_types::{
     BillingStatus, CreditBalanceCorrection, CreditCalibrationRequest, CreditConfigurationWrite,
     CreditConfigureRequest, CreditGrantRequest,
 };
-pub use crate::byok_application::{ByokClient, ByokInspection, ByokStatus};
+pub use crate::byok_application::{ByokClient, ByokInspection, ByokPreview, ByokStatus};
 pub use crate::db::routing_cards::RoutingCard;
 pub use crate::model_metadata::ModelMetadata;
 
@@ -39,12 +42,27 @@ pub struct ByokApplication {
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ByokPreviewRequest {
+    pub target_path: Option<String>,
+    pub copilot_token_budget: Option<crate::byok_application::CopilotTokenBudget>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ByokConfigureRequest {
     pub expected_revision: u64,
     pub process_generation: u64,
     pub target_path: Option<String>,
     pub expected_fingerprint: String,
     pub client_closed: bool,
+    pub preview_fingerprint: Option<String>,
+    #[serde(default)]
+    pub acknowledge_takeover: bool,
+    #[serde(default)]
+    pub acknowledge_overwrite: bool,
+    #[serde(default)]
+    pub acknowledge_removal: bool,
+    pub copilot_token_budget: Option<crate::byok_application::CopilotTokenBudget>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
@@ -111,6 +129,8 @@ pub const CATALOG_TYPE_NAMES: &[&str] = &[
     "ByokClient",
     "ByokStatus",
     "ByokInspection",
+    "ByokPreview",
+    "ByokPreviewRequest",
     "ByokApplication",
     "ByokConfigureRequest",
     "ByokMutationRequest",
@@ -162,6 +182,13 @@ pub const CATALOG_TYPE_NAMES: &[&str] = &[
     "CatalogModelsRemoveResult",
     "AliasPublication",
     "AliasPublicationUpdate",
+    "CopilotTarget",
+    "CopilotStatus",
+    "CopilotInstallation",
+    "CopilotInspection",
+    "CopilotApplication",
+    "CopilotInstallRequest",
+    "CopilotMutationRequest",
     "DshApplicationStatus",
     "DshApplication",
     "DshDiscoveredProfile",
@@ -2021,10 +2048,16 @@ pub fn contract_schema() -> Value {
     include_type::<crate::dashboard_v3::ProviderContracts>(&mut serialize);
     include_type::<CatalogModelsRemoveResult>(&mut serialize);
     include_type::<AliasPublication>(&mut serialize);
+    include_type::<CopilotTarget>(&mut serialize);
+    include_type::<CopilotStatus>(&mut serialize);
+    include_type::<CopilotInstallation>(&mut serialize);
+    include_type::<CopilotInspection>(&mut serialize);
+    include_type::<CopilotApplication>(&mut serialize);
     include_type::<DshApplicationStatus>(&mut serialize);
     include_type::<ByokClient>(&mut serialize);
     include_type::<ByokStatus>(&mut serialize);
     include_type::<ByokInspection>(&mut serialize);
+    include_type::<ByokPreview>(&mut serialize);
     include_type::<ByokApplication>(&mut serialize);
     include_type::<DshApplicationOutcome>(&mut serialize);
     include_type::<DshApplication>(&mut serialize);
@@ -2111,7 +2144,10 @@ pub fn contract_schema() -> Value {
     include_type::<CatalogModelsAddRequest>(&mut deserialize);
     include_type::<CatalogModelsRemoveRequest>(&mut deserialize);
     include_type::<AliasPublicationUpdate>(&mut deserialize);
+    include_type::<CopilotInstallRequest>(&mut deserialize);
+    include_type::<CopilotMutationRequest>(&mut deserialize);
     include_type::<DshApplicationInstallRequest>(&mut deserialize);
+    include_type::<ByokPreviewRequest>(&mut deserialize);
     include_type::<ByokConfigureRequest>(&mut deserialize);
     include_type::<ByokMutationRequest>(&mut deserialize);
     include_type::<DshApplicationUninstallRequest>(&mut deserialize);

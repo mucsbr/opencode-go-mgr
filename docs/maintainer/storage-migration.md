@@ -9,7 +9,7 @@ upstream v38 introduced platform tables. The isolated `db/fork_compat.rs`
 bridge recognizes that exact legacy marker, writes a schema-checked SQLite
 `data.sqlite.pre-fork-v38.<timestamp>.bak` and SHA-256 sidecar, then creates the
 missing upstream platform tables transactionally without changing the version
-number. Normal upstream migrations continue to v66. Accounts, Keys and logs
+number. Normal upstream migrations continue to v67. Accounts, Keys and logs
 follow those migrations. Old Alias rows remain stored for recovery but are
 not imported into the new model mappings or used in routing. A partial platform
 schema is rejected. Production rollback still requires the full pre-upgrade
@@ -20,6 +20,12 @@ month deadline in `goat_plan_cooldowns_json` using a usable saved purchase date;
 the same upstream reset/rotation/import rules apply to that map.
 
 Operator contract for upgrades, backups, and rollback. Schema details are in [Persistence](state-and-lifecycle.md#persistence).
+
+## Schema v67 — saved catalog compatibility
+
+v67 changes saved data only; it adds no table or column. After a verified `data.sqlite.pre-v67.<timestamp>.bak` and SHA-256 sidecar for an existing database, one transaction preserves the default public names of retained Kimi `k3`/`k3-256k` and GOAT Nemotron rows as explicit catalog mappings. Operator renames remain unchanged, conflicting names are skipped, and raw IDs and credential scopes are preserved. Existing nonempty GOAT protocol declarations within the adapter bounds retain support through saved preset evidence; empty or unsupported rows gain no protocol. Existing disable choices remain disabled.
+
+The historical naming snapshot runs once while moving schema 66 to 67. Refresh and transfer preserve those saved names; fresh discoveries and deleted/reintroduced rows use catalog-derived names. Reopening schema 67 does not replay the migration or create another backup. Failure rolls back names, evidence, and schema version together. Older binaries reject schema 67; rollback uses the verified pre-v67 database with its matching encryption key, or the complete pre-upgrade data directory. The portable payload remains V12; schema 67 is an internal storage version, not a product release version.
 
 ## Schema v66 — GOAT Key-local plan windows
 
@@ -119,7 +125,7 @@ Downgrades are not supported: never point an older binary at a migrated database
 
 ## Schema v27 and the pre-v3 snapshot
 
-`CURRENT_SCHEMA_VERSION = 66` (`crates/ocg-core/src/db.rs`). Historical migrations v1–v57 remain described below. v58 adds `destinations.model_resolution`, backfills `adapter_defined` / `public_only` / `public_and_upstream`, changes legacy Custom destinations to unbounded credential capacity, preserves every destination and credential ID, and writes a verified pre-v58 SQLite backup for a non-fresh canonical v57 source before mutation. v60 additively stores `credentials.quota_recovery_json` (see above). v66 additively stores `credentials.goat_plan_cooldowns_json` (see above).
+`CURRENT_SCHEMA_VERSION = 67` (`crates/ocg-core/src/db.rs`). Historical migrations v1–v57 remain described below. v58 adds `destinations.model_resolution`, backfills `adapter_defined` / `public_only` / `public_and_upstream`, changes legacy Custom destinations to unbounded credential capacity, preserves every destination and credential ID, and writes a verified pre-v58 SQLite backup for a non-fresh canonical v57 source before mutation. v60 additively stores `credentials.quota_recovery_json` (see above). v66 additively stores `credentials.goat_plan_cooldowns_json` (see above).
 
 ## Schema v45 — identity / credential / binding satellites
 

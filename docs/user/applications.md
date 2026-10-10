@@ -2,6 +2,8 @@
 
 # Applications
 
+The native configuration tabs are **Codex**, **Kimi Code**, **MiniMax Code**, and **ZCode**. **VS Code Copilot** and **DSH** use their concrete extension/plugin flows below.
+
 ## Codex, Kimi Code, MiniMax Code, and ZCode
 
 These tabs add an **Open Console Gateway** model provider to an existing local client configuration. Codex means local Codex workflows in the CLI or desktop app; it does not redirect ordinary ChatGPT Chat or cloud Work.
@@ -13,7 +15,13 @@ These tabs add an **Open Console Gateway** model provider to an existing local c
 
 The gateway route marker protects opaque native history only when that client forwards it. Codex, Kimi Code, MiniMax Code, and ZCode own their conversation serialization. Their SDK can turn a native opaque field into plain text, or drop it, when the provider, API, or model identity changes. OCG cannot recover a field that never arrives, and it cannot detect that drop. Switching a protocol group or rewriting the client configuration does not migrate an old conversation. Start a new conversation, or send history that has already been resolved, when that identity changes. When marked history does arrive, the same configured route is the bound of the guarantee: a direct change of upstream model, endpoint, or credential version is rejected before HTTP. The DSH plugin is the client that checks a present signed envelope before its base adapter can rewrite it.
 
-**Update configuration** exports the entire current model list again. These native catalogs are snapshots taken when you configure; update after changing published models. **Remove** removes or restores only the OCG-managed portions. It does not delete the client's login, other providers, or the OCG Key. Removal does not require the original Key or model to remain available. When a user has changed a managed value, OCG reports a conflict instead of overwriting it. A manual ZCode rule stays in place. OCG reports a conflict when that rule uses the same managed provider and model as a rule being written, or when it still names a managed provider this write would remove. Fields OCG does not own on a managed model rule are retained. Existing CAS checks and ownership-collision protection remain.
+Before **Configure** or **Update configuration**, the page runs a read-only fresh preview. **Remove** and **Recover** refresh inspection before confirmation. It shows the current revision, process generation, inspected file fingerprint, and the planned managed model/provider changes. A preview does not create a Key, write client files, create a receipt, build native configuration directories, or mutate the upstream catalog. Configure then submits the preview fingerprint plus explicit acknowledgements for takeover, overwrite, and removal where required. The commit revalidates every preflight value and the plan fingerprint; if the page is stale, prepare a new preview and review it again rather than retrying automatically.
+
+**Update configuration** exports the whole published model list again; there is no model picker. Existing managed providers and models, unknown extras, and client preferences are preserved according to each adapter's ownership rules. **Remove** removes or restores only OCG-managed portions. It does not delete the client's login, other providers, or the OCG Key. Removal and recovery remain available even when the original Key or the published catalog is gone; an empty catalog can still be used to remove existing application configuration because the preflight does not create a Key. Actual file I/O failure after preflight may leave one enabled named Key for retry; the result reports the partial outcome and does not delete that Key automatically.
+
+OCG distinguishes an adapter's managed routing, identity, and metadata fields from unrelated bytes. A matching byte fingerprint still protects concurrency. Codex catalog whitespace is semantically equal. A unique OCG namespace can be reviewed for takeover after its receipt is lost; confirmation saves the current configuration as its private baseline; duplicate or malformed entries and foreign references remain blocked. A changed owned value requires an explicit reviewed **Apply OCG changes** choice or **Cancel**. A removed customized row requires explicit acknowledgement for whole-row deletion. There is no automatic 409 retry.
+
+When inspection marks an adopted block, the removal action is labeled **Undo takeover**. Undo restores only managed fields changed by OCG while they still match the last applied values. It preserves later-added extras and preferences inside the adopted block and all unrelated content. Competing owned edits produce a conflict, and undo cannot reconstruct unknown state from before the first OCG change.
 
 Configuration keeps the current OCG model when it is still published; otherwise it activates the first exported model. Choose another model in the client itself. Codex activates the OCG catalog as its global catalog; it does not merge it into the native ChatGPT catalog. Unknown model limits are left unspecified. Model availability does not guarantee that every model supports a coding client's tools.
 
@@ -23,7 +31,7 @@ Kimi lowercases ordinary effort selections and treats `on` and `off` as native c
 
 MiniMax normalizes the disable spelling `off` to `none`. OCG therefore omits a literal `off` choice when that would change the declared upstream parameter; an explicitly declared `none` remains available. The export does not force a binary thinking mode or invent a default effort.
 
-Disabled Keys stay disabled. Configuring again creates an enabled Key when none with the matching name exists. A Key created before a later client-file error remains available in Connection Center, and retrying reuses it. An empty model catalog is rejected before creating a Key or writing client files.
+Disabled Keys stay disabled. Configuring again creates an enabled Key when none with the matching name exists. A Key created before a later client-file error remains available in Connection Center, and retrying reuses it. An empty model catalog is rejected before creating a Key or writing client files for configuration and update; removal of existing application configuration remains available.
 
 The generated Codex catalog includes the official generic coding instructions from Codex 0.153.4, which requires an instruction source for each custom model. Source attribution and the Apache 2.0 license are included with OCG.
 
@@ -33,7 +41,35 @@ MiniMax YAML configuration is reformatted when saved. Unrelated values remain, a
 
 The tabs resolve client-specific home/data-directory overrides. You can select another configuration path for a custom profile. Codex and Kimi use `config.toml`; MiniMax uses `config.yaml`; current ZCode uses the versioned `provider_config.json` Personal Provider format. Legacy or malformed files are not overwritten. CLI and desktop share a configuration only when they use the same location and compatible format. Docker and builds without the native capability cannot configure clients on the browser computer; use [manual client configuration](add-application.md).
 
-The **DSH** tab below connects DSH itself to the gateway through the OCG plugin.
+## VS Code Copilot
+
+The main flow installs the **Open Console Gateway** VS Code model-provider extension. It creates or reuses the enabled ordinary Key named `copilot`; the extension imports it into the selected Profile's **SecretStorage**. Models and capabilities are read from authenticated `/v1/models` when VS Code discovers models and before each request. You do not maintain a second context budget or model snapshot.
+
+1. Run OCG Desktop or the native CLI on the same computer and user as VS Code. Open **Applications > VS Code Copilot**, inspect the displayed installation, Profile, user-data directory, and extension directory. **Other installation targets** selects Stable/Insiders, an existing named Profile, or explicit directories. Open a named Profile once before selecting it; Profiles that share default global state must use the default Profile connection. VS Code 1.141 or newer is required.
+2. Select **Install and connect**. OCG installs its bundled, secret-free VSIX through the official VS Code CLI and writes a private, one-time credential handoff into that Profile's extension storage. Open or reload that Profile, then refresh the application status. **Waiting for VS Code activation** and **Connected to OCG** are separate states.
+3. Select a model under **Open Console Gateway** in the Chat model picker. Its name is the public alias from OCG **Aliases**, also used in requests; different aliases remain separate even when they share an upstream display name. Context and output limits come from each model's OCG metadata; input capacity reserves its declared output limit. Models missing either limit appear in the application's metadata warning. Follow **Open model capabilities** and complete their capabilities in OCG once, then run **OCG: Refresh Models** in VS Code. Unknown tool/image capabilities remain disabled; Agent requires declared tool support.
+4. Send a request and verify it in OCG **Logs**. Installation, credential import, and catalog discovery do not establish successful inference. This provider serves Chat and agents, not inline code completions or Next Edit Suggestions.
+
+The experimental VS Code Agent Host/Agents Window bridge additionally needs
+`chat.agentHost.byokModels.enabled` in VS Code. OCG does not enable that setting;
+Agent Host support is separate from ordinary Chat/Agent model discovery. See
+[VS Code model customization](https://code.visualstudio.com/docs/agent-customization/language-models).
+
+**Update or reconnect** refreshes the extension and its Profile connection after a Key or gateway address change. It does not change the selected model or `settings.json`. The immutable executable is shared where VS Code shares extensions, while each Profile retains its own credential handoff and SecretStorage connection. The extension runs in the local UI extension host, including in remote workspaces; it does not install or pass local handoff paths to a remote host.
+
+**Disconnect** requests that the active extension clear its encrypted connection. **Uninstall extension** waits for an explicit secret-deletion acknowledgment before the CLI removes that Profile's extension registration. If activation is pending, open the selected Profile, refresh, then continue uninstalling. Other Profiles are checked after removal. OCG never edits VS Code's secret database or deletes the ordinary OCG Key.
+
+Docker, another computer, or an unsupported native target can use **Download VSIX for manual installation**. In VS Code, install that file through **Extensions: Install from VSIX**, then run **OCG: Connect** and enter the gateway `/v1` URL and an enabled Key once. **OCG: Disconnect** clears the extension connection. Remote gateway connections require HTTPS; private-network/loopback HTTP is permitted.
+
+The extension follows each model's published preferred Chat Completions, Responses, or Messages protocol and supports declared images, tools, streaming, and cancellation. Text token counting uses o200k encoding with message/tool overhead and conservative image estimates; other models may tokenize differently. Counting estimates do not change the published limits. Private reasoning signatures remain in a bounded in-memory replay cache for matching turns; reload, disconnect, and reconnect clear it.
+
+Use **OCG: Set Reasoning Effort** for per-model choices declared by OCG on Chat Completions or Responses. Messages receives no guessed effort menu or thinking budget.
+
+### Legacy JSON configuration and migration
+
+Expand **Legacy JSON configuration and migration** to use the existing native Custom Endpoint adapter. Once the extension is connected, remove the old OCG JSON provider through its reviewed **Remove** action to avoid duplicate providers. Close VS Code for that file operation. Ownership receipts, CAS, fingerprint checks, backups, undo, and recovery preserve unrelated providers and refuse intervening edits. Installation never silently edits or deletes a legacy provider.
+
+The JSON compatibility flow still exports a snapshot to `chatLanguageModels.json`, retains existing per-model client settings, and exposes its explicit client budgets. Those budgets belong only to this compatibility flow. Its Key is stored as a literal authentication header in the private JSON file and recovery backup; the extension flow uses SecretStorage instead. See [manual configuration](add-application.md#vs-code-copilot) and the [official provider API](https://code.visualstudio.com/api/extension-guides/ai/language-model-chat-provider).
 
 ## DSH
 

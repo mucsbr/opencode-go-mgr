@@ -2,6 +2,8 @@
 
 # 应用
 
+本机配置页签为 **Codex**、**Kimi Code**、**MiniMax Code** 和 **ZCode**。**VS Code Copilot** 与 **DSH** 分别使用下文的扩展和插件流程。
+
 ## Codex、Kimi Code、MiniMax Code 与 ZCode
 
 这些页签向本机客户端配置添加 **Open Console Gateway** 模型供应商。Codex 指 CLI 或桌面中的本地 Codex 工作流，不会改变普通 ChatGPT Chat 或云端 Work 的推理地址。
@@ -13,7 +15,13 @@
 
 Gateway 的路由标记只在客户端原样转发不透明原生历史时保护这段历史。Codex、Kimi Code、MiniMax Code 和 ZCode 各自负责会话的序列化。供应商、API 或模型身份变化时，它们的 SDK 可以把原生不透明字段改成纯文本，也可以丢掉该字段。OCG 无法恢复一个从未到达的字段，也无法发现这次丢弃。切换协议分组或改写客户端配置，不会迁移旧会话。原生身份变化时，需要新开会话，或者发送已经解析好的历史。带标记的历史确实到达时，同一条已配置路由就是这项保证的边界：上游模型、端点或凭据版本的直接变化会在发出 HTTP 之前拒绝。DSH 插件会在基础适配器改写已出现的签名信封之前检查该信封。
 
-**更新配置**会重新导出当前全部模型。这些原生目录是配置时的快照；公开模型变化后，请更新配置。**移除**只移除或恢复 OCG 管理的部分，保留客户端登录、其他供应商和 OCG Key。原 Key 或模型已删除也不影响移除。用户后来修改过受管字段时，OCG 会提示冲突，不会静默覆盖。手工 ZCode 规则留在原处。它与即将写入的受管规则使用同一个受管供应商和模型，或者仍指向这次写入会移除的受管供应商时，OCG 报告冲突。受管模型规则上 OCG 不拥有的字段予以保留。既有的 CAS 检查和所有权冲突保护仍然保留。
+在**配置**或**更新配置**之前，页面会先执行只读的新鲜预览。**移除**和**恢复**在确认前重新检查状态。预览显示当前 revision、process generation、检查得到的文件指纹，以及计划中的受管模型/供应商变化。预览不会创建 Key、写入客户端文件、创建 receipt、创建原生配置目录，也不会修改上游目录。配置提交时会附带预览指纹，并在需要时明确确认接管、覆盖和移除。提交会重新校验所有预检值和计划指纹；页面过期时必须重新准备并再次审阅，不会自动重试。
+
+**更新配置**会重新导出完整的已发布模型目录，不提供模型选择器。已有受管供应商和模型、未知额外字段以及客户端偏好会按各适配器的所有权规则保留。**移除**只移除或恢复 OCG 管理的部分，保留客户端登录、其他供应商和 OCG Key。即使原 Key 或已发布目录已不存在，仍可移除或恢复；空目录也可以移除已有应用配置，因为预检不会创建 Key。预检后实际文件 I/O 失败可能留下一个启用的同名 Key；结果会准确报告部分完成，不会自动删除该 Key。
+
+OCG 将适配器管理的路由、身份和元数据字段与无关字节区分开；字节指纹仍用于并发保护。Codex 目录中的空白在语义上相同。receipt 丢失时，唯一的 OCG 命名空间可以经过审阅后接管，确认时将当前配置保存为私有基线；重复或畸形条目、外部引用仍会阻止操作。受管值被修改后，必须明确选择经审阅的**应用 OCG 更改**或**取消**。已移除的自定义行需要明确确认整行删除。不会自动重试 409。
+
+检查结果标记为已接管时，移除操作显示为**撤销接管**。撤销只恢复 OCG 修改过、且仍匹配最后应用值的受管字段；接管块中后来添加的额外字段和偏好，以及其他无关内容都会保留。竞争性的受管编辑会产生冲突；撤销无法恢复首次 OCG 更改之前未知的状态。
 
 配置时，当前 OCG 模型仍在公开列表中就保留，否则启用导出的第一个模型；之后在客户端内切换模型。Codex 会启用 OCG 目录作为全局目录，不会把它合并进原生 ChatGPT 目录。未知模型上限保持未指定；模型可见不代表它支持编程客户端所需的全部工具能力。
 
@@ -23,7 +31,7 @@ Kimi 会将普通档位转成小写，并把 `on`、`off` 当作原生开关。O
 
 MiniMax 会将关闭参数 `off` 改写成 `none`。如果这会改变已声明的上游参数，OCG 就不导出字面值 `off` 选项；明确声明的 `none` 仍可选择。导出不会强制设置思考开关模式，也不会编造默认档位。
 
-已停用的 Key 不会重新启用；没有同名已启用 Key 时才新建。若创建 Key 后客户端文件写入失败，该 Key 仍保留在连接中心，重试会复用它。模型列表为空时，在创建 Key 或写入客户端文件前就会拒绝配置。
+已停用的 Key 不会重新启用；没有同名已启用 Key 时才新建。若创建 Key 后客户端文件写入失败，该 Key 仍保留在连接中心，重试会复用它。配置和更新时，模型列表为空会在创建 Key 或写入客户端文件前拒绝；移除已有应用配置仍然可用。
 
 生成的 Codex 目录附带 Codex 0.153.4 官方通用编码指令，该版本要求每个自定义模型提供指令来源。OCG 同时附带来源说明与 Apache 2.0 许可证。
 
@@ -33,7 +41,34 @@ MiniMax 的 YAML 配置会在保存时重新排版，保留其他字段值；原
 
 页签会解析各客户端的 Home、数据目录等覆盖设置，也可选择自定义 Profile 的配置路径。Codex、Kimi 使用 `config.toml`，MiniMax 使用 `config.yaml`，当前 ZCode 使用带版本的 `provider_config.json` Personal Provider 格式。旧格式或损坏文件不会被覆盖。CLI 与桌面端仅在使用相同位置及兼容格式时共享配置。Docker 或不含本机能力的构建无法配置浏览器电脑上的客户端，请使用[手动客户端配置](add-application.zh-CN.md)。
 
-下面的 **DSH** 子页签通过 OCG 插件把 DSH 本身接入 Gateway。
+## VS Code Copilot
+
+主流程安装 **Open Console Gateway** VS Code 模型提供者扩展。OCG 创建或复用名为 `copilot` 的启用普通 Key；扩展将其导入所选 Profile 的 **SecretStorage**。VS Code 发现模型及每次发请求前，扩展读取已鉴权 `/v1/models`。无需再维护一套上下文预算或模型快照。
+
+1. 在 VS Code 所在电脑、同一用户下运行 OCG Desktop 或原生 CLI。打开 **应用 > VS Code Copilot**，核对显示的安装、Profile、用户数据目录和扩展目录。**其他安装目标**可选择 Stable/Insiders、已有命名 Profile 或指定目录。命名 Profile 需先在 VS Code 中打开一次；共享默认全局状态的 Profile 应使用默认 Profile 的连接。要求 VS Code 1.141 或更新版本。
+2. 点击 **安装并连接**。OCG 通过官方 VS Code CLI 安装随应用附带、不含 Key 的 VSIX，并将私有一次性交接文件写入该 Profile 的扩展存储。打开或重新加载所选 Profile，再刷新应用状态。**等待 VS Code 激活**与**已连接 OCG**是不同阶段。
+3. 在 Chat 模型选择器的 **Open Console Gateway** 下选择模型。显示名称与 OCG **别名**表的对外模型名一致，请求也使用该别名；即使上游展示名相同，不同别名仍分别列出。上下文和输出限制直接来自各模型的 OCG 元数据；输入容量为输出上限预留空间。缺少任一限制的模型会显示在应用的元数据提示中。点击**前往模型能力**，在 OCG 补齐一次，再在 VS Code 执行 **OCG: Refresh Models**。未知工具/图像能力保持关闭；Agent 要求已声明工具调用能力。
+4. 发出请求，并在 OCG **日志**中确认。安装、Key 导入和目录发现均不等于推理成功。扩展提供 Chat 和 Agent 模型，不提供行内代码补全或 Next Edit Suggestions。
+
+实验性的 VS Code Agent Host/Agents Window 桥接还需要在 VS Code 启用
+`chat.agentHost.byokModels.enabled`。OCG 不代为开启；Agent Host 支持与普通
+Chat/Agent 模型发现分开验收。详见[VS Code 模型定制](https://code.visualstudio.com/docs/agent-customization/language-models)。
+
+Key 或网关地址变更后，使用**更新或重新连接**刷新扩展和该 Profile 的连接。它不修改默认模型或 `settings.json`。VS Code 共用扩展文件时，可执行包保持不可变，各 Profile 独立保存交接文件与 SecretStorage 连接。扩展运行在本机 UI 扩展宿主；远程工作区也使用本机宿主，不向远程宿主传递本机交接路径。
+
+**断开连接**请求正在运行的扩展清除加密连接。**卸载扩展**必须收到扩展已删除秘密的明确回执，才会让 CLI 移除该 Profile 的扩展注册。如果仍等待激活，请打开所选 Profile，刷新后继续卸载。移除后会检查其他 Profile。OCG 不编辑 VS Code 的秘密数据库，也不删除 OCG 中的普通 Key。
+
+Docker、另一台电脑或不支持的本机目标可用**下载 VSIX 手动安装**。在 VS Code 执行 **Extensions: Install from VSIX** 安装该文件，再运行 **OCG: Connect**，填写一次网关 `/v1` 地址和启用的 Key。**OCG: Disconnect** 清除扩展连接。远程网关要求 HTTPS；内网和回环地址可用 HTTP。
+
+扩展按模型发布的首选 Chat Completions、Responses 或 Messages 协议请求，支持已声明的图像、工具、流式响应和取消。文本 Token 计数使用 o200k 编码，加上消息/工具开销和保守图像估算；其他模型的分词可能不同。计数估算不修改已发布上限。私有推理签名保存在有界的内存重放缓存中，仅用于匹配的会话轮次；重新加载、断开或重新连接会清空它。
+
+可用 **OCG: Set Reasoning Effort** 为各模型选择 OCG 已声明的 Chat Completions 或 Responses 推理强度，不为 Messages 猜测强度菜单或思考预算。
+
+### 旧 JSON 配置与迁移
+
+展开**旧 JSON 配置与迁移**，可继续使用原有的原生 Custom Endpoint 适配器。扩展连接成功后，通过旧配置的受审查**移除**动作删除 OCG JSON 供应商，避免重复显示。文件操作前需关闭 VS Code。归属回执、CAS、指纹检查、备份、撤销和恢复会保留其他供应商，并拒绝覆盖后续编辑。安装扩展不会静默编辑或删除旧供应商。
+
+JSON 兼容流程仍将快照导出到 `chatLanguageModels.json`，保留原有逐模型客户端设置，并提供显式客户端预算。这些预算只属于兼容流程。Key 以字面值认证 Header 保存在私有 JSON 文件和恢复备份中；扩展流程使用 SecretStorage。详见[手动配置](add-application.zh-CN.md#vs-code-copilot)及[官方提供者接口](https://code.visualstudio.com/api/extension-guides/ai/language-model-chat-provider)。
 
 ## DSH
 
