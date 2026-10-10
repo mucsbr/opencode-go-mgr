@@ -1585,11 +1585,29 @@ async fn fetched_catalog_model_probes_all_protocols_and_writes_request_logs() {
 }
 
 #[tokio::test]
-async fn removed_and_zen_owned_go_catalog_models_cannot_be_probed() {
+async fn removed_and_zen_only_models_are_rejected_but_listed_go_free_models_can_be_probed() {
     let harness = start_probes("probes-current-catalog-only").await;
     let origin = start_probe_origin(StatusCode::OK, SUCCESS_BODY, Duration::ZERO).await;
     point_upstream(&harness, &origin.url);
     let account_id = create_go_account(&harness).await;
+    let before = harness.state.settings_revision();
+    let (status, body) = send_json(
+        &harness,
+        Method::POST,
+        &probe_path(OPENCODE_PROVIDER_ID),
+        &cas(
+            &harness,
+            json!({
+                "accountId": account_id,
+                "modelId": "mimo-v2.5-free",
+                "protocols": ["chat_completions"]
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(origin.call_count(), 0);
+    assert_eq!(harness.state.settings_revision(), before);
     let now = chrono::Utc::now();
     harness
         .state
@@ -1668,7 +1686,7 @@ async fn removed_and_zen_owned_go_catalog_models_cannot_be_probed() {
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     assert_eq!(origin.call_count(), 1);
 
-    let legacy = chrono::Utc::now();
+    let free_catalog_updated_at = chrono::Utc::now();
     harness
         .state
         .db
@@ -1676,10 +1694,10 @@ async fn removed_and_zen_owned_go_catalog_models_cannot_be_probed() {
         .set_contract_catalog(
             &go_scope(),
             &["hy3-free".to_string()],
-            Some(legacy),
+            Some(free_catalog_updated_at),
             CATALOG_SOURCE_OPENCODE_MODELS,
             "http://127.0.0.1/provider/v1/models",
-            legacy,
+            free_catalog_updated_at,
         )
         .unwrap();
     harness.state.reload_provider_contracts().unwrap();
@@ -1697,8 +1715,26 @@ async fn removed_and_zen_owned_go_catalog_models_cannot_be_probed() {
         ),
     )
     .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-    assert_eq!(origin.call_count(), 1);
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["results"][0]["success"], true);
+    // A probe observes a route; without documented support it does not turn
+    // an unknown protocol into an enabled production capability.
+    assert_eq!(body["contract"]["routable"], false);
+    assert_eq!(origin.call_count(), 2);
+    {
+        let calls = origin.calls.lock().unwrap();
+        let call = calls.last().unwrap();
+        let expected_authorization = format!("Bearer {GO_KEY}");
+        assert_eq!(
+            call.authorization.as_deref(),
+            Some(expected_authorization.as_str())
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(&call.body).unwrap()["model"],
+            "hy3-free"
+        );
+        assert!(call.opencode_session.is_some());
+    }
     harness.stop();
 }
 
